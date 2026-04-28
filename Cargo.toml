@@ -1,0 +1,25 @@
+[package]
+name = "soltty"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+
+[dependencies]
+winit = "0.30"
+wgpu = "22"
+pollster = "0.3"
+log = "0.4"
+env_logger = "0.11"
+bytemuck = { version = "1.18", features = ["derive"] }
+portable-pty = "0.8"
+vte = "0.13"
+swash = "0.1"
+etagere = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.dev]
+opt-level = 1
