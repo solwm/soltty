@@ -33,6 +33,19 @@ fn main() {
     ))
     .init();
 
+    let cli = match Cli::parse(std::env::args().skip(1)) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("soltty: {msg}");
+            print_usage();
+            std::process::exit(2);
+        }
+    };
+    if cli.help {
+        print_usage();
+        return;
+    }
+
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("create event loop");
@@ -47,8 +60,59 @@ fn main() {
         pty: None,
         term: Term::new(24, 80),
         modifiers: ModifiersState::empty(),
+        program: cli
+            .program
+            .unwrap_or_else(crate::pty::default_shell),
+        args: cli.args,
     };
     event_loop.run_app(&mut app).expect("run event loop");
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Cli {
+    program: Option<String>,
+    args: Vec<String>,
+    help: bool,
+}
+
+impl Cli {
+    fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Self, String> {
+        let mut out = Cli::default();
+        let mut it = args.into_iter();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "-h" | "--help" => out.help = true,
+                "-e" | "--command" => {
+                    out.program = Some(
+                        it.next()
+                            .ok_or_else(|| format!("{arg} requires a command"))?,
+                    );
+                    // Convention: -e consumes the rest of the command line, so
+                    // `soltty -e zsh -i` does what you'd expect.
+                    out.args = it.collect();
+                    return Ok(out);
+                }
+                _ => return Err(format!("unrecognized argument: {arg}")),
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn print_usage() {
+    eprintln!(
+        "usage: soltty [OPTIONS]
+
+OPTIONS:
+  -e, --command <cmd> [args...]   Run cmd with args instead of $SHELL.
+                                  Consumes the rest of the command line.
+  -h, --help                      Show this help.
+
+ENV:
+  SHELL          Default command when -e is not given (Linux/macOS).
+  SOLTTY_FONT    Path to a TTF/OTF to use instead of auto-discovery.
+  RUST_LOG       e.g. `soltty=debug` for verbose logging."
+    );
 }
 
 struct App {
@@ -58,6 +122,8 @@ struct App {
     pty: Option<Pty>,
     term: Term,
     modifiers: ModifiersState,
+    program: String,
+    args: Vec<String>,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -77,9 +143,12 @@ impl ApplicationHandler<UserEvent> for App {
 
         let proxy_data = self.proxy.clone();
         let proxy_exit = self.proxy.clone();
+        log::info!("spawn: {} {:?}", self.program, self.args);
         let pty = Pty::spawn(
             rows,
             cols,
+            &self.program,
+            &self.args,
             move || {
                 let _ = proxy_data.send_event(UserEvent::PtyData);
             },
@@ -365,6 +434,58 @@ fn named_key_seq(named: NamedKey, ctrl: bool, alt: bool, shift: bool) -> Option<
         NamedKey::F12 => csi_tilde(24, m),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, String> {
+        Cli::parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn empty_args_means_default_shell() {
+        let c = parse(&[]).unwrap();
+        assert_eq!(c.program, None);
+        assert!(c.args.is_empty());
+    }
+
+    #[test]
+    fn dash_e_takes_command() {
+        let c = parse(&["-e", "zsh"]).unwrap();
+        assert_eq!(c.program.as_deref(), Some("zsh"));
+        assert!(c.args.is_empty());
+    }
+
+    #[test]
+    fn dash_e_consumes_rest() {
+        let c = parse(&["-e", "fish", "-i", "-l"]).unwrap();
+        assert_eq!(c.program.as_deref(), Some("fish"));
+        assert_eq!(c.args, vec!["-i".to_string(), "-l".to_string()]);
+    }
+
+    #[test]
+    fn long_form_command() {
+        let c = parse(&["--command", "bash"]).unwrap();
+        assert_eq!(c.program.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn dash_e_without_arg_errors() {
+        assert!(parse(&["-e"]).is_err());
+    }
+
+    #[test]
+    fn unknown_flag_errors() {
+        assert!(parse(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn help_flag() {
+        let c = parse(&["--help"]).unwrap();
+        assert!(c.help);
+    }
 }
 
 #[cfg(test)]

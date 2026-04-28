@@ -23,6 +23,8 @@ impl Pty {
     pub fn spawn(
         rows: u16,
         cols: u16,
+        program: &str,
+        args: &[String],
         on_data: impl Fn() + Send + 'static,
         on_exit: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<Self> {
@@ -36,7 +38,10 @@ impl Pty {
             })
             .map_err(io_other)?;
 
-        let mut cmd = CommandBuilder::new(default_shell());
+        let mut cmd = CommandBuilder::new(program);
+        for a in args {
+            cmd.arg(a);
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         if let Ok(home) = std::env::var("HOME") {
@@ -111,7 +116,7 @@ impl Pty {
     }
 }
 
-fn default_shell() -> String {
+pub fn default_shell() -> String {
     if cfg!(windows) {
         std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into())
     } else {
