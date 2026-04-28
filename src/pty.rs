@@ -1,7 +1,15 @@
 use std::io::{Read, Write};
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+
+/// Bound on how many 8 KB chunks the reader thread can buffer before blocking.
+/// 64 chunks = 512 KB in flight. When full, the reader's `tx.send` blocks,
+/// the kernel PTY buffer fills, and a chatty child (e.g. a busy-loop printf)
+/// is forced to slow down to match our drain rate. Without this, the channel
+/// grows unboundedly, the main thread can't keep up, and keyboard events
+/// (including Ctrl+C) queue behind a wall of PTY data.
+const PTY_CHANNEL_CAP: usize = 64;
 
 pub struct Pty {
     #[allow(dead_code)] // used by `resize`, which is wired up in milestone 5
@@ -16,6 +24,7 @@ impl Pty {
         rows: u16,
         cols: u16,
         on_data: impl Fn() + Send + 'static,
+        on_exit: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -41,7 +50,7 @@ impl Pty {
         let mut reader = pair.master.try_clone_reader().map_err(io_other)?;
         let writer = pair.master.take_writer().map_err(io_other)?;
 
-        let (tx, rx) = channel::<Vec<u8>>();
+        let (tx, rx) = sync_channel::<Vec<u8>>(PTY_CHANNEL_CAP);
         std::thread::Builder::new()
             .name("soltty-pty-reader".into())
             .spawn(move || {
@@ -59,6 +68,9 @@ impl Pty {
                         Err(_) => break,
                     }
                 }
+                // Reader saw EOF (or unrecoverable error) — child has closed
+                // its end of the PTY. Tell the main thread to wind down.
+                on_exit();
             })?;
 
         Ok(Self {

@@ -39,6 +39,8 @@ pub struct Renderer {
     palette: [[f32; 4]; 256],
     default_fg: [f32; 4],
     default_bg: [f32; 4],
+    cursor_bg: [f32; 4],
+    cursor_fg: [f32; 4],
 
     screen_size: (u32, u32),
     cell_size: (u32, u32),
@@ -55,6 +57,11 @@ impl Renderer {
         let palette = build_palette();
         let default_fg = srgb_to_linear_rgba([214, 214, 214, 255]);
         let default_bg = srgb_to_linear_rgba([11, 12, 17, 255]);
+        // Block cursor: solid bright square with the glyph "punched out" in the
+        // page bg color. Stays the same regardless of the underlying cell's
+        // colors, which is what every other terminal does.
+        let cursor_bg = srgb_to_linear_rgba([235, 235, 235, 255]);
+        let cursor_fg = default_bg;
 
         let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("soltty-atlas"),
@@ -250,6 +257,8 @@ impl Renderer {
             palette,
             default_fg,
             default_bg,
+            cursor_bg,
+            cursor_fg,
             screen_size,
             cell_size: (atlas.metrics.cell_w, atlas.metrics.cell_h),
         }
@@ -271,6 +280,16 @@ impl Renderer {
 
     pub fn resize(&mut self, queue: &wgpu::Queue, screen_size: (u32, u32)) {
         self.screen_size = screen_size;
+        self.write_uniforms(queue);
+    }
+
+    /// Swap in a new font atlas (e.g. after a zoom). Atlas dimensions are
+    /// fixed in `FontAtlas::new`, so the texture/view/bind group can stay —
+    /// we just re-upload pixels and update the cell-size uniform.
+    pub fn reload_font(&mut self, queue: &wgpu::Queue, atlas: &FontAtlas) {
+        debug_assert_eq!(self.atlas_size, (atlas.atlas_w, atlas.atlas_h));
+        upload_atlas_full(queue, &self.atlas_texture, atlas);
+        self.cell_size = (atlas.metrics.cell_w, atlas.metrics.cell_h);
         self.write_uniforms(queue);
     }
 
@@ -319,7 +338,8 @@ impl Renderer {
                     std::mem::swap(&mut fg, &mut bg);
                 }
                 if cursor == Some((vrow, col_idx)) {
-                    std::mem::swap(&mut fg, &mut bg);
+                    bg = self.cursor_bg;
+                    fg = self.cursor_fg;
                 }
                 let glyph = atlas.get(cell.ch).unwrap_or_default();
                 self.instances_scratch.push(CellInstance {

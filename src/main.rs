@@ -13,13 +13,14 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::gpu::Gpu;
+use crate::gpu::{Gpu, DEFAULT_FONT_SIZE_PX};
 use crate::pty::Pty;
 use crate::term::Term;
 
 #[derive(Debug, Clone, Copy)]
 pub enum UserEvent {
     PtyData,
+    PtyExited,
 }
 
 fn main() {
@@ -74,10 +75,18 @@ impl ApplicationHandler<UserEvent> for App {
         let (rows, cols) = grid_dims_for_window(gpu.cell_size(), inner.width, inner.height);
         let term = Term::new(rows as usize, cols as usize);
 
-        let proxy = self.proxy.clone();
-        let pty = Pty::spawn(rows, cols, move || {
-            let _ = proxy.send_event(UserEvent::PtyData);
-        })
+        let proxy_data = self.proxy.clone();
+        let proxy_exit = self.proxy.clone();
+        let pty = Pty::spawn(
+            rows,
+            cols,
+            move || {
+                let _ = proxy_data.send_event(UserEvent::PtyData);
+            },
+            move || {
+                let _ = proxy_exit.send_event(UserEvent::PtyExited);
+            },
+        )
         .expect("spawn pty");
 
         log::info!("grid: {cols}x{rows}");
@@ -87,7 +96,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.term = term;
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyData => {
                 if let Some(pty) = self.pty.as_ref() {
@@ -99,6 +108,11 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+            }
+            UserEvent::PtyExited => {
+                // Shell (or whatever was the foreground command) closed its
+                // end of the PTY — there's nothing left to interact with.
+                event_loop.exit();
             }
         }
     }
@@ -162,6 +176,21 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                 ..
             } => {
+                // Font zoom: Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0. Handled
+                // locally; never forwarded to the PTY.
+                if let Some(target) = font_zoom_target(&logical_key, self.modifiers, gpu.font_size())
+                {
+                    let inner = window.inner_size();
+                    let cell = gpu.set_font_size(target);
+                    let (rows, cols) = grid_dims_for_window(cell, inner.width, inner.height);
+                    self.term.resize(rows as usize, cols as usize);
+                    if let Some(pty) = self.pty.as_ref() {
+                        pty.resize(rows, cols);
+                    }
+                    window.request_redraw();
+                    return;
+                }
+
                 if let Some(pty) = self.pty.as_mut() {
                     if let Some(bytes) = encode_key(&logical_key, text.as_deref(), self.modifiers) {
                         // Any keypress that produces output snaps the viewport
@@ -175,6 +204,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
             _ => {}
         }
+    }
+}
+
+/// Returns the new font size in pixels if `key` is a zoom shortcut, else None.
+/// Ctrl+= / Ctrl++ → zoom in (×1.1); Ctrl+- → zoom out (÷1.1); Ctrl+0 → reset.
+fn font_zoom_target(key: &Key, mods: ModifiersState, current_px: f32) -> Option<f32> {
+    if !mods.control_key() || mods.alt_key() {
+        return None;
+    }
+    let Key::Character(s) = key else { return None };
+    match s.as_ref() {
+        "=" | "+" => Some(current_px * 1.1),
+        "-" => Some(current_px / 1.1),
+        "0" => Some(DEFAULT_FONT_SIZE_PX),
+        _ => None,
     }
 }
 

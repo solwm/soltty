@@ -7,6 +7,11 @@ use crate::font::FontAtlas;
 use crate::renderer::Renderer;
 use crate::term::Term;
 
+/// Default font size, ~30% larger than the original 16px baseline.
+pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0 * 1.3;
+const MIN_FONT_SIZE_PX: f32 = 6.0;
+const MAX_FONT_SIZE_PX: f32 = 96.0;
+
 pub struct Gpu {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -14,6 +19,7 @@ pub struct Gpu {
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
     atlas: FontAtlas,
+    font_px: f32,
 }
 
 impl Gpu {
@@ -83,7 +89,7 @@ impl Gpu {
             config.present_mode
         );
 
-        let atlas = FontAtlas::new(16.0).expect("load font");
+        let atlas = FontAtlas::new(DEFAULT_FONT_SIZE_PX).expect("load font");
         let renderer = Renderer::new(
             &device,
             &queue,
@@ -99,11 +105,39 @@ impl Gpu {
             config,
             renderer,
             atlas,
+            font_px: DEFAULT_FONT_SIZE_PX,
         }
     }
 
-    #[allow(dead_code)] // wired up for resize→winsize in milestone 5
     pub fn cell_size(&self) -> (u32, u32) {
+        self.renderer.cell_size()
+    }
+
+    pub fn font_size(&self) -> f32 {
+        self.font_px
+    }
+
+    /// Reload the font atlas at a new pixel size and rewire it into the
+    /// renderer. Returns the new cell size so the caller can resize the
+    /// terminal grid + PTY winsize accordingly.
+    pub fn set_font_size(&mut self, px: f32) -> (u32, u32) {
+        let px = px.clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX);
+        if (px - self.font_px).abs() < 0.05 {
+            return self.renderer.cell_size();
+        }
+        match FontAtlas::new(px) {
+            Ok(atlas) => {
+                self.atlas = atlas;
+                self.renderer.reload_font(&self.queue, &self.atlas);
+                self.font_px = px;
+                log::info!(
+                    "font: {:.1}px (cell {:?})",
+                    self.font_px,
+                    self.renderer.cell_size()
+                );
+            }
+            Err(e) => log::warn!("font reload at {px}px failed: {e}"),
+        }
         self.renderer.cell_size()
     }
 
