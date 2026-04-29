@@ -99,6 +99,8 @@ fn main() {
         redraw_pending: false,
         dirty: false,
         last_render: None,
+        // Real value is set in `resumed` once we have a window to ask.
+        frame_interval: Duration::from_millis(8),
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -178,14 +180,54 @@ struct App {
     /// still set after we've gone quiet (e.g. last byte arrived during
     /// the throttle window).
     dirty: bool,
-    /// When the last frame was actually presented. Used to cap redraw rate
-    /// at ~60 Hz — without this, under a chatty PTY producer we paint 2-3×
-    /// per game frame, and `swap_buffers` (≈200µs each on macOS Metal/GL
-    /// even with vsync off) becomes the dominant cost.
+    /// When the last frame was actually presented. Used to cap redraw
+    /// rate so a chatty PTY producer can't make `swap_buffers` (≈200µs
+    /// each on macOS Metal/GL even with vsync off) the dominant cost.
     last_render: Option<Instant>,
+    /// Minimum interval between paints, derived from the window's
+    /// monitor refresh rate at startup (clamped to 60-240 Hz). Set in
+    /// `resumed`; the `Default::default()` here only covers the
+    /// vanishingly small window before that.
+    frame_interval: Duration,
 }
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Even with the per-display cap, we always paint immediately if we've
+/// been quiet for this long. That makes typing-after-idle feel
+/// instant on a 60 Hz panel where the cap would otherwise add up to
+/// ~16 ms of echo latency on the first keystroke.
+const IDLE_THRESHOLD: Duration = Duration::from_millis(100);
+
+const MIN_FRAME_HZ: u32 = 60;
+const MAX_FRAME_HZ: u32 = 240;
+/// Used when both the env override and winit's monitor query come up
+/// empty. 120 is a safer default than 60 — modern panels are mostly
+/// faster than that and the cost of capping high is negligible.
+const DEFAULT_FRAME_HZ: u32 = 120;
+
+/// Pick the redraw cap. `SOLTTY_FRAME_HZ` env var wins, then the
+/// current monitor's refresh rate from winit, then a 120 Hz default.
+/// Result is clamped to a sane range so a misconfigured monitor can't
+/// pin us at 5 Hz or 1 kHz.
+fn detect_frame_interval(window: &Window) -> Duration {
+    let env_hz = std::env::var("SOLTTY_FRAME_HZ")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+    let hz = env_hz
+        .or_else(|| {
+            window
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz())
+                .map(|mhz| (mhz + 500) / 1000) // round to nearest Hz
+        })
+        .unwrap_or(DEFAULT_FRAME_HZ)
+        .clamp(MIN_FRAME_HZ, MAX_FRAME_HZ);
+    let interval = Duration::from_secs_f64(1.0 / hz as f64);
+    log::info!(
+        "frame cap: {hz} Hz ({:.2} ms)",
+        interval.as_secs_f64() * 1000.0
+    );
+    interval
+}
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -227,6 +269,7 @@ impl ApplicationHandler<UserEvent> for App {
         .expect("spawn pty");
 
         log::info!("grid: {cols}x{rows}");
+        self.frame_interval = detect_frame_interval(&window);
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.pty = Some(pty);
@@ -245,11 +288,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.do_request_redraw();
             }
             Some(t) => {
-                let next = t + FRAME_INTERVAL;
-                if Instant::now() >= next {
+                let elapsed = Instant::now().duration_since(t);
+                if elapsed >= self.frame_interval || elapsed >= IDLE_THRESHOLD {
                     self.do_request_redraw();
                 } else {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(t + self.frame_interval));
                 }
             }
         }
@@ -613,16 +656,24 @@ impl ApplicationHandler<UserEvent> for App {
 
 impl App {
     /// Request a redraw if one isn't already pending and we're past the
-    /// frame-interval throttle window. If we're inside the window,
-    /// `about_to_wait` will arm a `WaitUntil` so we wake up to paint
-    /// exactly when the slot opens.
+    /// frame-interval throttle window. Inside the window, `about_to_wait`
+    /// arms a `WaitUntil` so we paint exactly when the slot opens.
+    ///
+    /// Idle exit: a burst arriving more than `IDLE_THRESHOLD` after the
+    /// last paint paints immediately regardless of the cap. Logically
+    /// redundant with `elapsed >= frame_interval` at our normal caps,
+    /// but documents the intent and keeps echo latency bounded if the
+    /// cap is ever configured high.
     fn maybe_request_redraw(&mut self) {
         if self.redraw_pending {
             return;
         }
         let due = match self.last_render {
             None => true,
-            Some(t) => Instant::now().duration_since(t) >= FRAME_INTERVAL,
+            Some(t) => {
+                let elapsed = Instant::now().duration_since(t);
+                elapsed >= self.frame_interval || elapsed >= IDLE_THRESHOLD
+            }
         };
         if due {
             self.do_request_redraw();
