@@ -26,6 +26,65 @@ Plus `portable-pty` for the OS-specific PTY dance (`forkpty` on Unix,
 ConPTY on Windows) and `etagere` for shelf-packing glyph rectangles into
 the atlas.
 
+## Mouse selection
+
+Three pieces:
+
+- **`src/selection.rs`** — `Selection` struct with `anchor` and `end`
+  cells in viewport coords, plus a `dragging` flag. `normalized()` puts
+  them in row-major order; `contains(row, col)` is the per-cell hit
+  test the renderer uses.
+- **Mouse handlers in `App::window_event`**:
+  - `CursorMoved` updates `App::mouse_pos` and, if a drag is in
+    progress, advances `selection.end`.
+  - `MouseInput { button: Left, state: Pressed }` — start a new
+    selection at the current pixel-mapped cell.
+  - `MouseInput { button: Left, state: Released }` — freeze the
+    selection and copy to clipboard if non-empty.
+- **Renderer integration** — `Renderer::prepare` accepts an
+  `Option<&Selection>` and applies an inverse-video swap on selected
+  cells. Composes after SGR-inverse but before the cursor, so the
+  cursor still reads through correctly.
+
+`pixel_to_cell` is integer division of physical pixels by the cell size
+(returned by `Renderer::cell_size`). Off-window drags clamp to the
+grid's last row/column.
+
+Typing into the PTY also clears the selection — matches xterm
+behavior. `extract_text` in `selection.rs` walks the viewport rows in
+order, trims trailing whitespace per line, and joins with `\n`. Works
+whether you're scrolled into history or at the live grid.
+
+### Clipboard backend chain
+
+Wayland clipboard is messy in 2026. There are *three* possible
+protocols:
+
+1. `wl_data_device` — the standard, every compositor supports it,
+   but apps need to plumb it through their wl_seat.
+2. `wlr-data-control` — wlroots extension. Sway, Hyprland, KDE
+   support it.
+3. `ext-data-control` — newer extension working its way through
+   wayland-protocols.
+
+`arboard` (the canonical Rust clipboard crate) on Linux uses (2) or
+(3). Compositors that only implement (1) — Mutter, several minimal
+WMs — fail to connect, after which arboard tries to fall back to X11
+and times out on Wayland-only setups.
+
+`src/clipboard.rs` implements a fallback chain:
+
+1. **`wl-copy`** (from the `wl-clipboard` package) — preferred when
+   `WAYLAND_DISPLAY` is set and the binary is on `$PATH`. Uses
+   protocol (1), works on every Wayland compositor.
+2. **`arboard`** — used otherwise (X11, macOS, Windows, or as a last
+   resort if `wl-copy` is missing).
+
+We don't currently bind to wl_data_device through winit's Wayland
+connection. That's the architecturally cleanest answer (would let us
+drop the `wl-clipboard` runtime dep) and it's the right next step if
+copy/paste UX needs to be more polished.
+
 ## VSync and ANSI throughput
 
 This deserves a section because it's a 35%-throughput trap that's easy

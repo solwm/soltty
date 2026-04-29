@@ -1,9 +1,11 @@
+mod clipboard;
 mod font;
 mod gpu;
 mod grid;
 mod picker;
 mod pty;
 mod renderer;
+mod selection;
 mod term;
 mod theme;
 
@@ -11,7 +13,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -28,11 +30,15 @@ pub enum UserEvent {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
-        // wgpu_hal::vulkan::conv: noisy when compositors advertise present-mode
-        // extensions wgpu doesn't recognize yet (e.g. FIFO_LATEST_READY_EXT).
-        // sctk_adwaita::config: noisy when the XDG Settings Portal isn't running
-        // (custom WMs, minimal Wayland setups).
-        "warn,soltty=info,wgpu_hal::vulkan::conv=off,sctk_adwaita::config=off",
+        // Noisy on configurations we deliberately handle elsewhere:
+        //   wgpu_hal::vulkan::conv  — wgpu warns on compositors that
+        //     advertise present-mode extensions it doesn't recognize.
+        //   sctk_adwaita::config    — XDG portal not running on minimal/
+        //     custom Wayland setups.
+        //   arboard::platform::linux — arboard logs a WARN when the
+        //     compositor lacks wlr-data-control. We have a wl-copy fallback.
+        "warn,soltty=info,wgpu_hal::vulkan::conv=off,\
+         sctk_adwaita::config=off,arboard::platform::linux=off",
     ))
     .init();
 
@@ -84,6 +90,9 @@ fn main() {
         theme_lib,
         active_theme_name: initial_theme_name,
         picker: None,
+        mouse_pos: (0.0, 0.0),
+        selection: None,
+        clipboard: clipboard::Clipboard::new(),
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -136,6 +145,14 @@ struct App {
     theme_lib: theme::ThemeLib,
     active_theme_name: String,
     picker: Option<picker::Picker>,
+    /// Live mouse cursor position in physical pixels. We keep the latest
+    /// from CursorMoved so MouseInput (which doesn't carry a position)
+    /// can resolve clicks to cell coords.
+    mouse_pos: (f64, f64),
+    /// Active selection while the user is dragging or after release
+    /// (we keep it visible until they click again).
+    selection: Option<selection::Selection>,
+    clipboard: clipboard::Clipboard,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -247,10 +264,50 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                gpu.render(&self.term, self.picker.as_mut());
+                gpu.render(&self.term, self.picker.as_mut(), self.selection.as_ref());
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_pos = (position.x, position.y);
+                if let Some(sel) = self.selection.as_mut() {
+                    if sel.dragging {
+                        let (cw, ch) = gpu.cell_size();
+                        let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &self.term);
+                        if cell != sel.end {
+                            sel.end = cell;
+                            window.request_redraw();
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (cw, ch) = gpu.cell_size();
+                let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &self.term);
+                match state {
+                    ElementState::Pressed => {
+                        self.selection = Some(selection::Selection::new(cell));
+                        window.request_redraw();
+                    }
+                    ElementState::Released => {
+                        if let Some(sel) = self.selection.as_mut() {
+                            sel.dragging = false;
+                            // Auto-copy on mouse-up if there's actually a range
+                            // (skip stray clicks).
+                            if !sel.is_empty() {
+                                let text = selection::extract_text(&self.term, sel);
+                                if !text.is_empty() {
+                                    self.clipboard.set_text(text);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
@@ -356,6 +413,8 @@ impl ApplicationHandler<UserEvent> for App {
                         // back to the live grid — matches what every other
                         // terminal does and is what users expect.
                         self.term.reset_view();
+                        // Typing also clears the selection.
+                        self.selection = None;
                         pty.write(&bytes);
                         window.request_redraw();
                     }
@@ -384,6 +443,20 @@ fn font_zoom_target(key: &Key, mods: ModifiersState, current_px: f32) -> Option<
 fn apply_picker_preview(gpu: &mut Gpu, picker: &picker::Picker, lib: &theme::ThemeLib) {
     let theme = picker.current(lib);
     gpu.set_theme(theme);
+}
+
+/// Convert a window-pixel mouse position into viewport (row, col).
+/// Clamped so off-window drags pin to grid edges. We pass `term` only to
+/// know the grid bounds — selection lives in viewport coords.
+fn pixel_to_cell(pos: (f64, f64), cell: (u32, u32), term: &Term) -> (usize, usize) {
+    let (cw, ch) = (cell.0.max(1) as f64, cell.1.max(1) as f64);
+    let col = (pos.0 / cw).max(0.0) as usize;
+    let row = (pos.1 / ch).max(0.0) as usize;
+    let g = term.grid();
+    (
+        row.min(g.rows.saturating_sub(1)),
+        col.min(g.cols.saturating_sub(1)),
+    )
 }
 
 fn grid_dims_for_window(cell_size: (u32, u32), w: u32, h: u32) -> (u16, u16) {

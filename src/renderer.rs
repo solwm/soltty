@@ -3,6 +3,7 @@ use glow::HasContext;
 use crate::font::FontAtlas;
 use crate::grid::{CellAttrs, Color};
 use crate::picker::Picker;
+use crate::selection::Selection;
 use crate::term::Term;
 use crate::theme::Theme;
 
@@ -146,6 +147,7 @@ impl Renderer {
         term: &Term,
         atlas: &mut FontAtlas,
         picker: Option<&mut Picker>,
+        selection: Option<&Selection>,
     ) {
         let rows = term.grid().rows;
         let cols = term.grid().cols;
@@ -164,6 +166,14 @@ impl Renderer {
                 let mut bg = resolve_color(cell.bg, &self.palette, self.default_bg);
                 if cell.attrs.has(CellAttrs::INVERSE) {
                     std::mem::swap(&mut fg, &mut bg);
+                }
+                // Selection: classic xterm-style inverse highlighting.
+                // Composes after SGR-inverse but before the cursor, so a
+                // selected cell under the cursor still shows as the cursor.
+                if let Some(sel) = selection {
+                    if sel.contains(vrow, col_idx) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
                 }
                 if cursor == Some((vrow, col_idx)) {
                     bg = self.cursor_bg;

@@ -17,6 +17,7 @@ use winit::window::{Window, WindowAttributes};
 use crate::font::FontAtlas;
 use crate::picker::Picker;
 use crate::renderer::Renderer;
+use crate::selection::Selection;
 use crate::term::Term;
 use crate::theme::Theme;
 
@@ -194,9 +195,14 @@ impl Gpu {
         self.renderer.resize(&self.gl, (width, height));
     }
 
-    pub fn render(&mut self, term: &Term, picker: Option<&mut Picker>) {
+    pub fn render(
+        &mut self,
+        term: &Term,
+        picker: Option<&mut Picker>,
+        selection: Option<&Selection>,
+    ) {
         self.renderer
-            .prepare(&self.gl, term, &mut self.atlas, picker);
+            .prepare(&self.gl, term, &mut self.atlas, picker, selection);
         self.renderer.draw(&self.gl);
         if let Err(e) = self.surface.swap_buffers(&self.context) {
             log::warn!("swap_buffers: {e}");
