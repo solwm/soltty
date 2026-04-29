@@ -11,6 +11,10 @@ pub struct Term {
     /// 0 = viewport pinned to the bottom of the live grid (the normal case);
     /// N>0 = scrolled N lines into history.
     pub viewport_offset: usize,
+    /// Set/reset by DECSET 2004. When true, pastes should be wrapped in
+    /// `ESC [ 200~ ... ESC [ 201~` so the application can distinguish
+    /// pasted text from typed input.
+    pub bracketed_paste: bool,
 }
 
 impl Term {
@@ -22,6 +26,7 @@ impl Term {
             parser: Parser::new(),
             title: String::new(),
             viewport_offset: 0,
+            bracketed_paste: false,
         }
     }
 
@@ -300,6 +305,7 @@ impl<'a> Performer<'a> {
                         self.term.leave_alt();
                     }
                 }
+                2004 => self.term.bracketed_paste = on,
                 _ => {}
             }
         }

@@ -10,6 +10,7 @@ mod term;
 mod theme;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use winit::application::ApplicationHandler;
@@ -92,6 +93,7 @@ fn main() {
         picker: None,
         mouse_pos: (0.0, 0.0),
         selection: None,
+        last_click: None,
         clipboard: clipboard::Clipboard::new(),
     };
     event_loop.run_app(&mut app).expect("run event loop");
@@ -152,6 +154,10 @@ struct App {
     /// Active selection while the user is dragging or after release
     /// (we keep it visible until they click again).
     selection: Option<selection::Selection>,
+    /// Last left-press: time, cell, and how many fast clicks in a row
+    /// (1 = single, 2 = double, 3 = triple). Used to detect word/line
+    /// select on rapid repeats.
+    last_click: Option<(Instant, (usize, usize), u32)>,
     clipboard: clipboard::Clipboard,
 }
 
@@ -274,6 +280,16 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(sel) = self.selection.as_mut() {
                     if sel.dragging {
                         let (cw, ch) = gpu.cell_size();
+                        // Auto-scroll: if the cursor is dragged above the
+                        // top or below the bottom of the window, advance
+                        // the viewport so the user can extend the
+                        // selection past the visible region.
+                        let inner = window.inner_size();
+                        if position.y < 0.0 {
+                            self.term.scroll_view(1);
+                        } else if position.y > inner.height as f64 {
+                            self.term.scroll_view(-1);
+                        }
                         let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &self.term);
                         if cell != sel.end {
                             sel.end = cell;
@@ -291,21 +307,96 @@ impl ApplicationHandler<UserEvent> for App {
                 let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &self.term);
                 match state {
                     ElementState::Pressed => {
-                        self.selection = Some(selection::Selection::new(cell));
+                        // Shift+click extends the existing selection.
+                        if self.modifiers.shift_key() {
+                            if let Some(sel) = self.selection.as_mut() {
+                                sel.end = cell;
+                                sel.dragging = true;
+                                window.request_redraw();
+                                return;
+                            }
+                        }
+
+                        // Multi-click detection. Within 400ms of the last
+                        // press at the same cell, escalate to word (2)
+                        // then line (3) selection.
+                        const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
+                        let now = Instant::now();
+                        let count = match self.last_click {
+                            Some((t, c, n))
+                                if c == cell && now.duration_since(t) <= MULTI_CLICK_WINDOW =>
+                            {
+                                (n % 3) + 1
+                            }
+                            _ => 1,
+                        };
+                        self.last_click = Some((now, cell, count));
+
+                        let mut sel = match count {
+                            2 => {
+                                let (s, e) = selection::word_bounds(&self.term, cell.0, cell.1);
+                                let mut sel = selection::Selection::new(s);
+                                sel.end = e;
+                                sel
+                            }
+                            3 => {
+                                let (s, e) = selection::line_bounds(&self.term, cell.0);
+                                let mut sel = selection::Selection::new(s);
+                                sel.end = e;
+                                sel
+                            }
+                            _ => selection::Selection::new(cell),
+                        };
+                        // Word/line selections are committed; don't keep
+                        // dragging in cell-precision after a multi-click.
+                        if count > 1 {
+                            sel.dragging = false;
+                            // Auto-fill clipboard so triple-click → middle
+                            // click pastes the whole line.
+                            let text = selection::extract_text(&self.term, &sel);
+                            if !text.is_empty() {
+                                self.clipboard.set_primary(text.clone());
+                                self.clipboard.set_text(text);
+                            }
+                        }
+                        self.selection = Some(sel);
                         window.request_redraw();
                     }
                     ElementState::Released => {
                         if let Some(sel) = self.selection.as_mut() {
                             sel.dragging = false;
                             // Auto-copy on mouse-up if there's actually a range
-                            // (skip stray clicks).
+                            // (skip stray clicks). Fill both clipboards so
+                            // Ctrl+Shift+V and middle-click both paste it.
                             if !sel.is_empty() {
                                 let text = selection::extract_text(&self.term, sel);
                                 if !text.is_empty() {
+                                    self.clipboard.set_primary(text.clone());
                                     self.clipboard.set_text(text);
                                 }
                             }
                         }
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                // Middle-click pastes the primary selection — what most
+                // Linux apps do. Falls through to clipboard if there's no
+                // primary content.
+                let mut text = self.clipboard.get_primary();
+                if text.is_empty() {
+                    text = self.clipboard.get_text();
+                }
+                if !text.is_empty() {
+                    if let Some(pty) = self.pty.as_mut() {
+                        write_paste(pty, &text, self.term.bracketed_paste);
+                        self.term.reset_view();
+                        self.selection = None;
+                        window.request_redraw();
                     }
                 }
             }
@@ -392,6 +483,24 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                // Ctrl+Shift+V → paste from system clipboard.
+                if self.modifiers.control_key() && self.modifiers.shift_key() {
+                    if let Key::Character(s) = &logical_key {
+                        if s.eq_ignore_ascii_case("v") {
+                            let text = self.clipboard.get_text();
+                            if !text.is_empty() {
+                                if let Some(pty) = self.pty.as_mut() {
+                                    write_paste(pty, &text, self.term.bracketed_paste);
+                                    self.term.reset_view();
+                                    self.selection = None;
+                                    window.request_redraw();
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 // Font zoom: Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0. Handled
                 // locally; never forwarded to the PTY.
                 if let Some(target) = font_zoom_target(&logical_key, self.modifiers, gpu.font_size())
@@ -443,6 +552,20 @@ fn font_zoom_target(key: &Key, mods: ModifiersState, current_px: f32) -> Option<
 fn apply_picker_preview(gpu: &mut Gpu, picker: &picker::Picker, lib: &theme::ThemeLib) {
     let theme = picker.current(lib);
     gpu.set_theme(theme);
+}
+
+/// Write pasted text to the PTY, optionally wrapped in bracketed-paste
+/// markers. Bracketed paste lets the receiving program tell pasted bytes
+/// apart from typed input — important for editors that interpret newlines
+/// in paste differently from Enter.
+fn write_paste(pty: &mut Pty, text: &str, bracketed: bool) {
+    if bracketed {
+        pty.write(b"\x1b[200~");
+        pty.write(text.as_bytes());
+        pty.write(b"\x1b[201~");
+    } else {
+        pty.write(text.as_bytes());
+    }
 }
 
 /// Convert a window-pixel mouse position into viewport (row, col).

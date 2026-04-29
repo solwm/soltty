@@ -93,23 +93,19 @@ impl ThemeLib {
     }
 
     /// Look up a theme. Tries case-insensitive exact match first, then a
-    /// case-insensitive substring match (so `dracula` and `DRACULA` and
-    /// `dra` all find Dracula if it's the only match).
+    /// case-insensitive substring match. With 500+ themes a query like
+    /// `dracu` matches several (Dracula, Dracula+, Dracula Pro…), so we
+    /// return the shortest match — the canonical short name is the one
+    /// users almost always mean.
     pub fn find(&self, name: &str) -> Option<&Theme> {
         let needle = name.to_lowercase();
         if let Some(t) = self.themes.iter().find(|t| t.name.to_lowercase() == needle) {
             return Some(t);
         }
-        let matches: Vec<&Theme> = self
-            .themes
+        self.themes
             .iter()
             .filter(|t| t.name.to_lowercase().contains(&needle))
-            .collect();
-        if matches.len() == 1 {
-            Some(matches[0])
-        } else {
-            None
-        }
+            .min_by_key(|t| t.name.len())
     }
 
     pub fn default(&self) -> &Theme {
@@ -163,7 +159,7 @@ fn parse_user_theme(name: &str, src: &str) -> Result<Theme, String> {
             .split_once('=')
             .ok_or_else(|| format!("line {}: missing `=`", lineno + 1))?;
         let k = k.trim();
-        let v = v.trim().trim_matches('"');
+        let v = v.trim().trim_matches(|c: char| c == '"' || c == '\'');
         let rgb = parse_hex(v)
             .ok_or_else(|| format!("line {}: bad color {v:?}", lineno + 1))?;
         match (section.as_deref().unwrap_or(""), k) {
@@ -203,12 +199,14 @@ fn parse_user_theme(name: &str, src: &str) -> Result<Theme, String> {
 
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
-    let mut in_str = false;
+    let mut in_basic = false;
+    let mut in_literal = false;
     for (i, &b) in bytes.iter().enumerate() {
-        if b == b'"' {
-            in_str = !in_str;
-        } else if b == b'#' && !in_str {
-            return &line[..i];
+        match b {
+            b'"' if !in_literal => in_basic = !in_basic,
+            b'\'' if !in_basic => in_literal = !in_literal,
+            b'#' if !in_basic && !in_literal => return &line[..i],
+            _ => {}
         }
     }
     line

@@ -86,7 +86,9 @@ fn parse(src: &str) -> Result<ParsedTheme, String> {
             .split_once('=')
             .ok_or_else(|| format!("line {}: missing `=`", lineno + 1))?;
         let key = key.trim();
-        let value = value.trim().trim_matches('"');
+        // Accept either basic ("...") or literal ('...') TOML strings —
+        // iTerm2-Color-Schemes uses both styles inconsistently.
+        let value = value.trim().trim_matches(|c: char| c == '"' || c == '\'');
         let rgb = parse_hex(value)
             .ok_or_else(|| format!("line {}: bad color {value:?}", lineno + 1))?;
         let sec = section.as_deref().unwrap_or("");
@@ -134,16 +136,19 @@ fn parse(src: &str) -> Result<ParsedTheme, String> {
 }
 
 fn strip_comment(line: &str) -> &str {
-    // Comment is `#` not inside a string. Themes don't have hashes inside
-    // strings except for color literals like "#1d1d1d", so we cheat: a `#`
-    // outside of `"..."` starts a comment. Simple state machine.
+    // `#` outside of any string starts a comment. We need to track both
+    // basic ("...") AND literal ('...') strings because many themes write
+    // their hex literals in single quotes and the `#` inside `'#1d1d1d'`
+    // would otherwise look like the start of a comment.
     let bytes = line.as_bytes();
-    let mut in_str = false;
+    let mut in_basic = false;  // inside "..."
+    let mut in_literal = false; // inside '...'
     for (i, &b) in bytes.iter().enumerate() {
-        if b == b'"' {
-            in_str = !in_str;
-        } else if b == b'#' && !in_str {
-            return &line[..i];
+        match b {
+            b'"' if !in_literal => in_basic = !in_basic,
+            b'\'' if !in_basic => in_literal = !in_literal,
+            b'#' if !in_basic && !in_literal => return &line[..i],
+            _ => {}
         }
     }
     line

@@ -1,28 +1,33 @@
-# Nord — https://github.com/arcticicestudio/nord
-[colors.primary]
-background = "#2e3440"
-foreground = "#d8dee9"
-
-[colors.cursor]
-text   = "#2e3440"
-cursor = "#d8dee9"
-
-[colors.normal]
-black   = "#3b4252"
-red     = "#bf616a"
-green   = "#a3be8c"
-yellow  = "#ebcb8b"
-blue    = "#81a1c1"
-magenta = "#b48ead"
-cyan    = "#88c0d0"
-white   = "#e5e9f0"
+# Colors (Nord)
 
 [colors.bright]
-black   = "#4c566a"
-red     = "#bf616a"
-green   = "#a3be8c"
-yellow  = "#ebcb8b"
-blue    = "#81a1c1"
-magenta = "#b48ead"
-cyan    = "#8fbcbb"
-white   = "#eceff4"
+black = '#596377'
+blue = '#81a1c1'
+cyan = '#8fbcbb'
+green = '#a3be8c'
+magenta = '#b48ead'
+red = '#bf616a'
+white = '#eceff4'
+yellow = '#ebcb8b'
+
+[colors.cursor]
+cursor = '#eceff4'
+text = '#282828'
+
+[colors.normal]
+black = '#3b4252'
+blue = '#81a1c1'
+cyan = '#88c0d0'
+green = '#a3be8c'
+magenta = '#b48ead'
+red = '#bf616a'
+white = '#e5e9f0'
+yellow = '#ebcb8b'
+
+[colors.primary]
+background = '#2e3440'
+foreground = '#d8dee9'
+
+[colors.selection]
+background = '#eceff4'
+text = '#4c566a'

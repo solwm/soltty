@@ -26,21 +26,32 @@ Plus `portable-pty` for the OS-specific PTY dance (`forkpty` on Unix,
 ConPTY on Windows) and `etagere` for shelf-packing glyph rectangles into
 the atlas.
 
-## Mouse selection
+## Mouse selection and paste
 
 Three pieces:
 
 - **`src/selection.rs`** — `Selection` struct with `anchor` and `end`
   cells in viewport coords, plus a `dragging` flag. `normalized()` puts
   them in row-major order; `contains(row, col)` is the per-cell hit
-  test the renderer uses.
+  test the renderer uses. Also `word_bounds` and `line_bounds` for
+  multi-click expansion.
 - **Mouse handlers in `App::window_event`**:
-  - `CursorMoved` updates `App::mouse_pos` and, if a drag is in
-    progress, advances `selection.end`.
-  - `MouseInput { button: Left, state: Pressed }` — start a new
-    selection at the current pixel-mapped cell.
-  - `MouseInput { button: Left, state: Released }` — freeze the
-    selection and copy to clipboard if non-empty.
+  - `CursorMoved` updates `App::mouse_pos` and, if dragging, advances
+    `selection.end`. If the cursor is dragged outside the window the
+    viewport auto-scrolls so the user can extend selection past the
+    visible region.
+  - Left press: starts a new selection. Within 400 ms of the previous
+    press at the same cell, escalates: 2 = word, 3 = line. Shift+left
+    extends the existing selection's end instead of starting fresh.
+  - Left release: freezes the selection and fills *both* the regular
+    clipboard and the X11/Wayland *primary* selection so middle-click
+    pastes the most recent selection without a Ctrl+Shift+V cycle.
+  - Middle press: pastes the primary selection (falls back to clipboard
+    if primary is empty).
+- **Ctrl+Shift+V**: pastes from the regular clipboard.
+- **Bracketed paste**: when DECSET 2004 is on (`Term::bracketed_paste`),
+  pasted text is wrapped in `ESC [ 200~ ... ESC [ 201~` so editors can
+  tell pasted bytes from typed input.
 - **Renderer integration** — `Renderer::prepare` accepts an
   `Option<&Selection>` and applies an inverse-video swap on selected
   cells. Composes after SGR-inverse but before the cursor, so the
@@ -113,11 +124,15 @@ concern.
 
 Two pieces:
 
-- **`themes/*.toml`** — vendored themes in iTerm2-Color-Schemes Alacritty
-  TOML format. `build.rs` walks this directory at compile time, parses
-  each file with a tiny TOML-subset state machine (~50 LOC, no `toml`
-  crate dep), and emits a static `BUILTIN_THEMES` array into
-  `OUT_DIR/themes_data.rs` that `src/theme.rs` includes.
+- **`themes/*.toml`** — vendored snapshot of every theme in
+  `mbadolato/iTerm2-Color-Schemes`'s Alacritty TOML directory (504
+  themes as of this writing). `build.rs` walks the directory at
+  compile time, parses each file with a tiny TOML-subset state
+  machine (~50 LOC, no `toml` crate dep — but it does handle both
+  basic `"..."` and literal `'...'` strings, plus `#` inside strings,
+  because the upstream collection uses both), and emits a static
+  `BUILTIN_THEMES` array into `OUT_DIR/themes_data.rs` that
+  `src/theme.rs` includes.
 - **`~/.config/soltty/themes/*.toml`** — runtime overrides in the same
   format. Loaded once at startup by `ThemeLib::load`. A user theme with
   the same name as a builtin replaces it.
