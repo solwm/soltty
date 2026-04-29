@@ -111,22 +111,15 @@ impl Term {
         }
     }
 
-    /// Cursor's visual row/col within the current viewport, if visible.
-    /// Returns None when the cursor is scrolled out of the visible region,
-    /// or DECTCEM-hidden *while on the alt screen*. On the primary screen we
-    /// deliberately ignore `?25l` — programs that crash without restoring the
-    /// cursor (e.g. anything that runs `printf("\x1b[?25l")` and then exits)
-    /// would otherwise leave the user with a permanently invisible cursor at
-    /// the shell prompt. Vim/less/htop all use the alt screen, so they're
-    /// unaffected.
+    /// Cursor's visual row/col within the current viewport, or `None` if
+    /// it's scrolled out of view or DECTCEM-hidden via `?25l`. We honor
+    /// `?25l` on both screens — programs like gol-c use it on the primary
+    /// screen legitimately. If a program exits without restoring (`?25h`)
+    /// the user's shell prompt will be cursor-less until the next keypress
+    /// or `tput cnorm`; that's the same behavior as every other terminal.
     pub fn viewport_cursor(&self) -> Option<(usize, usize)> {
         let g = self.grid();
-        let visible = if self.on_alt {
-            g.cursor.visible
-        } else {
-            true
-        };
-        if !visible {
+        if !g.cursor.visible {
             return None;
         }
         let vrow = g.cursor.row + self.viewport_offset;
