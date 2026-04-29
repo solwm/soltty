@@ -13,11 +13,13 @@ fixed?" and "what do the synthetic axes show?".
 
 A truecolor-cell-paint loop in C, ~22 bytes per cell, no fps cap. This
 is what the user noticed soltty being slow on. With the fixes on this
-branch, soltty is statistically tied with alacritty:
+branch, soltty is in the same range as alacritty and faster than
+ghostty (5 runs each, 3s settle between runs):
 
 ```
-soltty:    5.47 - 5.65 M cells/s   (mean ~5.55)
-alacritty: 5.43 - 5.72 M cells/s   (mean ~5.63)
+soltty:    5.36 - 5.42 M cells/s   (mean ~5.40)
+alacritty: 5.47 - 5.65 M cells/s   (mean ~5.56)   +3% over soltty
+ghostty:   4.58 - 5.07 M cells/s   (mean ~4.89)   -10% under soltty
 ```
 
 Run with the harness in `~/workspace/gol-c`:
@@ -38,25 +40,35 @@ runs or numbers degrade — see "harness gotchas" below.
 
 ### Synthetic suite (`bench/compare.sh`)
 
-| axis             | soltty      | alacritty   | what it stresses                |
-|------------------|-------------|-------------|---------------------------------|
-| `truecolor_grid` | 9-10 M c/s  | 7-9 M c/s   | per-cell SGR repaint            |
-| `glyph_churn`    | 70-80 MB/s  | 70-90 MB/s  | atlas allocation + GPU upload   |
-| `scroll_storm`   | 4-7 M l/s   | 3-7 M l/s   | scrollback ring eviction        |
-| `raw_throughput` | 50-150 MB/s | 50-100 MB/s | parser printable fast path      |
-| `cursor_jumps`   | 6-9 M j/s   | 10-19 M j/s | pure CSI parser cost            |
+Indicative numbers from one 5-run-averaged session. **Trust gol-c
+for absolute claims** — the synthetic suite is too noisy
+(thermal/compositor variation) for cross-session comparisons.
 
-Ranges are not noise — most are repeatable for one machine within a
-single boot session, but vary between sessions and the system's
-thermal/compositor mood. **Trust gol-c for headline numbers.** Trust
-the synthetic suite for relative changes between consecutive runs of
-the same code, not absolute claims.
+| axis             | soltty | alacritty | ghostty | what it stresses              |
+|------------------|--------|-----------|---------|-------------------------------|
+| `truecolor_grid` | 9.0 M c/s | 8.3 M c/s | 4.6 M c/s | per-cell SGR repaint        |
+| `glyph_churn`    |  74 MB/s |  89 MB/s | 132 MB/s | atlas allocation + upload   |
+| `scroll_storm`   | 3.8 M l/s | 6.3 M l/s | 8.4 M l/s | scrollback ring eviction   |
+| `raw_throughput` |  60 MB/s | 103 MB/s | 105 MB/s | parser printable fast path |
+| `cursor_jumps`   | 8.2 M j/s | 18 M j/s | 14 M j/s | pure CSI parser cost       |
 
-The one place alacritty consistently still wins is `cursor_jumps`.
-That bench is a tight loop of `\e[<r>;<c>H` with nothing else — pure
-vte parser cost. Both terminals use the `vte` crate (same parser),
-but alacritty's wrapper is leaner. Real workloads don't look like
-this; we left it.
+Reading the table:
+
+- **`truecolor_grid` is the only synthetic axis we win clearly.**
+  Mirrors gol-c's workload (truecolor SGR + space per cell), so it
+  validates the throttle + SGR fast path doing real work for the
+  one user-perceived complaint.
+- **Ghostty's strengths are scrollback churn and atlas growth**, by
+  big margins. Different architecture — they have an SIMD parser
+  and a more aggressive atlas strategy.
+- **Alacritty wins `cursor_jumps`** (pure CSI parser cost). Both
+  soltty and alacritty use the `vte` crate, but alacritty's wrapper
+  around it is leaner. Real workloads don't look like this.
+- **`raw_throughput` (plain ASCII)** is the gap that surprises
+  people: alacritty and ghostty are both ~70% faster than us at
+  pumping plain bytes through the parser. Closing this would mean
+  rewriting the parser-to-grid glue. Not currently a priority — see
+  "what's still on the table" below.
 
 ## What this branch changed
 

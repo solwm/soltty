@@ -20,7 +20,7 @@ bin_dir="$repo/target/release"
 iters_override=""
 runs=1
 selected_bench=""
-terms=(soltty alacritty)
+terms=(soltty alacritty ghostty)
 cols_override=""
 rows_override=""
 
@@ -47,11 +47,13 @@ else
 fi
 
 # Verify each requested terminal exists. soltty is local; alacritty
-# may or may not be installed.
+# may or may not be installed; ghostty ships as a macOS .app bundle.
+GHOSTTY_APP="/Applications/Ghostty.app"
 for t in "${terms[@]}"; do
     case "$t" in
         soltty)    [ -x "$bin_dir/soltty" ] || { echo "missing $bin_dir/soltty — run cargo build --release" >&2; exit 1; } ;;
         alacritty) command -v alacritty >/dev/null || { echo "alacritty not on PATH; pass --terms soltty to skip it" >&2; exit 1; } ;;
+        ghostty)   [ -d "$GHOSTTY_APP" ] || { echo "Ghostty.app not in /Applications" >&2; exit 1; } ;;
         *) echo "unknown terminal: $t" >&2; exit 2 ;;
     esac
 done
@@ -79,6 +81,15 @@ run_one() {
             ;;
         alacritty)
             alacritty -e bash -lc "$inner" >/dev/null 2>&1
+            ;;
+        ghostty)
+            # Ghostty's CLI launcher returns immediately on macOS — the
+            # actual terminal lives in /Applications/Ghostty.app and is
+            # spawned via `open`. `-n` forces a fresh instance and `-W`
+            # blocks until it terminates, so the bench result file is
+            # ready by the time we return. Cold-spawn cost is ~3s of
+            # overhead per run, but the bench measures itself.
+            open -nWa "$GHOSTTY_APP" --args -e bash -lc "$inner" >/dev/null 2>&1
             ;;
     esac
 
@@ -122,10 +133,12 @@ average_runs() {
 for bench in "${benches[@]}"; do
     echo
     echo "=== $bench ==="
-    # macOS ships bash 3.2 — no associative arrays. Stash both metrics
-    # in plain variables so we can compute their ratio at the end.
+    # macOS ships bash 3.2 — no associative arrays. Stash each metric
+    # in its own variable so we can compute soltty's ratio against
+    # the others at the end.
     soltty_metric=""
     alacritty_metric=""
+    ghostty_metric=""
     for term in "${terms[@]}"; do
         runs_data=""
         for ((r=1; r<=runs; r++)); do
@@ -149,13 +162,21 @@ for bench in "${benches[@]}"; do
         case "$term" in
             soltty)    soltty_metric="$primary" ;;
             alacritty) alacritty_metric="$primary" ;;
+            ghostty)   ghostty_metric="$primary" ;;
         esac
     done
 
-    if [ -n "$soltty_metric" ] && [ -n "$alacritty_metric" ]; then
-        s_val=$(echo "$soltty_metric"    | awk '{ print $1+0 }')
-        a_val=$(echo "$alacritty_metric" | awk '{ print $1+0 }')
-        ratio=$(awk -v s="$s_val" -v a="$a_val" 'BEGIN { if (a > 0) printf "%.2f", s/a; else print "-" }')
-        echo "  -> soltty/alacritty: ${ratio}x"
+    if [ -n "$soltty_metric" ]; then
+        s_val=$(echo "$soltty_metric" | awk '{ print $1+0 }')
+        if [ -n "$alacritty_metric" ]; then
+            a_val=$(echo "$alacritty_metric" | awk '{ print $1+0 }')
+            ratio=$(awk -v s="$s_val" -v a="$a_val" 'BEGIN { if (a > 0) printf "%.2f", s/a; else print "-" }')
+            echo "  -> soltty/alacritty: ${ratio}x"
+        fi
+        if [ -n "$ghostty_metric" ]; then
+            g_val=$(echo "$ghostty_metric" | awk '{ print $1+0 }')
+            ratio=$(awk -v s="$s_val" -v g="$g_val" 'BEGIN { if (g > 0) printf "%.2f", s/g; else print "-" }')
+            echo "  -> soltty/ghostty:   ${ratio}x"
+        fi
     fi
 done

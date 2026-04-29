@@ -21,7 +21,7 @@ can `write(2)` rather than how fast the terminal actually consumes.
 
 ## Running
 
-The most common case — compare both terminals on every bench:
+The most common case — compare every terminal on every bench:
 
 ```
 ./bench/compare.sh
@@ -33,11 +33,25 @@ Useful flags:
 --iters N           Override BENCH_ITERS for every bench
 --runs N            Average N runs per (bench, terminal)
 --bench NAME        Run just one of the benches
---terms a,b         Comma-separated list (default: soltty,alacritty)
+--terms a,b         Comma-separated list. Default is
+                    soltty,alacritty,ghostty — drop names to skip.
 --cols N --rows N   Force a fixed grid size (different terminals open
                     at different default sizes, so this is needed for
                     apples-to-apples comparison)
 ```
+
+### Terminal launch quirks
+
+- `soltty -e <cmd>` and `alacritty -e <cmd>` block until `<cmd>`
+  exits, so the harness reads the result file right after they
+  return.
+- `ghostty -e ...` on macOS just signals an existing Ghostty.app
+  process and returns immediately, so the harness uses
+  `open -nWa Ghostty.app --args -e ...` instead. `-n` forces a
+  fresh app instance and `-W` blocks until it terminates. The
+  cold-spawn cost is ~3s of overhead per run that doesn't affect
+  the bench measurement (the bench times itself), but does make
+  multi-run comparisons slow.
 
 Each bench writes a single result line to a temp file:
 
@@ -62,12 +76,23 @@ through soltty's `-e` flag.
 
 ## Sample numbers (M5 MacBook, soltty performance branch)
 
-200×60 grid, default iters per bench:
+200×60 grid, --runs 5, one session. Numbers are noisy across
+sessions; treat as indicative ranges, not gospel.
 
 ```
-raw_throughput     soltty 150 MB/s     alacritty 103 MB/s    1.45x
-truecolor_grid     soltty 10.4M c/s    alacritty 8.3M c/s    1.26x
-scroll_storm       soltty 6.0M l/s     alacritty 7.0M l/s    0.87x
-cursor_jumps       soltty 17.4M j/s    alacritty 17.9M j/s   ~tied
-glyph_churn        soltty  80 MB/s     alacritty  77 MB/s    ~tied
+                soltty       alacritty   ghostty
+raw_throughput   60 MB/s     103 MB/s   105 MB/s
+truecolor_grid    9.0 M c/s    8.3 M c/s   4.6 M c/s   <- soltty wins
+scroll_storm      3.8 M l/s    6.3 M l/s   8.4 M l/s
+cursor_jumps      8.2 M j/s   18.0 M j/s  13.9 M j/s
+glyph_churn       74 MB/s      89 MB/s   132 MB/s
+```
+
+For the headline gol-c number (real-world truecolor stress test in
+a single long-lived window, low variance):
+
+```
+soltty:    ~5.40 M cells/s
+alacritty: ~5.56 M cells/s   (+3% over soltty)
+ghostty:   ~4.89 M cells/s   (-10% under soltty)
 ```
