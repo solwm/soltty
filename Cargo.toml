@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "bench"]
+
 [package]
 name = "soltty"
 version = "0.0.1"

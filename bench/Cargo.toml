@@ -1,0 +1,12 @@
+[package]
+name = "soltty-bench"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+terminal_size = "0.4"
+libc = "0.2"
