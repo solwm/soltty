@@ -16,7 +16,7 @@ use clap::Parser;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::gpu::{Gpu, DEFAULT_FONT_SIZE_PX};
@@ -414,6 +414,7 @@ impl ApplicationHandler<UserEvent> for App {
                 event:
                     KeyEvent {
                         logical_key,
+                        physical_key,
                         text,
                         state: ElementState::Pressed,
                         repeat: _,
@@ -421,20 +422,32 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                 ..
             } => {
+                log::debug!(
+                    "key: logical={logical_key:?} physical={physical_key:?} text={text:?} ctrl={} shift={} alt={}",
+                    self.modifiers.control_key(),
+                    self.modifiers.shift_key(),
+                    self.modifiers.alt_key(),
+                );
+
                 // Theme picker: Ctrl+Shift+T opens it. While open, all
                 // keystrokes are picker-local — never forwarded to the PTY.
                 if self.modifiers.control_key() && self.modifiers.shift_key() {
-                    if let Key::Character(s) = &logical_key {
-                        if s.eq_ignore_ascii_case("t") || s.eq_ignore_ascii_case("T") {
-                            if self.picker.is_none() {
-                                self.picker = Some(picker::Picker::new(
-                                    &self.theme_lib,
-                                    &self.active_theme_name,
-                                ));
-                                window.request_redraw();
-                            }
-                            return;
+                    // Match the physical T position OR the layout-aware
+                    // "t" character. Either works regardless of keyboard
+                    // layout; some platforms also deliver Ctrl-modified
+                    // keys as raw C0 bytes (\u{14} = Ctrl+T).
+                    let is_t = matches!(physical_key, PhysicalKey::Code(KeyCode::KeyT))
+                        || matches!(&logical_key, Key::Character(s) if s.eq_ignore_ascii_case("t"))
+                        || matches!(text.as_deref(), Some("\u{14}") | Some("t") | Some("T"));
+                    if is_t {
+                        if self.picker.is_none() {
+                            self.picker = Some(picker::Picker::new(
+                                &self.theme_lib,
+                                &self.active_theme_name,
+                            ));
+                            window.request_redraw();
                         }
+                        return;
                     }
                 }
                 if let Some(picker) = self.picker.as_mut() {
@@ -485,19 +498,20 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Ctrl+Shift+V → paste from system clipboard.
                 if self.modifiers.control_key() && self.modifiers.shift_key() {
-                    if let Key::Character(s) = &logical_key {
-                        if s.eq_ignore_ascii_case("v") {
-                            let text = self.clipboard.get_text();
-                            if !text.is_empty() {
-                                if let Some(pty) = self.pty.as_mut() {
-                                    write_paste(pty, &text, self.term.bracketed_paste);
-                                    self.term.reset_view();
-                                    self.selection = None;
-                                    window.request_redraw();
-                                }
+                    let is_v = matches!(physical_key, PhysicalKey::Code(KeyCode::KeyV))
+                        || matches!(&logical_key, Key::Character(s) if s.eq_ignore_ascii_case("v"))
+                        || matches!(text.as_deref(), Some("\u{16}") | Some("v") | Some("V"));
+                    if is_v {
+                        let pasted = self.clipboard.get_text();
+                        if !pasted.is_empty() {
+                            if let Some(pty) = self.pty.as_mut() {
+                                write_paste(pty, &pasted, self.term.bracketed_paste);
+                                self.term.reset_view();
+                                self.selection = None;
+                                window.request_redraw();
                             }
-                            return;
                         }
+                        return;
                     }
                 }
 
