@@ -19,7 +19,7 @@ ghostty (5 runs each, 3s settle between runs):
 ```
 soltty:    5.36 - 5.42 M cells/s   (mean ~5.40)
 alacritty: 5.47 - 5.65 M cells/s   (mean ~5.56)   +3% over soltty
-ghostty:   4.58 - 5.07 M cells/s   (mean ~4.89)   -10% under soltty
+ghostty:   4.49 - 5.07 M cells/s   (mean ~4.82)   -11% under soltty
 ```
 
 Run with the harness in `~/workspace/gol-c`:

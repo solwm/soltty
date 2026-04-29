@@ -94,5 +94,5 @@ a single long-lived window, low variance):
 ```
 soltty:    ~5.40 M cells/s
 alacritty: ~5.56 M cells/s   (+3% over soltty)
-ghostty:   ~4.89 M cells/s   (-10% under soltty)
+ghostty:   ~4.82 M cells/s   (-11% under soltty)
 ```
