@@ -269,10 +269,18 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyData => {
-                if let Some(pty) = self.pty.as_ref() {
+                if let Some(pty) = self.pty.as_mut() {
                     let bytes = pty.drain();
                     if !bytes.is_empty() {
                         self.term.feed(&bytes);
+                        // Parser may have produced reply bytes (DSR
+                        // cursor-position reports etc.) — write them
+                        // back to the PTY now so the application sees
+                        // the round-trip before its next read.
+                        let reply = self.term.take_reply();
+                        if !reply.is_empty() {
+                            pty.write(&reply);
+                        }
                         self.dirty = true;
                         self.maybe_request_redraw();
                     }

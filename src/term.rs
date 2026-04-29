@@ -15,6 +15,10 @@ pub struct Term {
     /// `ESC [ 200~ ... ESC [ 201~` so the application can distinguish
     /// pasted text from typed input.
     pub bracketed_paste: bool,
+    /// Bytes the parser wants to send back to the application (e.g. DSR
+    /// cursor-position reports). Drained by the host loop after each
+    /// `feed` and written to the PTY master.
+    reply: Vec<u8>,
 }
 
 impl Term {
@@ -27,7 +31,14 @@ impl Term {
             title: String::new(),
             viewport_offset: 0,
             bracketed_paste: false,
+            reply: Vec::new(),
         }
+    }
+
+    /// Hand back any pending reply bytes (e.g. from DSR), clearing the
+    /// internal buffer. Called by the host loop after every `feed`.
+    pub fn take_reply(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.reply)
     }
 
     pub fn grid(&self) -> &Grid {
@@ -245,6 +256,7 @@ impl<'a> Perform for Performer<'a> {
             (false, 's') => self.grid().save_cursor(),
             (false, 'u') => self.grid().restore_cursor(),
             (false, 'm') => apply_sgr(self.grid(), params),
+            (false, 'n') => self.dsr(arg(&nums, 0, 0)),
             (true, 'h') => self.set_private_modes(&nums, true),
             (true, 'l') => self.set_private_modes(&nums, false),
             _ => {}
@@ -291,6 +303,24 @@ impl<'a> Perform for Performer<'a> {
 }
 
 impl<'a> Performer<'a> {
+    /// `CSI Pn n` — Device Status Report. Pn=5 asks "are you ok?",
+    /// Pn=6 asks "where's the cursor?". Replies feed back through
+    /// `Term::reply` and are written to the PTY by the host loop.
+    fn dsr(&mut self, n: u16) {
+        match n {
+            5 => self.term.reply.extend_from_slice(b"\x1b[0n"),
+            6 => {
+                let (row, col) = {
+                    let g = self.term.grid();
+                    (g.cursor.row + 1, g.cursor.col + 1)
+                };
+                let resp = format!("\x1b[{row};{col}R");
+                self.term.reply.extend_from_slice(resp.as_bytes());
+            }
+            _ => {}
+        }
+    }
+
     fn set_private_modes(&mut self, nums: &[u16], on: bool) {
         for &n in nums {
             match n {
