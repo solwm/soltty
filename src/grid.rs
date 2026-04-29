@@ -249,18 +249,39 @@ impl Grid {
         let n = n.min(self.scroll_bot - self.scroll_top + 1);
         let full_screen = self.scroll_top == 0 && self.scroll_bot == self.rows - 1;
         for _ in 0..n {
-            if full_screen {
-                let row = std::mem::replace(&mut self.lines[0], Row::blank(self.cols, self.pen));
-                self.scrollback.push_back(row);
-                while self.scrollback.len() > self.scrollback_limit {
-                    self.scrollback.pop_front();
-                }
-                self.lines.rotate_left(1);
-            } else {
+            if !full_screen {
                 let blank = Row::blank(self.cols, self.pen);
                 self.lines[self.scroll_top..=self.scroll_bot].rotate_left(1);
                 self.lines[self.scroll_bot] = blank;
+                continue;
             }
+            if self.scrollback_limit == 0 {
+                // Alt-screen scroll without history. The displaced row
+                // would be pushed and immediately popped — short-circuit
+                // to clearing in place, no VecDeque churn.
+                self.lines[0].clear_with(self.pen);
+                self.lines.rotate_left(1);
+                continue;
+            }
+            // In steady state scrollback is full and we'd otherwise
+            // allocate a fresh blank `Vec<Cell>` AND free the oldest
+            // scrollback row's. Recycle: pop the oldest, reset it, use
+            // it as the new blank. Saves one alloc + one free per scroll.
+            let blank = if self.scrollback.len() >= self.scrollback_limit {
+                let mut row = self.scrollback.pop_front().expect("len > 0");
+                // `Grid::resize` doesn't touch scrollback, so a row
+                // recycled across a width change needs reshaping.
+                if row.cells.len() != self.cols {
+                    row.cells.resize(self.cols, Cell::default());
+                }
+                row.clear_with(self.pen);
+                row
+            } else {
+                Row::blank(self.cols, self.pen)
+            };
+            let old = std::mem::replace(&mut self.lines[0], blank);
+            self.scrollback.push_back(old);
+            self.lines.rotate_left(1);
         }
     }
 
