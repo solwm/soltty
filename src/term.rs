@@ -207,58 +207,61 @@ impl<'a> Perform for Performer<'a> {
             return;
         }
 
-        let nums: Vec<u16> = collect_first_subparams(params);
+        // Read params lazily out of `params` instead of collecting them
+        // into a `Vec<u16>`. Most arms only look at the first one or
+        // two args; CUP at random row/col was the cursor_jumps bench's
+        // hot spot precisely because we used to allocate per dispatch.
 
         match (private, action) {
-            (false, 'A') => self.grid().move_cursor(-(arg(&nums, 0, 1) as isize), 0),
-            (false, 'B') => self.grid().move_cursor(arg(&nums, 0, 1) as isize, 0),
-            (false, 'C') => self.grid().move_cursor(0, arg(&nums, 0, 1) as isize),
-            (false, 'D') => self.grid().move_cursor(0, -(arg(&nums, 0, 1) as isize)),
+            (false, 'A') => self.grid().move_cursor(-(arg(params, 0, 1) as isize), 0),
+            (false, 'B') => self.grid().move_cursor(arg(params, 0, 1) as isize, 0),
+            (false, 'C') => self.grid().move_cursor(0, arg(params, 0, 1) as isize),
+            (false, 'D') => self.grid().move_cursor(0, -(arg(params, 0, 1) as isize)),
             (false, 'E') => {
-                let n = arg(&nums, 0, 1) as isize;
+                let n = arg(params, 0, 1) as isize;
                 let g = self.grid();
                 g.move_cursor(n, 0);
                 g.carriage_return();
             }
             (false, 'F') => {
-                let n = arg(&nums, 0, 1) as isize;
+                let n = arg(params, 0, 1) as isize;
                 let g = self.grid();
                 g.move_cursor(-n, 0);
                 g.carriage_return();
             }
             (false, 'G') => {
-                let col = arg(&nums, 0, 1).saturating_sub(1) as usize;
+                let col = arg(params, 0, 1).saturating_sub(1) as usize;
                 let r = self.grid().cursor.row;
                 self.grid().goto(r, col);
             }
             (false, 'H') | (false, 'f') => {
-                let row = arg(&nums, 0, 1).saturating_sub(1) as usize;
-                let col = arg(&nums, 1, 1).saturating_sub(1) as usize;
+                let row = arg(params, 0, 1).saturating_sub(1) as usize;
+                let col = arg(params, 1, 1).saturating_sub(1) as usize;
                 self.grid().goto(row, col);
             }
-            (false, 'J') => self.grid().erase_display(arg(&nums, 0, 0)),
-            (false, 'K') => self.grid().erase_line(arg(&nums, 0, 0)),
-            (false, 'L') => self.grid().insert_lines(arg(&nums, 0, 1) as usize),
-            (false, 'M') => self.grid().delete_lines(arg(&nums, 0, 1) as usize),
-            (false, 'P') => self.grid().delete_chars(arg(&nums, 0, 1) as usize),
-            (false, '@') => self.grid().insert_chars(arg(&nums, 0, 1) as usize),
-            (false, 'X') => self.grid().erase_chars(arg(&nums, 0, 1) as usize),
+            (false, 'J') => self.grid().erase_display(arg(params, 0, 0)),
+            (false, 'K') => self.grid().erase_line(arg(params, 0, 0)),
+            (false, 'L') => self.grid().insert_lines(arg(params, 0, 1) as usize),
+            (false, 'M') => self.grid().delete_lines(arg(params, 0, 1) as usize),
+            (false, 'P') => self.grid().delete_chars(arg(params, 0, 1) as usize),
+            (false, '@') => self.grid().insert_chars(arg(params, 0, 1) as usize),
+            (false, 'X') => self.grid().erase_chars(arg(params, 0, 1) as usize),
             (false, 'd') => {
-                let row = arg(&nums, 0, 1).saturating_sub(1) as usize;
+                let row = arg(params, 0, 1).saturating_sub(1) as usize;
                 let c = self.grid().cursor.col;
                 self.grid().goto(row, c);
             }
             (false, 'r') => {
-                let top = arg(&nums, 0, 1).saturating_sub(1) as usize;
-                let bot = arg(&nums, 1, self.grid().rows as u16).saturating_sub(1) as usize;
+                let top = arg(params, 0, 1).saturating_sub(1) as usize;
+                let bot = arg(params, 1, self.grid().rows as u16).saturating_sub(1) as usize;
                 self.grid().set_scroll_region(top, bot);
             }
             (false, 's') => self.grid().save_cursor(),
             (false, 'u') => self.grid().restore_cursor(),
             (false, 'm') => apply_sgr(self.grid(), params),
-            (false, 'n') => self.dsr(arg(&nums, 0, 0)),
-            (true, 'h') => self.set_private_modes(&nums, true),
-            (true, 'l') => self.set_private_modes(&nums, false),
+            (false, 'n') => self.dsr(arg(params, 0, 0)),
+            (true, 'h') => self.set_private_modes(params, true),
+            (true, 'l') => self.set_private_modes(params, false),
             _ => {}
         }
     }
@@ -321,8 +324,9 @@ impl<'a> Performer<'a> {
         }
     }
 
-    fn set_private_modes(&mut self, nums: &[u16], on: bool) {
-        for &n in nums {
+    fn set_private_modes(&mut self, params: &Params, on: bool) {
+        for sub in params.iter() {
+            let n = sub.first().copied().unwrap_or(0);
             match n {
                 25 => self.grid().cursor.visible = on,
                 47 | 1047 | 1049 => {
@@ -345,18 +349,18 @@ impl<'a> Performer<'a> {
     }
 }
 
-fn arg(nums: &[u16], idx: usize, default: u16) -> u16 {
-    nums.get(idx)
-        .copied()
-        .filter(|n| *n != 0)
-        .unwrap_or(default)
-}
-
-fn collect_first_subparams(params: &Params) -> Vec<u16> {
+/// Read the n-th param's first subparam. Returns `default` when the
+/// param is missing or zero (per ECMA-48: a zero arg is treated as
+/// "default" for movement commands). Walks `params` directly without
+/// allocating — `nth(idx)` is O(idx) and `idx` is at most 1 in our
+/// dispatch.
+fn arg(params: &Params, idx: usize, default: u16) -> u16 {
     params
         .iter()
-        .map(|sub| sub.first().copied().unwrap_or(0))
-        .collect()
+        .nth(idx)
+        .and_then(|sub| sub.first().copied())
+        .filter(|n| *n != 0)
+        .unwrap_or(default)
 }
 
 fn apply_sgr(grid: &mut Grid, params: &Params) {
