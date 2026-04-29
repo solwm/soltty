@@ -140,9 +140,9 @@ impl Gpu {
         );
 
         let initial_font_px = startup_font_px();
-        let atlas = FontAtlas::new(initial_font_px).expect("load font");
+        let mut atlas = FontAtlas::new(initial_font_px).expect("load font");
         let inner = window.inner_size();
-        let renderer = Renderer::new(&gl, (inner.width, inner.height), &atlas, theme);
+        let renderer = Renderer::new(&gl, (inner.width, inner.height), &mut atlas, theme);
 
         let gpu = Self {
             gl,
@@ -182,7 +182,7 @@ impl Gpu {
         match FontAtlas::new(px) {
             Ok(atlas) => {
                 self.atlas = atlas;
-                self.renderer.reload_font(&self.gl, &self.atlas);
+                self.renderer.reload_font(&self.gl, &mut self.atlas);
                 self.font_px = px;
                 log::info!(
                     "font: {:.1}px (cell {:?})",

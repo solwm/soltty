@@ -99,7 +99,7 @@ impl Renderer {
     pub fn new(
         gl: &glow::Context,
         screen_size: (u32, u32),
-        atlas: &FontAtlas,
+        atlas: &mut FontAtlas,
         theme: &Theme,
     ) -> Self {
         let palette = build_palette(theme);
@@ -114,6 +114,9 @@ impl Renderer {
         let (vao, vbo) = unsafe { build_vao_vbo(gl, INITIAL_INSTANCE_CAPACITY) };
 
         let atlas_tex = unsafe { build_atlas_texture(gl, atlas) };
+        // The pre-baked ASCII glyphs already shipped via `tex_image_2d`
+        // above; clear so the first `prepare()` doesn't re-upload them.
+        atlas.dirty_rects.clear();
 
         let renderer = Self {
             program,
@@ -167,7 +170,12 @@ impl Renderer {
     /// Re-upload glyph atlas pixels and update cell-size uniform after a
     /// font reload (e.g. zoom). Atlas dimensions are fixed in `FontAtlas::new`,
     /// so the texture object stays the same — we just call `tex_sub_image_2d`.
-    pub fn reload_font(&mut self, gl: &glow::Context, atlas: &FontAtlas) {
+    /// One full upload is the right call here even though steady-state
+    /// uploads are now per-rect: a fresh atlas allocator places glyphs
+    /// at brand new positions, so the entire texture needs replacing.
+    /// We then clear `dirty_rects` so the next `prepare()` doesn't
+    /// redundantly re-upload the rects we just covered.
+    pub fn reload_font(&mut self, gl: &glow::Context, atlas: &mut FontAtlas) {
         debug_assert_eq!(self.atlas_size, (atlas.atlas_w, atlas.atlas_h));
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas_tex));
@@ -183,6 +191,7 @@ impl Renderer {
                 glow::PixelUnpackData::Slice(&atlas.atlas_data),
             );
         }
+        atlas.dirty_rects.clear();
         self.cell_size = (atlas.metrics.cell_w, atlas.metrics.cell_h);
         unsafe { self.upload_uniforms(gl) };
     }
@@ -249,22 +258,32 @@ impl Renderer {
             self.append_fps_overlay(rows, cols, atlas);
         }
 
-        if atlas.atlas_dirty {
+        if !atlas.dirty_rects.is_empty() {
             unsafe {
                 gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas_tex));
-                gl.tex_sub_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    atlas.atlas_w as i32,
-                    atlas.atlas_h as i32,
-                    glow::RED,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(&atlas.atlas_data),
-                );
+                // The source slice has the full atlas's row stride
+                // (atlas_w bytes per row), but we're only uploading a
+                // rect.w-wide block. UNPACK_ROW_LENGTH tells GL how
+                // far apart consecutive source rows are.
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, atlas.atlas_w as i32);
+                for rect in &atlas.dirty_rects {
+                    let offset = (rect.y * atlas.atlas_w + rect.x) as usize;
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        rect.x as i32,
+                        rect.y as i32,
+                        rect.w as i32,
+                        rect.h as i32,
+                        glow::RED,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(&atlas.atlas_data[offset..]),
+                    );
+                }
+                // Reset to default (0 == "use upload region's width").
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
             }
-            atlas.atlas_dirty = false;
+            atlas.dirty_rects.clear();
         }
 
         let needed = self.instances_scratch.len();

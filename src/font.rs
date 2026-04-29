@@ -17,6 +17,18 @@ pub struct GlyphEntry {
     pub offset_y: i16,
 }
 
+/// One contiguous region of `atlas_data` that's been mutated since the
+/// last GPU upload. The renderer drains this list every frame and
+/// uploads only these rects via `tex_sub_image_2d` — saves ~1 MB of
+/// PCIe traffic per new glyph compared to re-uploading the whole atlas.
+#[derive(Copy, Clone, Debug)]
+pub struct DirtyRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct CellMetrics {
     pub cell_w: u32,
@@ -32,8 +44,9 @@ pub struct FontAtlas {
     pub atlas_w: u32,
     pub atlas_h: u32,
     pub atlas_data: Vec<u8>,
-    /// Set when atlas_data has been mutated since the last GPU upload.
-    pub atlas_dirty: bool,
+    /// Per-glyph rects added to the atlas since the last GPU upload.
+    /// Empty == clean, no upload needed.
+    pub dirty_rects: Vec<DirtyRect>,
     glyphs: HashMap<char, GlyphEntry>,
     allocator: AtlasAllocator,
     scale_ctx: ScaleContext,
@@ -69,7 +82,7 @@ impl FontAtlas {
             atlas_w,
             atlas_h,
             atlas_data,
-            atlas_dirty: true,
+            dirty_rects: Vec::new(),
             glyphs: HashMap::new(),
             allocator,
             scale_ctx: ScaleContext::new(),
@@ -181,7 +194,12 @@ impl FontAtlas {
             }
         }
 
-        self.atlas_dirty = true;
+        self.dirty_rects.push(DirtyRect {
+            x: ax,
+            y: ay,
+            w,
+            h,
+        });
         self.glyphs.insert(
             ch,
             GlyphEntry {
