@@ -131,7 +131,10 @@ for bench in "${benches[@]}"; do
         for ((r=1; r<=runs; r++)); do
             line=$(run_one "$bench" "$term") || continue
             runs_data+="$line"$'\n'
-            sleep 0.2
+            # macOS throttles back-to-back GPU window creation — short
+            # sleeps produce 2-3x slower numbers in subsequent runs.
+            # 1.5s is empirically enough for the compositor to settle.
+            sleep 1.5
         done
         if [ -z "$runs_data" ]; then
             echo "  $term: no successful runs" >&2
