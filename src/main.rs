@@ -134,8 +134,9 @@ impl ApplicationHandler<UserEvent> for App {
         let attrs = Window::default_attributes()
             .with_title("soltty")
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
-        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let gpu = pollster::block_on(Gpu::new(window.clone()));
+        // glutin needs to pick a GL config alongside the window, so it owns
+        // the window creation. We get the Arc<Window> back for input handling.
+        let (window, gpu) = Gpu::new(event_loop, attrs);
 
         let inner = window.inner_size();
         let (rows, cols) = grid_dims_for_window(gpu.cell_size(), inner.width, inner.height);
@@ -163,6 +164,17 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.pty = Some(pty);
         self.term = term;
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // NVIDIA's EGL-Wayland implementation segfaults inside
+        // eglDestroySurface if the wl_display has been torn down before
+        // the surface — which is exactly what happens once `run_app`
+        // returns. Drop the GL state here, while winit's Wayland
+        // connection is still alive.
+        self.gpu = None;
+        self.window = None;
+        self.pty = None;
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -217,9 +229,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Err(err) = gpu.render(&self.term) {
-                    log::warn!("render error: {err:?}");
-                }
+                gpu.render(&self.term);
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();

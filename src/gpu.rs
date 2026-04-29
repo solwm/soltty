@@ -1,7 +1,18 @@
+use std::ffi::CString;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use wgpu::SurfaceError;
-use winit::window::Window;
+use glow::HasContext;
+use glutin::config::{ConfigTemplateBuilder, GlConfig};
+use glutin::context::{
+    ContextApi, ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentContext, Version,
+};
+use glutin::display::{GetGlDisplay, GlDisplay};
+use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
+use glutin_winit::{DisplayBuilder, GlWindow};
+use raw_window_handle::HasWindowHandle;
+use winit::event_loop::ActiveEventLoop;
+use winit::window::{Window, WindowAttributes};
 
 use crate::font::FontAtlas;
 use crate::renderer::Renderer;
@@ -13,100 +24,116 @@ const MIN_FONT_SIZE_PX: f32 = 6.0;
 const MAX_FONT_SIZE_PX: f32 = 96.0;
 
 pub struct Gpu {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
+    gl: glow::Context,
+    surface: Surface<WindowSurface>,
+    context: PossiblyCurrentContext,
     renderer: Renderer,
     atlas: FontAtlas,
     font_px: f32,
 }
 
 impl Gpu {
-    pub async fn new(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
+    /// Build window + GL context together. Returns the Window so the caller
+    /// can pass it to winit and keep an `Arc<Window>` for input handling.
+    pub fn new(
+        event_loop: &ActiveEventLoop,
+        window_attrs: WindowAttributes,
+    ) -> (Arc<Window>, Self) {
+        let template = ConfigTemplateBuilder::new()
+            .prefer_hardware_accelerated(Some(true))
+            .with_alpha_size(8);
 
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("create surface");
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
+        let (window, gl_config) = DisplayBuilder::new()
+            .with_window_attributes(Some(window_attrs))
+            .build(event_loop, template, |configs| {
+                // Pick a config with the most samples we can get; ties broken
+                // by accepting the first.
+                configs
+                    .reduce(|acc, c| if c.num_samples() > acc.num_samples() { c } else { acc })
+                    .expect("no GL configs")
             })
-            .await
-            .expect("request adapter");
+            .expect("build display");
+        let window = Arc::new(window.expect("DisplayBuilder yielded no window"));
 
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("soltty-device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults()
-                        .using_resolution(adapter.limits()),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
-            .await
-            .expect("request device");
+        let raw_window_handle = window
+            .window_handle()
+            .expect("window_handle")
+            .as_raw();
+        let gl_display = gl_config.display();
 
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+        // Try OpenGL 3.3 core. Fall back to OpenGL ES 3.0 if the driver
+        // refuses (rare on desktop, common on embedded).
+        let context_attrs = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
+            .build(Some(raw_window_handle));
+        let fallback_attrs = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::Gles(Some(Version::new(3, 0))))
+            .build(Some(raw_window_handle));
 
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: caps
-                .present_modes
-                .iter()
-                .copied()
-                .find(|m| *m == wgpu::PresentMode::Mailbox)
-                .unwrap_or(wgpu::PresentMode::Fifo),
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
+        let not_current_context = unsafe {
+            gl_display
+                .create_context(&gl_config, &context_attrs)
+                .or_else(|_| gl_display.create_context(&gl_config, &fallback_attrs))
+                .expect("create context")
         };
-        surface.configure(&device, &config);
+
+        let surface_attrs = window
+            .build_surface_attributes(SurfaceAttributesBuilder::default())
+            .expect("build surface attributes");
+        let surface = unsafe {
+            gl_display
+                .create_window_surface(&gl_config, &surface_attrs)
+                .expect("create surface")
+        };
+
+        let context = not_current_context
+            .make_current(&surface)
+            .expect("make current");
+
+        // Vsync. SwapInterval::Wait(1) = wait for one vsync per swap.
+        // The terminal redraws sparsely so this is mostly free; without it,
+        // wheel-spinning programs would tear.
+        let _ = surface.set_swap_interval(&context, SwapInterval::Wait(NonZeroU32::new(1).unwrap()));
+
+        let gl = unsafe {
+            glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s) as *const _)
+        };
+
+        // Linear-light blending against an sRGB framebuffer — same model as
+        // the wgpu version had, just without wgpu's auto-format pick.
+        unsafe {
+            gl.enable(glow::FRAMEBUFFER_SRGB);
+            let size = window.inner_size();
+            gl.viewport(0, 0, size.width as i32, size.height as i32);
+        }
 
         log::info!(
-            "wgpu: adapter={:?} format={:?} present={:?}",
-            adapter.get_info().name,
-            format,
-            config.present_mode
+            "gl: {} | {} | {}",
+            unsafe { gl.get_parameter_string(glow::VERSION) },
+            unsafe { gl.get_parameter_string(glow::RENDERER) },
+            unsafe { gl.get_parameter_string(glow::VENDOR) },
         );
 
         let atlas = FontAtlas::new(DEFAULT_FONT_SIZE_PX).expect("load font");
-        let renderer = Renderer::new(
-            &device,
-            &queue,
-            format,
-            (config.width, config.height),
-            &atlas,
-        );
+        let inner = window.inner_size();
+        let renderer = Renderer::new(&gl, (inner.width, inner.height), &atlas);
 
-        Self {
+        let gpu = Self {
+            gl,
             surface,
-            device,
-            queue,
-            config,
+            context,
             renderer,
             atlas,
             font_px: DEFAULT_FONT_SIZE_PX,
-        }
+        };
+
+        // Suppress the "unused" check for fields that aren't read yet.
+        let _ = &gpu.context;
+
+        // Ensure CString is in scope so the loader closure compiles cleanly.
+        let _ = CString::new("");
+
+        (window, gpu)
     }
 
     pub fn cell_size(&self) -> (u32, u32) {
@@ -117,9 +144,6 @@ impl Gpu {
         self.font_px
     }
 
-    /// Reload the font atlas at a new pixel size and rewire it into the
-    /// renderer. Returns the new cell size so the caller can resize the
-    /// terminal grid + PTY winsize accordingly.
     pub fn set_font_size(&mut self, px: f32) -> (u32, u32) {
         let px = px.clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX);
         if (px - self.font_px).abs() < 0.05 {
@@ -128,7 +152,7 @@ impl Gpu {
         match FontAtlas::new(px) {
             Ok(atlas) => {
                 self.atlas = atlas;
-                self.renderer.reload_font(&self.queue, &self.atlas);
+                self.renderer.reload_font(&self.gl, &self.atlas);
                 self.font_px = px;
                 log::info!(
                     "font: {:.1}px (cell {:?})",
@@ -145,55 +169,19 @@ impl Gpu {
         if width == 0 || height == 0 {
             return;
         }
-        self.config.width = width;
-        self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
-        self.renderer.resize(&self.queue, (width, height));
+        self.surface.resize(
+            &self.context,
+            NonZeroU32::new(width).unwrap(),
+            NonZeroU32::new(height).unwrap(),
+        );
+        self.renderer.resize(&self.gl, (width, height));
     }
 
-    pub fn render(&mut self, term: &Term) -> Result<(), SurfaceError> {
-        self.renderer
-            .prepare(&self.device, &self.queue, term, &mut self.atlas);
-
-        let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(SurfaceError::Lost | SurfaceError::Outdated) => {
-                self.surface.configure(&self.device, &self.config);
-                self.surface.get_current_texture()?
-            }
-            Err(e) => return Err(e),
-        };
-
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("soltty-encoder"),
-            });
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("soltty-grid"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.renderer.clear_color()),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            self.renderer.draw(&mut pass);
+    pub fn render(&mut self, term: &Term) {
+        self.renderer.prepare(&self.gl, term, &mut self.atlas);
+        self.renderer.draw(&self.gl);
+        if let Err(e) = self.surface.swap_buffers(&self.context) {
+            log::warn!("swap_buffers: {e}");
         }
-
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
-        Ok(())
     }
 }

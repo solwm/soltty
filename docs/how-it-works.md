@@ -16,13 +16,33 @@ Almost everything soltty does is some combination of four crates:
 | Role          | Crate          | What it actually owns                                    |
 |---------------|----------------|----------------------------------------------------------|
 | Window + input| `winit`        | The OS window, keyboard/mouse/scale events               |
-| GPU           | `wgpu`         | The Vulkan/Metal/DX12 device, surface, render pass       |
+| GL context    | `glutin`       | OpenGL context + surface creation per platform           |
+| GL bindings   | `glow`         | Thin Rust binding to the OpenGL function pointers        |
 | ANSI parser   | `vte`          | The byte-by-byte CSI/OSC/ESC state machine               |
 | Rasterizer    | `swash`        | Outline → 8-bit alpha bitmap for one glyph at one size   |
 
 Plus `portable-pty` for the OS-specific PTY dance (`forkpty` on Unix,
 ConPTY on Windows) and `etagere` for shelf-packing glyph rectangles into
 the atlas.
+
+### Why GL and not wgpu
+
+Earlier soltty used `wgpu` for portability and the safe API. We switched
+because of a measurable performance gap: `hyperfine -e true` showed
+soltty at ~520 ms vs alacritty at ~250 ms (1.9× slower), with almost
+the entire gap in *system CPU time* — i.e. kernel/driver work during
+Vulkan loader init, adapter selection, and device creation.
+
+After switching to `glow + glutin`, the same benchmark gives soltty
+~155 ms vs alacritty ~245 ms (1.58× **faster**). The Vulkan setup cost
+just doesn't exist on the GL path: one EGL context creation instead of
+loader → instance → adapter enumeration → device. We're now closer to
+the floor of "what does it cost to open a window and a GL context on
+Linux."
+
+Trade we accepted: no Metal/DX12/WebGPU portability and a `Cell`-deep
+unsafe block around every GL call. For a Linux/macOS terminal that
+emits one instanced draw call per frame, neither is a real loss.
 
 There's no `tokio`, no `async-std`, no message-passing actor framework.
 There is one main thread driving winit, plus exactly one helper thread that
