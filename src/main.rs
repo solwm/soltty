@@ -95,6 +95,10 @@ fn main() {
         selection: None,
         last_click: None,
         clipboard: clipboard::Clipboard::new(),
+        trace: cli.trace,
+        redraw_pending: false,
+        dirty: false,
+        last_render: None,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -133,6 +137,11 @@ struct Cli {
         value_name = "CMD",
     )]
     command: Vec<String>,
+
+    /// Show a small FPS counter in the top-right corner. Useful for
+    /// eyeballing render-loop performance under load.
+    #[arg(long = "trace")]
+    trace: bool,
 }
 
 struct App {
@@ -159,7 +168,24 @@ struct App {
     /// select on rapid repeats.
     last_click: Option<(Instant, (usize, usize), u32)>,
     clipboard: clipboard::Clipboard,
+    /// `--trace`: draw an FPS counter overlay in the top-right corner.
+    trace: bool,
+    /// While true, we've called `request_redraw` and the matching
+    /// `RedrawRequested` hasn't fired yet. Suppresses extra calls.
+    redraw_pending: bool,
+    /// Set by PtyData when there's data the user hasn't seen yet. Cleared
+    /// by RedrawRequested. `about_to_wait` re-arms a redraw if this is
+    /// still set after we've gone quiet (e.g. last byte arrived during
+    /// the throttle window).
+    dirty: bool,
+    /// When the last frame was actually presented. Used to cap redraw rate
+    /// at ~60 Hz — without this, under a chatty PTY producer we paint 2-3×
+    /// per game frame, and `swap_buffers` (≈200µs each on macOS Metal/GL
+    /// even with vsync off) becomes the dominant cost.
+    last_render: Option<Instant>,
 }
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -207,6 +233,28 @@ impl ApplicationHandler<UserEvent> for App {
         self.term = term;
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // If there's pending data we deferred during the throttle window,
+        // either request a redraw now (deadline elapsed) or arm a timer
+        // wakeup so we paint exactly when the next slot opens.
+        if !self.dirty || self.redraw_pending {
+            return;
+        }
+        match self.last_render {
+            None => {
+                self.do_request_redraw();
+            }
+            Some(t) => {
+                let next = t + FRAME_INTERVAL;
+                if Instant::now() >= next {
+                    self.do_request_redraw();
+                } else {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                }
+            }
+        }
+    }
+
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // NVIDIA's EGL-Wayland implementation segfaults inside
         // eglDestroySurface if the wl_display has been torn down before
@@ -225,9 +273,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let bytes = pty.drain();
                     if !bytes.is_empty() {
                         self.term.feed(&bytes);
-                        if let Some(window) = self.window.as_ref() {
-                            window.request_redraw();
-                        }
+                        self.dirty = true;
+                        self.maybe_request_redraw();
                     }
                 }
             }
@@ -270,7 +317,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                gpu.render(&self.term, self.picker.as_mut(), self.selection.as_ref());
+                gpu.render(
+                    &self.term,
+                    self.picker.as_mut(),
+                    self.selection.as_ref(),
+                    self.trace,
+                );
+                self.redraw_pending = false;
+                self.dirty = false;
+                self.last_render = Some(Instant::now());
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -544,6 +599,32 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+impl App {
+    /// Request a redraw if one isn't already pending and we're past the
+    /// frame-interval throttle window. If we're inside the window,
+    /// `about_to_wait` will arm a `WaitUntil` so we wake up to paint
+    /// exactly when the slot opens.
+    fn maybe_request_redraw(&mut self) {
+        if self.redraw_pending {
+            return;
+        }
+        let due = match self.last_render {
+            None => true,
+            Some(t) => Instant::now().duration_since(t) >= FRAME_INTERVAL,
+        };
+        if due {
+            self.do_request_redraw();
+        }
+    }
+
+    fn do_request_redraw(&mut self) {
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+            self.redraw_pending = true;
         }
     }
 }

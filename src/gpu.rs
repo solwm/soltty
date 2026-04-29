@@ -26,6 +26,17 @@ pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0 * 1.3;
 const MIN_FONT_SIZE_PX: f32 = 6.0;
 const MAX_FONT_SIZE_PX: f32 = 96.0;
 
+/// `SOLTTY_FONT_PX=12.5` overrides the default at startup. Useful for
+/// benchmarking and for users who want a fixed startup size without
+/// editing the source. Out-of-range values are clamped silently.
+pub fn startup_font_px() -> f32 {
+    std::env::var("SOLTTY_FONT_PX")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .map(|px| px.clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX))
+        .unwrap_or(DEFAULT_FONT_SIZE_PX)
+}
+
 pub struct Gpu {
     gl: glow::Context,
     surface: Surface<WindowSurface>,
@@ -128,7 +139,8 @@ impl Gpu {
             unsafe { gl.get_parameter_string(glow::VENDOR) },
         );
 
-        let atlas = FontAtlas::new(DEFAULT_FONT_SIZE_PX).expect("load font");
+        let initial_font_px = startup_font_px();
+        let atlas = FontAtlas::new(initial_font_px).expect("load font");
         let inner = window.inner_size();
         let renderer = Renderer::new(&gl, (inner.width, inner.height), &atlas, theme);
 
@@ -138,7 +150,7 @@ impl Gpu {
             context,
             renderer,
             atlas,
-            font_px: DEFAULT_FONT_SIZE_PX,
+            font_px: initial_font_px,
         };
 
         // Suppress the "unused" check for fields that aren't read yet.
@@ -200,9 +212,10 @@ impl Gpu {
         term: &Term,
         picker: Option<&mut Picker>,
         selection: Option<&Selection>,
+        trace: bool,
     ) {
         self.renderer
-            .prepare(&self.gl, term, &mut self.atlas, picker, selection);
+            .prepare(&self.gl, term, &mut self.atlas, picker, selection, trace);
         self.renderer.draw(&self.gl);
         if let Err(e) = self.surface.swap_buffers(&self.context) {
             log::warn!("swap_buffers: {e}");

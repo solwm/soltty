@@ -193,6 +193,16 @@ impl<'a> Perform for Performer<'a> {
     ) {
         // Private modes (CSI ? ... h/l) get their own intermediate byte.
         let private = intermediates.first().copied() == Some(b'?');
+
+        // SGR (`CSI ... m`) is by far the hottest CSI — every truecolor
+        // cell in the GoL stress test is one SGR. `apply_sgr` walks
+        // `params` directly, so collecting them into a `Vec<u16>` would
+        // be a per-cell heap allocation the dispatch doesn't even use.
+        if !private && action == 'm' {
+            apply_sgr(self.grid(), params);
+            return;
+        }
+
         let nums: Vec<u16> = collect_first_subparams(params);
 
         match (private, action) {
