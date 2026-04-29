@@ -20,10 +20,50 @@ Almost everything soltty does is some combination of four crates:
 | GL bindings   | `glow`         | Thin Rust binding to the OpenGL function pointers        |
 | ANSI parser   | `vte`          | The byte-by-byte CSI/OSC/ESC state machine               |
 | Rasterizer    | `swash`        | Outline → 8-bit alpha bitmap for one glyph at one size   |
+| CLI           | `clap`         | `--theme`, `--list-themes`, `-e`, `--help`, `--version`  |
 
 Plus `portable-pty` for the OS-specific PTY dance (`forkpty` on Unix,
 ConPTY on Windows) and `etagere` for shelf-packing glyph rectangles into
 the atlas.
+
+## Color themes
+
+Two pieces:
+
+- **`themes/*.toml`** — vendored themes in iTerm2-Color-Schemes Alacritty
+  TOML format. `build.rs` walks this directory at compile time, parses
+  each file with a tiny TOML-subset state machine (~50 LOC, no `toml`
+  crate dep), and emits a static `BUILTIN_THEMES` array into
+  `OUT_DIR/themes_data.rs` that `src/theme.rs` includes.
+- **`~/.config/soltty/themes/*.toml`** — runtime overrides in the same
+  format. Loaded once at startup by `ThemeLib::load`. A user theme with
+  the same name as a builtin replaces it.
+
+The `Theme` struct is the 16 ANSI colors plus default fg/bg and cursor
+fg/bg — 84 bytes plus the name. Indices 16..=255 of the 256-color palette
+are derived at theme-set time from the standard xterm formula (6×6×6
+cube + 24-step grayscale ramp), so themes don't need to specify them.
+
+Live switching is a `Renderer::set_theme(&Theme)` call that rebuilds the
+linearized palette and the cursor/default colors. The next frame's
+instance pack picks up the new colors automatically — no GPU reset, no
+shader reload.
+
+### The picker overlay
+
+`Ctrl+Shift+T` opens a centered modal listing every available theme.
+While open, Up/Down move the selection cursor and *immediately* call
+`set_theme`, so you see what the theme actually looks like before
+committing. Enter keeps the new selection; Esc reverts to whatever was
+active when the picker opened.
+
+The overlay is rendered by appending extra `CellInstance`s to the
+instance buffer **after** the grid instances. Our shader doesn't blend,
+so later instances at the same screen pixel just overwrite earlier ones —
+that's all "modal on top" needs. State lives in `src/picker.rs`, geometry
+is computed once per frame in `Picker::layout`, and the renderer's
+`append_picker_overlay` walks the layout and emits cells for the box,
+header, and theme list.
 
 ### Why GL and not wgpu
 

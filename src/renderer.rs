@@ -2,7 +2,9 @@ use glow::HasContext;
 
 use crate::font::FontAtlas;
 use crate::grid::{CellAttrs, Color};
+use crate::picker::Picker;
 use crate::term::Term;
+use crate::theme::Theme;
 
 /// One instance per cell. Layout has to match the vertex shader's attribute
 /// declarations (locations 0..=5) and the `vertex_attrib_pointer_*` calls in
@@ -48,12 +50,17 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(gl: &glow::Context, screen_size: (u32, u32), atlas: &FontAtlas) -> Self {
-        let palette = build_palette();
-        let default_fg = srgb_to_linear_rgba([214, 214, 214, 255]);
-        let default_bg = srgb_to_linear_rgba([11, 12, 17, 255]);
-        let cursor_bg = srgb_to_linear_rgba([235, 235, 235, 255]);
-        let cursor_fg = default_bg;
+    pub fn new(
+        gl: &glow::Context,
+        screen_size: (u32, u32),
+        atlas: &FontAtlas,
+        theme: &Theme,
+    ) -> Self {
+        let palette = build_palette(theme);
+        let default_fg = srgb_to_linear_rgba_3(theme.fg);
+        let default_bg = srgb_to_linear_rgba_3(theme.bg);
+        let cursor_bg = srgb_to_linear_rgba_3(theme.cursor_bg);
+        let cursor_fg = srgb_to_linear_rgba_3(theme.cursor_fg);
 
         let (program, u_screen_size, u_cell_size, u_atlas_size, u_grid_offset, u_atlas) =
             unsafe { build_program(gl) };
@@ -92,6 +99,15 @@ impl Renderer {
         self.cell_size
     }
 
+    /// Swap the active palette/cursor colors. The next frame's instance
+    /// pack picks up the new colors automatically — no GPU reset needed.
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.palette = build_palette(theme);
+        self.default_fg = srgb_to_linear_rgba_3(theme.fg);
+        self.default_bg = srgb_to_linear_rgba_3(theme.bg);
+        self.cursor_bg = srgb_to_linear_rgba_3(theme.cursor_bg);
+        self.cursor_fg = srgb_to_linear_rgba_3(theme.cursor_fg);
+    }
 
     pub fn resize(&mut self, gl: &glow::Context, screen_size: (u32, u32)) {
         self.screen_size = screen_size;
@@ -124,7 +140,13 @@ impl Renderer {
         unsafe { self.upload_uniforms(gl) };
     }
 
-    pub fn prepare(&mut self, gl: &glow::Context, term: &Term, atlas: &mut FontAtlas) {
+    pub fn prepare(
+        &mut self,
+        gl: &glow::Context,
+        term: &Term,
+        atlas: &mut FontAtlas,
+        picker: Option<&mut Picker>,
+    ) {
         let rows = term.grid().rows;
         let cols = term.grid().cols;
         let cursor = term.viewport_cursor();
@@ -157,6 +179,13 @@ impl Renderer {
                     bg,
                 });
             }
+        }
+
+        // Picker overlay. Drawn AFTER grid instances, which works because
+        // the GPU draws in order and our shader doesn't blend — later
+        // instances overwrite earlier ones at the same pixel.
+        if let Some(picker) = picker {
+            self.append_picker_overlay(picker, rows, cols, atlas);
         }
 
         if atlas.atlas_dirty {
@@ -212,6 +241,116 @@ impl Renderer {
             gl.uniform_1_i32(Some(&self.u_atlas), 0);
             gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, self.instance_count);
         }
+    }
+
+    fn append_picker_overlay(
+        &mut self,
+        picker: &mut Picker,
+        rows: usize,
+        cols: usize,
+        atlas: &mut FontAtlas,
+    ) {
+        let layout = picker.layout(rows, cols);
+        let (origin_row, origin_col) = layout.origin;
+        let (height, width) = layout.size;
+        if width < 8 || height < 5 {
+            return;
+        }
+
+        // Color scheme: invert page colors so the modal stands out.
+        let panel_bg = self.cursor_bg; // bright
+        let panel_fg = self.cursor_fg; // dark
+        let header_bg = self.default_fg;
+        let header_fg = self.default_bg;
+        let highlight_bg = self.default_fg;
+        let highlight_fg = self.default_bg;
+
+        // Fill background.
+        for r in 0..height {
+            for c in 0..width {
+                self.push_overlay_cell(' ', origin_row + r, origin_col + c, panel_fg, panel_bg, atlas);
+            }
+        }
+
+        // Header text.
+        let header = "Theme picker  ↑↓ navigate  Enter keep  Esc revert";
+        let header_row = origin_row;
+        write_string_clipped(
+            &mut |ch, dr, dc| {
+                self.push_overlay_cell(ch, dr, dc, header_fg, header_bg, atlas);
+            },
+            header,
+            header_row,
+            origin_col,
+            width,
+        );
+
+        // List entries.
+        let names = picker.themes();
+        let cursor_idx = picker.cursor();
+        let visible = layout.list_visible;
+        let scroll = layout.scroll;
+        for vis_row in 0..visible {
+            let item_idx = scroll + vis_row;
+            if item_idx >= names.len() {
+                break;
+            }
+            let row_y = origin_row + 2 + vis_row;
+            let is_selected = item_idx == cursor_idx;
+            let (fg, bg) = if is_selected {
+                (highlight_fg, highlight_bg)
+            } else {
+                (panel_fg, panel_bg)
+            };
+            // Pad with spaces to fill the row so highlight covers full width.
+            for c in 0..width {
+                self.push_overlay_cell(' ', row_y, origin_col + c, fg, bg, atlas);
+            }
+            let prefix = if is_selected { " ▶ " } else { "   " };
+            let mut col = origin_col;
+            write_string_clipped(
+                &mut |ch, dr, dc| {
+                    self.push_overlay_cell(ch, dr, dc, fg, bg, atlas);
+                },
+                prefix,
+                row_y,
+                col,
+                width,
+            );
+            col += prefix.chars().count();
+            write_string_clipped(
+                &mut |ch, dr, dc| {
+                    self.push_overlay_cell(ch, dr, dc, fg, bg, atlas);
+                },
+                &names[item_idx],
+                row_y,
+                col,
+                origin_col + width - col,
+            );
+        }
+    }
+
+    fn push_overlay_cell(
+        &mut self,
+        ch: char,
+        row: usize,
+        col: usize,
+        fg: [f32; 4],
+        bg: [f32; 4],
+        atlas: &mut FontAtlas,
+    ) {
+        if ch != ' ' && ch != '\0' {
+            atlas.ensure(ch);
+        }
+        let glyph = atlas.get(ch).unwrap_or_default();
+        self.instances_scratch.push(CellInstance {
+            cell_xy: [col as u32, row as u32],
+            glyph_origin: [glyph.atlas_x as u32, glyph.atlas_y as u32],
+            glyph_size: [glyph.w as u32, glyph.h as u32],
+            glyph_offset: [glyph.offset_x as i32, glyph.offset_y as i32],
+            fg,
+            bg,
+        });
     }
 
     unsafe fn upload_uniforms(&self, gl: &glow::Context) {
@@ -372,6 +511,25 @@ fn is_blank_glyph(c: char) -> bool {
     c == ' ' || c == '\0'
 }
 
+/// Write `s` cell-by-cell starting at `(row, col)`, calling `emit` for each
+/// character. Stops if the column would exceed `col + width`. Counts in chars,
+/// not bytes — it's safe with multi-byte UTF-8 but treats each `char` as one
+/// cell, which is wrong for full-width CJK but acceptable for picker UI.
+fn write_string_clipped(
+    emit: &mut dyn FnMut(char, usize, usize),
+    s: &str,
+    row: usize,
+    col_start: usize,
+    width: usize,
+) {
+    for (i, ch) in s.chars().enumerate() {
+        if i >= width {
+            break;
+        }
+        emit(ch, row, col_start + i);
+    }
+}
+
 fn resolve_color(c: Color, palette: &[[f32; 4]; 256], default: [f32; 4]) -> [f32; 4] {
     match c {
         Color::Default => default,
@@ -398,28 +556,18 @@ fn srgb_to_linear_rgba([r, g, b, a]: [u8; 4]) -> [f32; 4] {
     ]
 }
 
-fn build_palette() -> [[f32; 4]; 256] {
+fn srgb_to_linear_rgba_3([r, g, b]: [u8; 3]) -> [f32; 4] {
+    srgb_to_linear_rgba([r, g, b, 255])
+}
+
+/// Build the full 256-color palette from the theme's 16-color base.
+/// Indices 0..=15 come straight from the theme. 16..=231 are the standard
+/// xterm 6×6×6 cube, 232..=255 the 24-step grayscale ramp — both
+/// derivative formulas, not theme-specific.
+fn build_palette(theme: &Theme) -> [[f32; 4]; 256] {
     let mut out = [[0.0; 4]; 256];
-    let basic: [[u8; 3]; 16] = [
-        [0x00, 0x00, 0x00],
-        [0xcd, 0x00, 0x00],
-        [0x00, 0xcd, 0x00],
-        [0xcd, 0xcd, 0x00],
-        [0x1e, 0x6f, 0xd0],
-        [0xcd, 0x00, 0xcd],
-        [0x00, 0xcd, 0xcd],
-        [0xe5, 0xe5, 0xe5],
-        [0x7f, 0x7f, 0x7f],
-        [0xff, 0x40, 0x40],
-        [0x40, 0xff, 0x40],
-        [0xff, 0xff, 0x40],
-        [0x60, 0xa0, 0xff],
-        [0xff, 0x40, 0xff],
-        [0x40, 0xff, 0xff],
-        [0xff, 0xff, 0xff],
-    ];
-    for (i, rgb) in basic.iter().enumerate() {
-        out[i] = srgb_to_linear_rgba([rgb[0], rgb[1], rgb[2], 255]);
+    for (i, rgb) in theme.palette.iter().enumerate() {
+        out[i] = srgb_to_linear_rgba_3(*rgb);
     }
     let levels: [u8; 6] = [0, 95, 135, 175, 215, 255];
     for r in 0..6 {

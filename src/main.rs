@@ -1,12 +1,15 @@
 mod font;
 mod gpu;
 mod grid;
+mod picker;
 mod pty;
 mod renderer;
 mod term;
+mod theme;
 
 use std::sync::Arc;
 
+use clap::Parser;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -33,18 +36,34 @@ fn main() {
     ))
     .init();
 
-    let cli = match Cli::parse(std::env::args().skip(1)) {
-        Ok(c) => c,
-        Err(msg) => {
-            eprintln!("soltty: {msg}");
-            print_usage();
-            std::process::exit(2);
+    let cli = Cli::parse();
+
+    let theme_lib = theme::ThemeLib::load();
+
+    if cli.list_themes {
+        for name in theme_lib.names() {
+            println!("{name}");
         }
-    };
-    if cli.help {
-        print_usage();
         return;
     }
+
+    let initial_theme_name = match cli.theme.as_deref() {
+        Some(n) => match theme_lib.find(n) {
+            Some(t) => t.name.clone(),
+            None => {
+                eprintln!(
+                    "soltty: theme {n:?} not found. Use --list-themes to see options."
+                );
+                std::process::exit(2);
+            }
+        },
+        None => theme_lib.default().name.clone(),
+    };
+
+    let (program, args) = match cli.command.as_slice() {
+        [] => (crate::pty::default_shell(), Vec::new()),
+        [prog, rest @ ..] => (prog.clone(), rest.to_vec()),
+    };
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -60,59 +79,49 @@ fn main() {
         pty: None,
         term: Term::new(24, 80),
         modifiers: ModifiersState::empty(),
-        program: cli
-            .program
-            .unwrap_or_else(crate::pty::default_shell),
-        args: cli.args,
+        program,
+        args,
+        theme_lib,
+        active_theme_name: initial_theme_name,
+        picker: None,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+/// soltty: a GPU terminal emulator.
+///
+/// In-app keybinds:
+///   Ctrl+Shift+T   Open the theme picker. Up/Down to navigate (with live
+///                  preview), Enter to keep, Esc to revert.
+///   Ctrl+= / +     Increase font size.
+///   Ctrl+-         Decrease font size.
+///   Ctrl+0         Reset font size.
+///
+/// Drop additional themes into ~/.config/soltty/themes/<name>.toml using
+/// the iTerm2-Color-Schemes Alacritty TOML format. They override builtins
+/// of the same name.
+#[derive(Parser, Debug)]
+#[command(name = "soltty", version, about, long_about = None)]
 struct Cli {
-    program: Option<String>,
-    args: Vec<String>,
-    help: bool,
-}
+    /// Color theme. Case-insensitive; substring match works.
+    #[arg(short = 't', long = "theme", value_name = "NAME")]
+    theme: Option<String>,
 
-impl Cli {
-    fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Self, String> {
-        let mut out = Cli::default();
-        let mut it = args.into_iter();
-        while let Some(arg) = it.next() {
-            match arg.as_str() {
-                "-h" | "--help" => out.help = true,
-                "-e" | "--command" => {
-                    out.program = Some(
-                        it.next()
-                            .ok_or_else(|| format!("{arg} requires a command"))?,
-                    );
-                    // Convention: -e consumes the rest of the command line, so
-                    // `soltty -e zsh -i` does what you'd expect.
-                    out.args = it.collect();
-                    return Ok(out);
-                }
-                _ => return Err(format!("unrecognized argument: {arg}")),
-            }
-        }
-        Ok(out)
-    }
-}
+    /// Print every available theme and exit.
+    #[arg(long = "list-themes")]
+    list_themes: bool,
 
-fn print_usage() {
-    eprintln!(
-        "usage: soltty [OPTIONS]
-
-OPTIONS:
-  -e, --command <cmd> [args...]   Run cmd with args instead of $SHELL.
-                                  Consumes the rest of the command line.
-  -h, --help                      Show this help.
-
-ENV:
-  SHELL          Default command when -e is not given (Linux/macOS).
-  SOLTTY_FONT    Path to a TTF/OTF to use instead of auto-discovery.
-  RUST_LOG       e.g. `soltty=debug` for verbose logging."
-    );
+    /// Program (and its arguments) to run instead of $SHELL.
+    /// Everything after -e is forwarded, e.g. `soltty -e fish -i -l`.
+    #[arg(
+        short = 'e',
+        long = "command",
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "CMD",
+    )]
+    command: Vec<String>,
 }
 
 struct App {
@@ -124,6 +133,9 @@ struct App {
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
+    theme_lib: theme::ThemeLib,
+    active_theme_name: String,
+    picker: Option<picker::Picker>,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -136,7 +148,13 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
         // glutin needs to pick a GL config alongside the window, so it owns
         // the window creation. We get the Arc<Window> back for input handling.
-        let (window, gpu) = Gpu::new(event_loop, attrs);
+        let initial_theme = self
+            .theme_lib
+            .find(&self.active_theme_name)
+            .cloned()
+            .unwrap_or_else(|| self.theme_lib.default().clone());
+        log::info!("theme: {}", initial_theme.name);
+        let (window, gpu) = Gpu::new(event_loop, attrs, &initial_theme);
 
         let inner = window.inner_size();
         let (rows, cols) = grid_dims_for_window(gpu.cell_size(), inner.width, inner.height);
@@ -229,7 +247,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                gpu.render(&self.term);
+                gpu.render(&self.term, self.picker.as_mut());
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -255,6 +273,68 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                 ..
             } => {
+                // Theme picker: Ctrl+Shift+T opens it. While open, all
+                // keystrokes are picker-local — never forwarded to the PTY.
+                if self.modifiers.control_key() && self.modifiers.shift_key() {
+                    if let Key::Character(s) = &logical_key {
+                        if s.eq_ignore_ascii_case("t") || s.eq_ignore_ascii_case("T") {
+                            if self.picker.is_none() {
+                                self.picker = Some(picker::Picker::new(
+                                    &self.theme_lib,
+                                    &self.active_theme_name,
+                                ));
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
+                if let Some(picker) = self.picker.as_mut() {
+                    use winit::keyboard::NamedKey::*;
+                    match &logical_key {
+                        Key::Named(ArrowUp) => {
+                            picker.move_up();
+                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                        }
+                        Key::Named(ArrowDown) => {
+                            picker.move_down();
+                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                        }
+                        Key::Named(PageUp) => {
+                            picker.page_up(8);
+                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                        }
+                        Key::Named(PageDown) => {
+                            picker.page_down(8);
+                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                        }
+                        Key::Named(Home) => {
+                            picker.home();
+                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                        }
+                        Key::Named(End) => {
+                            picker.end();
+                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                        }
+                        Key::Named(Enter) => {
+                            // Commit current selection.
+                            self.active_theme_name =
+                                picker.current(&self.theme_lib).name.clone();
+                            self.picker = None;
+                        }
+                        Key::Named(Escape) => {
+                            // Restore the original theme.
+                            let original = picker.cancel(&self.theme_lib).clone();
+                            gpu.set_theme(&original);
+                            self.active_theme_name = original.name;
+                            self.picker = None;
+                        }
+                        _ => {}
+                    }
+                    window.request_redraw();
+                    return;
+                }
+
                 // Font zoom: Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0. Handled
                 // locally; never forwarded to the PTY.
                 if let Some(target) = font_zoom_target(&logical_key, self.modifiers, gpu.font_size())
@@ -299,6 +379,11 @@ fn font_zoom_target(key: &Key, mods: ModifiersState, current_px: f32) -> Option<
         "0" => Some(DEFAULT_FONT_SIZE_PX),
         _ => None,
     }
+}
+
+fn apply_picker_preview(gpu: &mut Gpu, picker: &picker::Picker, lib: &theme::ThemeLib) {
+    let theme = picker.current(lib);
+    gpu.set_theme(theme);
 }
 
 fn grid_dims_for_window(cell_size: (u32, u32), w: u32, h: u32) -> (u16, u16) {
@@ -444,58 +529,6 @@ fn named_key_seq(named: NamedKey, ctrl: bool, alt: bool, shift: bool) -> Option<
         NamedKey::F12 => csi_tilde(24, m),
         _ => return None,
     })
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-
-    fn parse(args: &[&str]) -> Result<Cli, String> {
-        Cli::parse(args.iter().map(|s| s.to_string()))
-    }
-
-    #[test]
-    fn empty_args_means_default_shell() {
-        let c = parse(&[]).unwrap();
-        assert_eq!(c.program, None);
-        assert!(c.args.is_empty());
-    }
-
-    #[test]
-    fn dash_e_takes_command() {
-        let c = parse(&["-e", "zsh"]).unwrap();
-        assert_eq!(c.program.as_deref(), Some("zsh"));
-        assert!(c.args.is_empty());
-    }
-
-    #[test]
-    fn dash_e_consumes_rest() {
-        let c = parse(&["-e", "fish", "-i", "-l"]).unwrap();
-        assert_eq!(c.program.as_deref(), Some("fish"));
-        assert_eq!(c.args, vec!["-i".to_string(), "-l".to_string()]);
-    }
-
-    #[test]
-    fn long_form_command() {
-        let c = parse(&["--command", "bash"]).unwrap();
-        assert_eq!(c.program.as_deref(), Some("bash"));
-    }
-
-    #[test]
-    fn dash_e_without_arg_errors() {
-        assert!(parse(&["-e"]).is_err());
-    }
-
-    #[test]
-    fn unknown_flag_errors() {
-        assert!(parse(&["--bogus"]).is_err());
-    }
-
-    #[test]
-    fn help_flag() {
-        let c = parse(&["--help"]).unwrap();
-        assert!(c.help);
-    }
 }
 
 #[cfg(test)]

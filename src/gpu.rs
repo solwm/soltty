@@ -15,8 +15,10 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
 
 use crate::font::FontAtlas;
+use crate::picker::Picker;
 use crate::renderer::Renderer;
 use crate::term::Term;
+use crate::theme::Theme;
 
 /// Default font size, ~30% larger than the original 16px baseline.
 pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0 * 1.3;
@@ -38,6 +40,7 @@ impl Gpu {
     pub fn new(
         event_loop: &ActiveEventLoop,
         window_attrs: WindowAttributes,
+        theme: &Theme,
     ) -> (Arc<Window>, Self) {
         let template = ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(Some(true))
@@ -116,7 +119,7 @@ impl Gpu {
 
         let atlas = FontAtlas::new(DEFAULT_FONT_SIZE_PX).expect("load font");
         let inner = window.inner_size();
-        let renderer = Renderer::new(&gl, (inner.width, inner.height), &atlas);
+        let renderer = Renderer::new(&gl, (inner.width, inner.height), &atlas, theme);
 
         let gpu = Self {
             gl,
@@ -138,6 +141,10 @@ impl Gpu {
 
     pub fn cell_size(&self) -> (u32, u32) {
         self.renderer.cell_size()
+    }
+
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.renderer.set_theme(theme);
     }
 
     pub fn font_size(&self) -> f32 {
@@ -177,8 +184,9 @@ impl Gpu {
         self.renderer.resize(&self.gl, (width, height));
     }
 
-    pub fn render(&mut self, term: &Term) {
-        self.renderer.prepare(&self.gl, term, &mut self.atlas);
+    pub fn render(&mut self, term: &Term, picker: Option<&mut Picker>) {
+        self.renderer
+            .prepare(&self.gl, term, &mut self.atlas, picker);
         self.renderer.draw(&self.gl);
         if let Err(e) = self.surface.swap_buffers(&self.context) {
             log::warn!("swap_buffers: {e}");
