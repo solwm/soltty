@@ -63,7 +63,7 @@ this; we left it.
 In the order they landed (`git log performance ^main` for the
 authoritative list).
 
-### 1. Throttle redraws to 60 Hz (`195bb08`)
+### 1. Throttle redraws to display refresh rate (`195bb08`, `a812ced`)
 
 The original 19% gol-c gap was almost entirely here. Profiling showed
 that under a chatty PTY producer, winit fires `RedrawRequested` 2-3×
@@ -73,16 +73,32 @@ across them). Each redraw calls `surface.swap_buffers`, which on
 macOS Metal/GL is **~196 µs per call even with vsync off**. That cost
 dominated the loop.
 
-Fix: cap the actual paint rate at ~60 Hz with a `dirty` flag,
-`last_render` timestamp, and `about_to_wait` arming
-`ControlFlow::WaitUntil` so deferred frames still paint when the
-slot opens.
+Fix: cap the actual paint rate with a `dirty` flag, `last_render`
+timestamp, and `about_to_wait` arming `ControlFlow::WaitUntil` so
+deferred frames still paint when the slot opens.
 
-The whole machinery is in `src/main.rs` around `App::about_to_wait`
-and `maybe_request_redraw`. `FRAME_INTERVAL = Duration::from_millis(16)`.
+The whole machinery is in `src/main.rs` around `App::about_to_wait`,
+`maybe_request_redraw`, and `detect_frame_interval`.
 
-Side effect: human keystroke latency is now bounded by 16 ms in the
-worst case. Below human perception, no one notices.
+The cap is per-window, set in `resumed()`:
+
+  - winit's `current_monitor().refresh_rate_millihertz()` first
+  - `SOLTTY_FRAME_HZ` env var override (for debugging or compositors
+    that don't expose a rate)
+  - 120 Hz default if both fail
+  - clamped to [60, 240] so a misconfigured monitor can't pin us
+    at 5 Hz or 1 kHz
+
+There's also an `IDLE_THRESHOLD = 100 ms` bypass: the first paint
+after a long quiet period skips the cap regardless. Mostly defensive
+— at typical caps it's logically redundant with `elapsed >=
+frame_interval` — but it documents the intent and bounds echo
+latency if the cap is ever configured high.
+
+Side effect: human keystroke latency is bounded by `frame_interval`
+in the worst case. At 4-8 ms (120-240 Hz panels) this is invisible;
+at 16 ms (60 Hz fallback) it's right at the edge of human
+perception, which is why `IDLE_THRESHOLD` exists.
 
 ### 2. SGR dispatch fast path (`195bb08`)
 
@@ -302,7 +318,8 @@ EWMA hides. ~20 lines if anyone cares.
 | concern                | file:lines (approx)                |
 |------------------------|-----------------------------------|
 | Throttle               | `src/main.rs::about_to_wait`, `maybe_request_redraw` |
-| Redraw flag flow       | `App::dirty`, `App::redraw_pending`, `App::last_render` |
+| Frame-rate detection   | `src/main.rs::detect_frame_interval` (env, monitor, default, clamp) |
+| Redraw flag flow       | `App::dirty`, `App::redraw_pending`, `App::last_render`, `App::frame_interval` |
 | SGR fast path          | `src/term.rs::csi_dispatch` (top of fn) |
 | Lazy CSI args          | `src/term.rs::arg`                |
 | DSR reply              | `src/term.rs::Performer::dsr`     |
