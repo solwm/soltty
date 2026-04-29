@@ -26,6 +26,30 @@ Plus `portable-pty` for the OS-specific PTY dance (`forkpty` on Unix,
 ConPTY on Windows) and `etagere` for shelf-packing glyph rectangles into
 the atlas.
 
+## VSync and ANSI throughput
+
+This deserves a section because it's a 35%-throughput trap that's easy
+to walk into. We use `glutin::SwapInterval::DontWait` rather than
+`Wait(1)`. With Wait, every `swap_buffers` blocks the main thread for
+up to one vsync frame (~16 ms at 60 Hz). And because PTY drain, parse,
+grid mutation, and rendering all run on that same thread, a blocked
+swap stalls byte processing.
+
+Measured under a synthetic ANSI-flood benchmark (full-screen truecolor
+SGR repaints, gol-c-style):
+
+| | Throughput | vs alacritty |
+|---|---:|---:|
+| `Wait(1)` (vsync on)  | ~110 MB/s | ~55% |
+| `DontWait` (vsync off)| ~178 MB/s | ~85% |
+
+Won't this tear? On Wayland, no — the compositor enforces tearing
+prevention regardless of our app's swap interval. On X11, full-screen
+animations with `DontWait` can tear; future work to address that
+properly is moving the GL context to a worker thread so the main
+thread never blocks on swap. For now the X11 case is the lesser
+concern.
+
 ## Color themes
 
 Two pieces:
