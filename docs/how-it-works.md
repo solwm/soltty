@@ -639,6 +639,7 @@ chosen shape on top of whatever the cell would otherwise paint:
 | Block       | 1    | Replace the cell's bg/fg with `cursor_bg`/`cursor_fg` so the glyph appears "punched out" of a solid block. |
 | Underline   | 2    | Leave the cell as-is, paint a band ~10% of cell height (min 2 px) at the bottom in `cursor_bg`. |
 | Bar         | 3    | Leave the cell as-is, paint a column ~15% of cell width (min 2 px) at the left in `cursor_bg`. |
+| HollowBlock | 4    | Outline only (~6% of min cell dim) along all four cell edges in `cursor_bg`. Used by vi-mode; apps can't request it. |
 | None        | 0    | No overlay — used when the cursor is hidden, scrolled out of view, or unfocused. |
 
 Apps select the shape with DECSCUSR (`CSI Ps SP q`). We don't honor
@@ -687,6 +688,54 @@ they're guaranteed readable against any palette.
 program that hides the cursor and crashes without restoring it leaves
 the shell prompt cursor-less until something sends `?25h` — typically
 `tput cnorm` or a fresh shell. Same behavior as every other terminal.
+
+## Vi mode
+
+A modal cursor for grabbing text without the mouse. Press the activation
+key (default `Ctrl+Shift+Space`, override via `SOLTTY_VI_KEY`) to enter,
+`Esc` to exit. While active, the PTY sees nothing — keystrokes drive a
+separate vi cursor over the visible viewport (and into scrollback).
+
+Indicator: a faint green wash over the whole window so it's obvious
+when you're "in" vi mode. Drawn as a separate fullscreen-quad pass
+(`src/tint.{vert,frag}`) with alpha blending enabled briefly around the
+draw, off otherwise. Color and strength are constants in `src/gpu.rs`
+(`VI_TINT_COLOR`).
+
+State lives in `src/vi.rs::ViMode`:
+
+  - `cursor: (row, col)` — vi cursor in viewport coords, independent of
+    the terminal cursor. While vi-mode is active the terminal cursor is
+    suppressed and only the vi cursor renders, as a hollow block.
+  - `visual: VisualMode::{None, Char, Line}` and `visual_anchor` —
+    drives the existing mouse `Selection` so all the rendering machinery
+    (inverse highlight in `Renderer::prepare`, `extract_text` for yank)
+    just works.
+
+Keys (M1):
+
+| Key       | Action                                                     |
+|-----------|------------------------------------------------------------|
+| `h j k l` | Move. At row 0, `k` scrolls into history; at row N-1, `j` scrolls toward live. |
+| `v`       | Start char-wise visual; further motions extend selection.  |
+| `V`       | Start line-wise visual; selection covers full rows.        |
+| `y`       | Yank selection to clipboard + primary, exit vi-mode.       |
+| `Esc`     | Exit visual back to vi-normal, or exit vi-mode entirely.   |
+
+`apply_vi_move` in `main.rs` does the cursor update + viewport scroll on
+edge. It's a free function rather than an `App` method so the destructure
+at the top of `window_event` (which holds `&mut self.gpu`) doesn't block
+the call — disjoint field borrows compose fine when the call site names
+the fields directly.
+
+The activation keybind is parsed by `vi::parse_vi_key` from a string like
+`"ctrl+shift+space"` or `"alt+v"`. Comparison against winit events
+requires *exact* modifier match — `Ctrl+Shift+Space` doesn't fire on
+`Ctrl+Shift+Alt+Space`. Bad env var values fall back to default with a
+warning.
+
+More motions (`w`/`b`/`e`, `0`/`^`/`$`, `gg`/`G`, page motions, count
+prefixes), search, and block-visual are later milestones.
 
 ## Window resize
 

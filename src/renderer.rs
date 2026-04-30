@@ -86,6 +86,13 @@ pub struct Renderer {
     u_cursor_color: glow::UniformLocation,
     u_cursor_text: glow::UniformLocation,
 
+    // Vi-mode tint: a separate program that draws a fullscreen quad with
+    // a translucent color, alpha-blended onto the existing frame. Shares
+    // no state with the main pipeline beyond the GL context.
+    tint_program: glow::Program,
+    tint_vao: glow::VertexArray,
+    u_tint_color: glow::UniformLocation,
+
     palette: [[f32; 4]; 256],
     default_fg: [f32; 4],
     default_bg: [f32; 4],
@@ -99,8 +106,8 @@ pub struct Renderer {
     /// Cursor cell as (col, row) in viewport coords; (-1, -1) when the
     /// cursor isn't visible. Set in `prepare`, uploaded in `draw`.
     cursor_cell: (i32, i32),
-    /// Encoded shape: 0 = none, 1 = block, 2 = underline, 3 = bar.
-    /// Mirrors the constants the fragment shader branches on.
+    /// Encoded shape: 0 = none, 1 = block, 2 = underline, 3 = bar,
+    /// 4 = hollow block (vi-mode). Mirrors the fragment shader constants.
     cursor_shape_id: i32,
 
     fps: FpsCounter,
@@ -134,6 +141,15 @@ impl Renderer {
         let u_cursor_color = u("u_cursor_color");
         let u_cursor_text = u("u_cursor_text");
 
+        let tint_program = unsafe { build_tint_program(gl) };
+        let u_tint_color = unsafe {
+            gl.get_uniform_location(tint_program, "u_tint_color")
+                .expect("tint uniform u_tint_color not found")
+        };
+        // Vertex-attributeless fullscreen quad — `gl_VertexID` picks each
+        // corner — so we just need an empty VAO bound during the draw.
+        let tint_vao = unsafe { gl.create_vertex_array().expect("create tint vao") };
+
         let (vao, vbo) = unsafe { build_vao_vbo(gl, INITIAL_INSTANCE_CAPACITY) };
 
         let atlas_tex = unsafe { build_atlas_texture(gl, atlas) };
@@ -158,6 +174,9 @@ impl Renderer {
             u_cursor_shape,
             u_cursor_color,
             u_cursor_text,
+            tint_program,
+            tint_vao,
+            u_tint_color,
             palette,
             default_fg,
             default_bg,
@@ -234,6 +253,7 @@ impl Renderer {
         selection: Option<&Selection>,
         trace: bool,
         cursor_visible_now: bool,
+        vi_cursor: Option<(usize, usize)>,
     ) {
         let rows = term.grid().rows;
         let cols = term.grid().cols;
@@ -243,23 +263,31 @@ impl Renderer {
         // out of the per-cell instance pack means selection and SGR-inverse
         // compose normally and the cursor wins because the shader runs last.
         //
-        // Suppressed when:
-        //   - the picker is open (overlay would bleed through the modal,
-        //     since the shader matches by cell_xy regardless of which
-        //     instance is being drawn at that position);
-        //   - blink is in its off phase (App passes cursor_visible_now=false
-        //     for that frame).
-        let cursor = term
-            .viewport_cursor()
-            .filter(|_| picker.is_none())
-            .filter(|_| cursor_visible_now);
+        // Vi-mode override: when `vi_cursor` is Some, we draw a hollow-block
+        // cursor at that position and suppress the terminal cursor entirely.
+        // Otherwise the normal terminal-cursor logic runs, with these
+        // suppressions:
+        //   - picker open → overlay would bleed through the modal, since
+        //     the shader matches by cell_xy regardless of which instance
+        //     is being drawn at that position;
+        //   - blink off-phase → App passes cursor_visible_now=false for
+        //     that frame.
+        let cursor: Option<(usize, usize, CursorShape)> = match vi_cursor {
+            Some((row, col)) => Some((row, col, CursorShape::HollowBlock)),
+            None => term
+                .viewport_cursor()
+                .filter(|_| picker.is_none())
+                .filter(|_| cursor_visible_now)
+                .map(|(r, c)| (r, c, term.cursor_shape())),
+        };
         match cursor {
-            Some((row, col)) => {
+            Some((row, col, shape)) => {
                 self.cursor_cell = (col as i32, row as i32);
-                self.cursor_shape_id = match term.cursor_shape() {
+                self.cursor_shape_id = match shape {
                     CursorShape::Block => 1,
                     CursorShape::Underline => 2,
                     CursorShape::Bar => 3,
+                    CursorShape::HollowBlock => 4,
                 };
             }
             None => {
@@ -397,6 +425,29 @@ impl Renderer {
                 self.cursor_fg[3],
             );
             gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, self.instance_count);
+        }
+    }
+
+    /// Paint a translucent fullscreen tint on top of the already-drawn
+    /// frame. Called after the main pass when vi-mode is active. The
+    /// `color` is in linear-light RGBA — alpha controls the strength of
+    /// the wash. Blending is enabled briefly here and disabled before
+    /// returning so the cell pipeline sees its usual no-blend state.
+    pub fn draw_tint(&self, gl: &glow::Context, color: [f32; 4]) {
+        unsafe {
+            gl.use_program(Some(self.tint_program));
+            gl.bind_vertex_array(Some(self.tint_vao));
+            gl.uniform_4_f32(
+                Some(&self.u_tint_color),
+                color[0],
+                color[1],
+                color[2],
+                color[3],
+            );
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.disable(glow::BLEND);
         }
     }
 
@@ -556,9 +607,22 @@ impl Renderer {
 const INITIAL_INSTANCE_CAPACITY: usize = 4096;
 
 unsafe fn build_program(gl: &glow::Context) -> glow::Program {
-    let vs_src = include_str!("shader.vert");
-    let fs_src = include_str!("shader.frag");
+    link_program(
+        gl,
+        include_str!("shader.vert"),
+        include_str!("shader.frag"),
+    )
+}
 
+unsafe fn build_tint_program(gl: &glow::Context) -> glow::Program {
+    link_program(
+        gl,
+        include_str!("tint.vert"),
+        include_str!("tint.frag"),
+    )
+}
+
+unsafe fn link_program(gl: &glow::Context, vs_src: &str, fs_src: &str) -> glow::Program {
     let program = gl.create_program().expect("create program");
 
     let vs = compile_shader(gl, glow::VERTEX_SHADER, vs_src);

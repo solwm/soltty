@@ -18,8 +18,8 @@ uniform vec2 u_cell_size;
 // (DECTCEM-hidden, scrolled out of view, or window unfocused — set by
 // the renderer).
 uniform ivec2 u_cursor_cell;
-// 0 = none, 1 = block, 2 = underline, 3 = bar. Matches CursorShape on
-// the CPU side.
+// 0 = none, 1 = block, 2 = underline, 3 = bar, 4 = hollow block.
+// Matches CursorShape on the CPU side.
 uniform int u_cursor_shape;
 uniform vec4 u_cursor_color; // body color (theme cursor_bg)
 uniform vec4 u_cursor_text;  // glyph color when block-overlaid (theme cursor_fg)
@@ -66,6 +66,15 @@ void main() {
             // Bar: ~15% of cell width on the left edge, minimum 2 px.
             float thickness = max(2.0, u_cell_size.x * 0.15);
             if (v_cell_local.x < thickness) {
+                color = u_cursor_color;
+            }
+        } else if (u_cursor_shape == 4) {
+            // Hollow block: 1-2 px outline along all four cell edges. Used
+            // for the vi-mode cursor so it reads as "the other cursor"
+            // without obscuring the glyph it's parked on.
+            float thickness = max(1.0, min(u_cell_size.x, u_cell_size.y) * 0.06);
+            vec2 d = min(v_cell_local, u_cell_size - v_cell_local);
+            if (d.x < thickness || d.y < thickness) {
                 color = u_cursor_color;
             }
         }

@@ -78,15 +78,17 @@ impl Row {
     }
 }
 
-/// DECSCUSR (`CSI Ps SP q`) cursor shape. We collapse blink/steady — we
-/// don't animate. Apps like vim and zsh-vi-mode set this to communicate
-/// editor state (insert vs. normal mode).
+/// Cursor shape for the renderer. The first three are settable by apps
+/// via DECSCUSR (`CSI Ps SP q`) — blink/steady collapse, since we don't
+/// animate the DECSCUSR way (see `App::cursor_visible_now`). HollowBlock
+/// is internal and used for the vi-mode cursor; apps can't request it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum CursorShape {
     #[default]
     Block,
     Underline,
     Bar,
+    HollowBlock,
 }
 
 #[derive(Copy, Clone, Debug, Default)]

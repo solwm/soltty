@@ -8,6 +8,7 @@ mod renderer;
 mod selection;
 mod term;
 mod theme;
+mod vi;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,6 +104,8 @@ fn main() {
         // Real value is set in `resumed` once we have a window to ask.
         frame_interval: Duration::from_millis(8),
         blink_epoch: Instant::now(),
+        vi: vi::ViMode::new(),
+        vi_keybind: vi::ViKeyBind::from_env_or_default(),
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -195,6 +198,10 @@ struct App {
     /// types so the cursor flashes on right after activity instead of
     /// continuing whatever stale phase it was in.
     blink_epoch: Instant,
+    vi: vi::ViMode,
+    /// Activation key for vi mode. Read from `SOLTTY_VI_KEY` at startup,
+    /// defaults to Ctrl+Shift+Space.
+    vi_keybind: vi::ViKeyBind,
 }
 
 /// Even with the per-display cap, we always paint immediately if we've
@@ -409,12 +416,17 @@ impl ApplicationHandler<UserEvent> for App {
                 // through field access directly lets disjoint-borrow do
                 // its job.
                 let cursor_visible = match self.term.cursor_shape() {
-                    CursorShape::Block => true,
+                    CursorShape::Block | CursorShape::HollowBlock => true,
                     CursorShape::Bar | CursorShape::Underline => {
                         let elapsed = now.duration_since(self.blink_epoch);
                         let half_ms = BLINK_HALF_PERIOD.as_millis();
                         (elapsed.as_millis() / half_ms) % 2 == 0
                     }
+                };
+                let vi_cursor = if self.vi.active {
+                    Some(self.vi.cursor)
+                } else {
+                    None
                 };
                 gpu.render(
                     &self.term,
@@ -422,6 +434,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.selection.as_ref(),
                     self.trace,
                     cursor_visible,
+                    vi_cursor,
+                    self.vi.active,
                 );
                 self.redraw_pending = false;
                 self.dirty = false;
@@ -651,6 +665,66 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                // Vi mode: activation. Once active, the keypress that
+                // triggered entry is consumed locally — never sent to PTY.
+                if !self.vi.active && self.vi_keybind.matches(&logical_key, self.modifiers) {
+                    let start = self.term.viewport_cursor().unwrap_or((0, 0));
+                    self.vi.enter(start);
+                    self.selection = None;
+                    window.request_redraw();
+                    return;
+                }
+
+                // Vi mode: while active, all keys go to the vi handler and
+                // nothing reaches the PTY. Esc exits (or exits visual first
+                // if a selection is active).
+                if self.vi.active {
+                    let cols = self.term.grid().cols;
+                    let shift = self.modifiers.shift_key();
+                    match &logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            if self.vi.visual != vi::VisualMode::None {
+                                self.vi.exit_visual();
+                            } else {
+                                self.vi.exit();
+                            }
+                            self.selection = None;
+                        }
+                        Key::Character(s) => {
+                            let ch = s.chars().next().unwrap_or('\0').to_ascii_lowercase();
+                            match ch {
+                                'h' => apply_vi_move(&mut self.vi, &mut self.term, 0, -1),
+                                'j' => apply_vi_move(&mut self.vi, &mut self.term, 1, 0),
+                                'k' => apply_vi_move(&mut self.vi, &mut self.term, -1, 0),
+                                'l' => apply_vi_move(&mut self.vi, &mut self.term, 0, 1),
+                                'v' if shift => self.vi.start_visual_line(),
+                                'v' => self.vi.start_visual_char(),
+                                'y' => {
+                                    if let Some(sel) = self.selection.as_ref() {
+                                        let text = selection::extract_text(&self.term, sel);
+                                        if !text.is_empty() {
+                                            self.clipboard.set_primary(text.clone());
+                                            self.clipboard.set_text(text);
+                                        }
+                                    }
+                                    self.vi.exit();
+                                    self.selection = None;
+                                }
+                                _ => {}
+                            }
+                            // Refresh selection from the latest vi state if
+                            // we're still in a visual mode (covers `v`/`V`
+                            // and any motion that extended the range).
+                            if self.vi.visual != vi::VisualMode::None {
+                                self.selection = self.vi.selection(cols);
+                            }
+                        }
+                        _ => {}
+                    }
+                    window.request_redraw();
+                    return;
+                }
+
                 // Ctrl+Shift+V → paste from system clipboard.
                 if self.modifiers.control_key() && self.modifiers.shift_key() {
                     let is_v = matches!(physical_key, PhysicalKey::Code(KeyCode::KeyV))
@@ -747,7 +821,10 @@ impl App {
     /// `BLINK_HALF_PERIOD * 2`.
     fn cursor_blinks(&self) -> bool {
         match self.term.cursor_shape() {
-            CursorShape::Block => false,
+            // HollowBlock is internal (vi-mode); apps can't request it,
+            // and we don't blink it for the same reason as Block — vi
+            // mode is "reading" mode, flicker would be distracting.
+            CursorShape::Block | CursorShape::HollowBlock => false,
             CursorShape::Bar | CursorShape::Underline => true,
         }
     }
@@ -788,6 +865,38 @@ fn font_zoom_target(key: &Key, mods: ModifiersState, current_px: f32) -> Option<
         "-" => Some(current_px / 1.1),
         "0" => Some(DEFAULT_FONT_SIZE_PX),
         _ => None,
+    }
+}
+
+/// Move the vi cursor by `(drow, dcol)`, scrolling the viewport into or
+/// out of scrollback when the move would push the cursor off the visible
+/// area. Free function rather than a method on `App` so it can be called
+/// while the surrounding `window_event` holds `&mut self.gpu` from the
+/// destructuring at the top — the compiler tracks disjoint field borrows
+/// fine when the call site names the fields directly.
+fn apply_vi_move(vi_state: &mut vi::ViMode, term: &mut Term, drow: isize, dcol: isize) {
+    let (rows, cols) = {
+        let g = term.grid();
+        (g.rows, g.cols)
+    };
+    let r = vi_state.cursor.0 as isize + drow;
+    let c = (vi_state.cursor.1 as isize + dcol)
+        .clamp(0, cols.saturating_sub(1) as isize) as usize;
+
+    if r < 0 {
+        // Going above the top: scroll into history (delta>0 raises
+        // viewport_offset) and pin the cursor to the new top row.
+        term.scroll_view(-r);
+        vi_state.cursor = (0, c);
+    } else if r >= rows as isize {
+        let overshoot = r - (rows - 1) as isize;
+        // Going below the bottom: scroll toward the live grid; if we're
+        // already pinned to live (offset 0) the cursor just stops at the
+        // last row.
+        term.scroll_view(-overshoot);
+        vi_state.cursor = (rows - 1, c);
+    } else {
+        vi_state.cursor = (r as usize, c);
     }
 }
 

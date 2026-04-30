@@ -214,6 +214,8 @@ impl Gpu {
         selection: Option<&Selection>,
         trace: bool,
         cursor_visible_now: bool,
+        vi_cursor: Option<(usize, usize)>,
+        vi_active: bool,
     ) {
         self.renderer.prepare(
             &self.gl,
@@ -223,10 +225,22 @@ impl Gpu {
             selection,
             trace,
             cursor_visible_now,
+            vi_cursor,
         );
         self.renderer.draw(&self.gl);
+        if vi_active {
+            self.renderer.draw_tint(&self.gl, VI_TINT_COLOR);
+        }
         if let Err(e) = self.surface.swap_buffers(&self.context) {
             log::warn!("swap_buffers: {e}");
         }
     }
 }
+
+/// Light-green wash painted over the whole window when vi-mode is active.
+/// CSS `lightgreen` (#90EE90 = rgb(144, 238, 144)), pre-converted to
+/// linear-light because the framebuffer is sRGB-encoded — values here go
+/// through `GL_FRAMEBUFFER_SRGB` and come out the right green. Alpha is
+/// the wash strength; 0.20 is enough to read at a glance without burying
+/// the underlying terminal content.
+const VI_TINT_COLOR: [f32; 4] = [0.279, 0.855, 0.279, 0.015];
