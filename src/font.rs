@@ -36,9 +36,29 @@ pub struct CellMetrics {
     pub baseline: u32,
 }
 
+/// One font loaded into memory. We hold the raw bytes + the offset into them
+/// because `swash::FontRef` is a thin view that re-parses cheaply on each
+/// `from_offset`. Keeping the bytes owned lets us hand out fresh refs without
+/// lifetime games.
+struct LoadedFont {
+    data: Vec<u8>,
+    offset: u32,
+}
+
+impl LoadedFont {
+    fn font(&self) -> Option<FontRef<'_>> {
+        FontRef::from_offset(&self.data, self.offset)
+    }
+}
+
 pub struct FontAtlas {
-    font_data: Vec<u8>,
-    font_offset: u32,
+    /// Loaded fonts, primary at [0] and fallbacks at [1..]. We try the
+    /// primary first when rasterizing a glyph, then walk the fallbacks
+    /// in order — first font that has the codepoint wins. JetBrainsMono
+    /// (a common primary) lacks ballot boxes, geometric shapes, and
+    /// many other symbol blocks, so the chain is what makes box-drawing
+    /// task lists and similar UI render at all.
+    fonts: Vec<LoadedFont>,
     px_size: f32,
     pub metrics: CellMetrics,
     pub atlas_w: u32,
@@ -54,29 +74,62 @@ pub struct FontAtlas {
 
 impl FontAtlas {
     pub fn new(px_size: f32) -> std::io::Result<Self> {
-        let path = discover_font().ok_or_else(|| io_err(
+        let primary_path = discover_font().ok_or_else(|| io_err(
             "no monospace font found; set SOLTTY_FONT to a TTF/OTF path",
         ))?;
-        log::info!("font: {}", path.display());
-        let font_data = std::fs::read(&path)?;
+        log::info!("font: {}", primary_path.display());
+        let primary_data = std::fs::read(&primary_path)?;
 
-        let font = FontRef::from_index(&font_data, 0)
+        let primary_font = FontRef::from_index(&primary_data, 0)
             .ok_or_else(|| io_err("could not parse font"))?;
-        let font_offset = font.offset;
+        let primary_offset = primary_font.offset;
 
-        let metrics = compute_cell_metrics(&font, px_size);
+        // Cell metrics come from the primary only. Fallback glyphs are
+        // rendered at the same px_size and slotted into primary-sized
+        // cells; their advance may not match exactly, but the alternative
+        // (unrenderable symbol) is worse.
+        let metrics = compute_cell_metrics(&primary_font, px_size);
         log::info!(
             "cell: {}x{} (baseline={})",
             metrics.cell_w, metrics.cell_h, metrics.baseline
         );
+
+        let mut fonts: Vec<LoadedFont> = vec![LoadedFont {
+            data: primary_data,
+            offset: primary_offset,
+        }];
+
+        // Load broad-coverage fallbacks for symbols the primary lacks.
+        // Skipped silently if the file doesn't exist or fails to parse —
+        // worst case we end up with primary-only, which is what we had
+        // before this commit.
+        let primary_canonical = primary_path.canonicalize().ok();
+        for path in discover_fallback_fonts() {
+            if path.canonicalize().ok() == primary_canonical {
+                continue; // primary already loaded under a different alias
+            }
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::debug!("fallback {} unreadable: {e}", path.display());
+                    continue;
+                }
+            };
+            let Some(font) = FontRef::from_index(&data, 0) else {
+                log::debug!("fallback {}: unparseable", path.display());
+                continue;
+            };
+            let offset = font.offset;
+            log::info!("font fallback: {}", path.display());
+            fonts.push(LoadedFont { data, offset });
+        }
 
         let (atlas_w, atlas_h) = (1024u32, 1024u32);
         let atlas_data = vec![0u8; (atlas_w * atlas_h) as usize];
         let allocator = AtlasAllocator::new(size2(atlas_w as i32, atlas_h as i32));
 
         let mut atlas = Self {
-            font_data,
-            font_offset,
+            fonts,
             px_size,
             metrics,
             atlas_w,
@@ -107,17 +160,36 @@ impl FontAtlas {
     }
 
     fn rasterize(&mut self, ch: char) {
-        // Build the FontRef inline to avoid borrowing self while we also need
-        // &mut self.scale_ctx below.
-        let Some(font) = FontRef::from_offset(&self.font_data, self.font_offset) else {
+        // Walk the font chain to find one that has the codepoint. Primary
+        // first, then fallbacks in load order. None match → cache empty so
+        // we don't try again next frame; this is what kept JetBrainsMono's
+        // ballot-box gap silent before we had a fallback chain at all.
+        let mut found: Option<usize> = None;
+        for (i, f) in self.fonts.iter().enumerate() {
+            let Some(font) = f.font() else { continue };
+            if font.charmap().map(ch) != 0 {
+                found = Some(i);
+                break;
+            }
+        }
+        let font_idx = match found {
+            Some(i) => i,
+            None if ch == '\0' => 0, // render primary's .notdef for a literal NUL
+            None => {
+                self.glyphs.insert(ch, GlyphEntry::default());
+                return;
+            }
+        };
+
+        // Re-fetch the FontRef from the chosen slot. The borrow checker
+        // wants this here (rather than caching from the search loop)
+        // because `self.scale_ctx.builder(font)` below needs mutable access
+        // to a different field of `self`, which requires the immutable
+        // borrow we just made to live in this scope only.
+        let Some(font) = self.fonts[font_idx].font() else {
             return;
         };
         let glyph_id = font.charmap().map(ch);
-        // glyph_id == 0 is .notdef. Cache it as empty so we don't try again.
-        if glyph_id == 0 && ch != '\0' {
-            self.glyphs.insert(ch, GlyphEntry::default());
-            return;
-        }
 
         let mut scaler = self
             .scale_ctx
@@ -273,6 +345,50 @@ fn discover_font() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Broad-coverage fonts loaded after the primary so we can render symbols
+/// the primary lacks. JetBrainsMono is missing ballot boxes (U+2610-2612)
+/// and the geometric-shape range (U+25A0-25CF), among others; DejaVuSansMono
+/// covers all of those and is widely available on Linux. Color emoji fonts
+/// are deliberately not here — our atlas is alpha-only, so we'd have to
+/// build an RGBA path before they'd be useful.
+///
+/// Order matters: more specific / better-quality fonts should come first.
+/// We don't cap how many we load, but in practice only a handful exist.
+fn discover_fallback_fonts() -> Vec<PathBuf> {
+    const CANDIDATES: &[&str] = &[
+        // Linux — DejaVuSansMono is the workhorse; covers most non-emoji
+        // symbol blocks. NotoSansMono fills a few additional gaps.
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        // macOS — Menlo/Monaco have decent symbol coverage; SF Symbols and
+        // Apple Symbols aren't accessible without CoreText, so we don't
+        // try to use them.
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Monaco.ttf",
+        // Windows — Segoe UI Symbol is the broad-coverage symbol font.
+        r"C:\Windows\Fonts\seguisym.ttf",
+        r"C:\Windows\Fonts\consola.ttf",
+    ];
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for c in CANDIDATES {
+        let p = PathBuf::from(c);
+        if !p.is_file() {
+            continue;
+        }
+        // Two CANDIDATES entries can resolve to the same file via
+        // distro-specific symlinks; canonicalize to dedupe.
+        let key = p.canonicalize().unwrap_or_else(|_| p.clone());
+        if seen.insert(key) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 fn io_err(msg: &str) -> std::io::Error {

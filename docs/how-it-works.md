@@ -567,24 +567,31 @@ for code in 0x20u8..=0x7Eu8 {
 
 So all 95 printable ASCII characters are in the atlas before we render
 the first frame. Anything else (Unicode, box-drawing, etc.) gets
-rasterized lazily when the renderer encounters it for the first time:
+rasterized lazily on first encounter, via `atlas.ensure(ch)` from the
+renderer's per-cell loop. New glyphs append to `atlas.dirty_rects`; the
+renderer drains that list each frame and uploads only the per-glyph
+sub-rectangles via `tex_sub_image_2d`. Steady state is no upload at all.
+See `docs/performance.md` for the per-rect upload mechanics.
 
-```rust
-// In Renderer::prepare:
-for vrow in 0..rows {
-    for cell in &term.viewport_row(vrow).cells {
-        if !is_blank_glyph(cell.ch) { atlas.ensure(cell.ch); }
-    }
-}
-if atlas.atlas_dirty {
-    upload_atlas_full(queue, &self.atlas_texture, atlas);
-    atlas.atlas_dirty = false;
-}
-```
+#### Font fallback chain
 
-The atlas re-upload is `1 MB` worst case (`R8 1024x1024`), but only
-happens on frames where new glyphs were added — i.e. essentially never
-in steady state.
+JetBrainsMono — our default primary — lacks ballot boxes (U+2610..2612),
+the geometric-shape range (U+25A0..25CF), and several other symbol
+blocks. Without a fallback those characters silently render as empty
+cells. So `FontAtlas::new` loads a small chain: the primary first, then
+broad-coverage fallbacks (DejaVuSansMono on Linux; Menlo/Monaco on
+macOS; Segoe UI Symbol on Windows) discovered by hand-probing fixed
+paths.
+
+`rasterize` walks the chain on each new glyph, picks the first font
+whose `charmap.map(ch) != 0`, and rasterizes from that one. Cell
+metrics still come from the primary, so a fallback glyph wider than the
+primary's advance gets clipped to the cell — acceptable since the
+alternative is "doesn't render at all".
+
+Color emoji (U+2705 ✅, U+274C ❌, etc.) deliberately stays outside the
+chain. Our atlas is alpha-only; doing color glyphs needs an RGBA path
+and a separate texture-or-array, which is its own milestone.
 
 Glyph rasterization itself is one `swash::scale::Render` call that
 produces an alpha mask. We pack it into the atlas using `etagere`, a
