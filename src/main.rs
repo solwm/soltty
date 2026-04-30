@@ -676,50 +676,139 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 // Vi mode: while active, all keys go to the vi handler and
-                // nothing reaches the PTY. Esc exits (or exits visual first
-                // if a selection is active).
+                // nothing reaches the PTY. Esc cancels pending count/op
+                // first, then exits visual, then exits vi-mode entirely.
                 if self.vi.active {
                     let cols = self.term.grid().cols;
                     let shift = self.modifiers.shift_key();
+                    let ctrl = self.modifiers.control_key();
+                    let mut motion: Option<vi::Motion> = None;
+
                     match &logical_key {
                         Key::Named(NamedKey::Escape) => {
-                            if self.vi.visual != vi::VisualMode::None {
+                            if self.vi.pending_count.is_some() || self.vi.pending_op.is_some() {
+                                self.vi.cancel_pending();
+                            } else if self.vi.visual != vi::VisualMode::None {
                                 self.vi.exit_visual();
+                                self.selection = None;
                             } else {
                                 self.vi.exit();
+                                self.selection = None;
                             }
-                            self.selection = None;
                         }
                         Key::Character(s) => {
-                            let ch = s.chars().next().unwrap_or('\0').to_ascii_lowercase();
-                            match ch {
-                                'h' => apply_vi_move(&mut self.vi, &mut self.term, 0, -1),
-                                'j' => apply_vi_move(&mut self.vi, &mut self.term, 1, 0),
-                                'k' => apply_vi_move(&mut self.vi, &mut self.term, -1, 0),
-                                'l' => apply_vi_move(&mut self.vi, &mut self.term, 0, 1),
-                                'v' if shift => self.vi.start_visual_line(),
-                                'v' => self.vi.start_visual_char(),
-                                'y' => {
-                                    if let Some(sel) = self.selection.as_ref() {
-                                        let text = selection::extract_text(&self.term, sel);
-                                        if !text.is_empty() {
-                                            self.clipboard.set_primary(text.clone());
-                                            self.clipboard.set_text(text);
-                                        }
-                                    }
-                                    self.vi.exit();
-                                    self.selection = None;
+                            let raw = s.chars().next().unwrap_or('\0');
+                            let ch = raw.to_ascii_lowercase();
+
+                            // Page motions are ctrl-modified letters. Take
+                            // them before the digit/letter split so 'd' /
+                            // 'u' etc. don't get swallowed.
+                            let page_motion = if ctrl {
+                                match ch {
+                                    'd' => Some(vi::Motion::HalfPageDown),
+                                    'u' => Some(vi::Motion::HalfPageUp),
+                                    'f' => Some(vi::Motion::FullPageDown),
+                                    'b' => Some(vi::Motion::FullPageUp),
+                                    _ => None,
                                 }
-                                _ => {}
-                            }
-                            // Refresh selection from the latest vi state if
-                            // we're still in a visual mode (covers `v`/`V`
-                            // and any motion that extended the range).
-                            if self.vi.visual != vi::VisualMode::None {
-                                self.selection = self.vi.selection(cols);
+                            } else {
+                                None
+                            };
+
+                            if let Some(m) = page_motion {
+                                motion = Some(m);
+                            } else if ch.is_ascii_digit()
+                                && (ch != '0' || self.vi.pending_count.is_some())
+                            {
+                                // Digit: append to count. Bare leading
+                                // `0` is a motion (LineStart) rather than
+                                // a digit, matching vim — falls through
+                                // to the `('0', _)` arm below.
+                                self.vi.push_digit(ch.to_digit(10).unwrap());
+                            } else if self.vi.pending_op == Some(vi::PendingOp::Goto) {
+                                // Mid-`gg` sequence. Only `g` completes;
+                                // any other key cancels the pending op
+                                // (and doesn't do its usual thing — vim
+                                // throws away the half-typed sequence).
+                                self.vi.pending_op = None;
+                                if ch == 'g' {
+                                    motion = Some(vi::Motion::DocStart);
+                                }
+                            } else {
+                                match (ch, shift) {
+                                    // h/j/k/l — char motion (no shift).
+                                    ('h', false) => motion = Some(vi::Motion::Char(0, -1)),
+                                    ('j', false) => motion = Some(vi::Motion::Char(1, 0)),
+                                    ('k', false) => motion = Some(vi::Motion::Char(-1, 0)),
+                                    ('l', false) => motion = Some(vi::Motion::Char(0, 1)),
+                                    // H/M/L — screen positions (shift).
+                                    ('h', true) => motion = Some(vi::Motion::ScreenTop),
+                                    ('m', true) => motion = Some(vi::Motion::ScreenMiddle),
+                                    ('l', true) => motion = Some(vi::Motion::ScreenBottom),
+                                    // gg / G — document ends.
+                                    ('g', false) => {
+                                        self.vi.pending_op = Some(vi::PendingOp::Goto)
+                                    }
+                                    ('g', true) => motion = Some(vi::Motion::DocEnd),
+                                    // Word motions: lowercase = word,
+                                    // uppercase (shift) = WORD.
+                                    ('w', false) => {
+                                        motion = Some(vi::Motion::WordNext { big: false })
+                                    }
+                                    ('w', true) => {
+                                        motion = Some(vi::Motion::WordNext { big: true })
+                                    }
+                                    ('e', false) => {
+                                        motion = Some(vi::Motion::WordEnd { big: false })
+                                    }
+                                    ('e', true) => {
+                                        motion = Some(vi::Motion::WordEnd { big: true })
+                                    }
+                                    ('b', false) => {
+                                        motion = Some(vi::Motion::WordPrev { big: false })
+                                    }
+                                    ('b', true) => {
+                                        motion = Some(vi::Motion::WordPrev { big: true })
+                                    }
+                                    // Line motions. `0`/`^`/`$` arrive
+                                    // with whatever shift state the user
+                                    // had to type them; we don't care.
+                                    ('0', _) => motion = Some(vi::Motion::LineStart),
+                                    ('^', _) => motion = Some(vi::Motion::LineFirstNonBlank),
+                                    ('$', _) => motion = Some(vi::Motion::LineEnd),
+                                    // Visual mode entries.
+                                    ('v', false) => self.vi.start_visual_char(),
+                                    ('v', true) => self.vi.start_visual_line(),
+                                    // Yank + exit.
+                                    ('y', _) => {
+                                        if let Some(sel) = self.selection.as_ref() {
+                                            let text =
+                                                selection::extract_text(&self.term, sel);
+                                            if !text.is_empty() {
+                                                self.clipboard.set_primary(text.clone());
+                                                self.clipboard.set_text(text);
+                                            }
+                                        }
+                                        self.vi.exit();
+                                        self.selection = None;
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         _ => {}
+                    }
+
+                    // Apply the chosen motion (if any), consuming the count.
+                    if let Some(m) = motion {
+                        let n = self.vi.take_count();
+                        vi::apply_motion(&mut self.vi, &mut self.term, m, n);
+                    }
+                    // Refresh selection from the latest vi state if we're
+                    // still in a visual mode (covers `v`/`V` plus any
+                    // motion that extended the range).
+                    if self.vi.active && self.vi.visual != vi::VisualMode::None {
+                        self.selection = self.vi.selection(cols);
                     }
                     window.request_redraw();
                     return;
@@ -865,38 +954,6 @@ fn font_zoom_target(key: &Key, mods: ModifiersState, current_px: f32) -> Option<
         "-" => Some(current_px / 1.1),
         "0" => Some(DEFAULT_FONT_SIZE_PX),
         _ => None,
-    }
-}
-
-/// Move the vi cursor by `(drow, dcol)`, scrolling the viewport into or
-/// out of scrollback when the move would push the cursor off the visible
-/// area. Free function rather than a method on `App` so it can be called
-/// while the surrounding `window_event` holds `&mut self.gpu` from the
-/// destructuring at the top — the compiler tracks disjoint field borrows
-/// fine when the call site names the fields directly.
-fn apply_vi_move(vi_state: &mut vi::ViMode, term: &mut Term, drow: isize, dcol: isize) {
-    let (rows, cols) = {
-        let g = term.grid();
-        (g.rows, g.cols)
-    };
-    let r = vi_state.cursor.0 as isize + drow;
-    let c = (vi_state.cursor.1 as isize + dcol)
-        .clamp(0, cols.saturating_sub(1) as isize) as usize;
-
-    if r < 0 {
-        // Going above the top: scroll into history (delta>0 raises
-        // viewport_offset) and pin the cursor to the new top row.
-        term.scroll_view(-r);
-        vi_state.cursor = (0, c);
-    } else if r >= rows as isize {
-        let overshoot = r - (rows - 1) as isize;
-        // Going below the bottom: scroll toward the live grid; if we're
-        // already pinned to live (offset 0) the cursor just stops at the
-        // last row.
-        term.scroll_view(-overshoot);
-        vi_state.cursor = (rows - 1, c);
-    } else {
-        vi_state.cursor = (r as usize, c);
     }
 }
 

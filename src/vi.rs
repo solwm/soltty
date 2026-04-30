@@ -1,16 +1,18 @@
-//! Vi mode state and keybind parsing.
+//! Vi mode state, motions, and keybind parsing.
 //!
 //! Vi mode is a soltty UI feature, not a terminal-protocol feature: it
 //! intercepts keystrokes locally to drive a separate "vi cursor" the user
 //! navigates with vim-style keys. The PTY sees nothing while we're in vi
 //! mode (modulo Esc, which exits us back to the normal flow).
 //!
-//! M1 scope (this file): state + the activation keybind parser. The actual
-//! key handling and rendering glue live in `main.rs` and `renderer.rs`.
+//! Key handling lives in `main.rs::window_event`; this module owns the
+//! state machine (cursor, visual mode, count prefix, op-pending) and the
+//! motion implementations that mutate `ViMode` + scroll the `Term`.
 
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::selection::Selection;
+use crate::term::Term;
 
 /// What kind of visual selection the user is in. `None` means vi-mode
 /// normal (motion only); `Char` and `Line` correspond to vim's `v` and
@@ -20,6 +22,13 @@ pub enum VisualMode {
     None,
     Char,
     Line,
+}
+
+/// Two-key sequences in vim wait for the second key — `gg` is the only
+/// one we use today, so this is a single-variant enum we'll grow later.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PendingOp {
+    Goto, // saw 'g', waiting for the second 'g' to mean DocStart
 }
 
 pub struct ViMode {
@@ -32,6 +41,15 @@ pub struct ViMode {
     /// Where visual selection started. Set by `v` / `V`, used to build
     /// the Selection that gets rendered.
     pub visual_anchor: Option<(usize, usize)>,
+    /// Accumulated count prefix (e.g. `5j` parses 5 here before applying
+    /// motion j five times). `None` means no count typed; `Some(0)` is
+    /// only reachable when `0` is itself a count digit (i.e. typed after
+    /// `1`-`9`), since a leading `0` means "line start" motion instead.
+    pub pending_count: Option<u32>,
+    /// Set when we're mid-multi-key sequence (e.g. saw `g`, waiting for
+    /// the next key to complete `gg`). Cleared once the sequence
+    /// completes or is cancelled by Esc / a non-matching follow-up.
+    pub pending_op: Option<PendingOp>,
 }
 
 impl ViMode {
@@ -41,6 +59,8 @@ impl ViMode {
             cursor: (0, 0),
             visual: VisualMode::None,
             visual_anchor: None,
+            pending_count: None,
+            pending_op: None,
         }
     }
 
@@ -52,17 +72,41 @@ impl ViMode {
         self.cursor = start;
         self.visual = VisualMode::None;
         self.visual_anchor = None;
+        self.pending_count = None;
+        self.pending_op = None;
     }
 
     pub fn exit(&mut self) {
         self.active = false;
         self.visual = VisualMode::None;
         self.visual_anchor = None;
+        self.pending_count = None;
+        self.pending_op = None;
     }
 
     pub fn exit_visual(&mut self) {
         self.visual = VisualMode::None;
         self.visual_anchor = None;
+    }
+
+    /// Clear half-typed count and op-pending state. Esc calls this before
+    /// deciding whether to also exit visual or vi-mode.
+    pub fn cancel_pending(&mut self) {
+        self.pending_count = None;
+        self.pending_op = None;
+    }
+
+    /// Consume the typed count and reset. Returns 1 when no count was
+    /// pending, matching vim's "implicit ×1" for an unprefixed motion.
+    pub fn take_count(&mut self) -> u32 {
+        self.pending_count.take().unwrap_or(1).max(1)
+    }
+
+    /// Append a digit (0..=9) to the pending count. Saturates at 10_000
+    /// to keep one stuck key from spinning forever.
+    pub fn push_digit(&mut self, d: u32) {
+        let cur = self.pending_count.unwrap_or(0);
+        self.pending_count = Some((cur.saturating_mul(10).saturating_add(d)).min(10_000));
     }
 
     pub fn start_visual_char(&mut self) {
@@ -102,6 +146,278 @@ impl ViMode {
             }
         }
     }
+}
+
+/// A vi-mode motion. Counts (`5j`, `3w`) are applied by re-running the
+/// motion N times in `apply_motion`; idempotent ones (LineStart) repeat
+/// trivially, others (Char, WordNext) accumulate the way vim users
+/// expect.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Motion {
+    /// (drow, dcol) per repeat. Used for h/j/k/l. Scrolls into history /
+    /// toward live when a step would push past the viewport edge.
+    Char(isize, isize),
+    LineStart,         // 0
+    LineFirstNonBlank, // ^
+    LineEnd,           // $
+    DocStart,          // gg — top of scrollback
+    DocEnd,            // G  — bottom of live grid
+    ScreenTop,         // H
+    ScreenMiddle,      // M
+    ScreenBottom,      // L
+    HalfPageUp,        // Ctrl-u
+    HalfPageDown,      // Ctrl-d
+    FullPageUp,        // Ctrl-b
+    FullPageDown,      // Ctrl-f
+    /// `w`/`W`. `big` toggles WORD (non-whitespace runs) vs word
+    /// (alphanumeric + `_` runs).
+    WordNext { big: bool },
+    /// `e`/`E` — end of current word, or end of next word if already at
+    /// the end.
+    WordEnd { big: bool },
+    /// `b`/`B`.
+    WordPrev { big: bool },
+}
+
+/// Apply a motion `count` times, scrolling the viewport when motions push
+/// past the edge. Free function rather than a `ViMode` method so the
+/// caller in `App::window_event` can pass disjoint borrows of `vi` and
+/// `term` while still holding the unrelated `&mut self.gpu` from the
+/// destructure at the top of that fn.
+pub fn apply_motion(vi: &mut ViMode, term: &mut Term, motion: Motion, count: u32) {
+    for _ in 0..count {
+        let (rows, cols) = {
+            let g = term.grid();
+            (g.rows, g.cols)
+        };
+        match motion {
+            Motion::Char(drow, dcol) => char_move(vi, term, drow, dcol, rows, cols),
+            Motion::LineStart => vi.cursor.1 = 0,
+            Motion::LineFirstNonBlank => {
+                let row = vi.cursor.0;
+                vi.cursor.1 = first_non_blank(term, row, cols);
+            }
+            Motion::LineEnd => {
+                let row = vi.cursor.0;
+                vi.cursor.1 = last_non_blank(term, row, cols);
+            }
+            Motion::DocStart => {
+                term.scroll_view(isize::MAX);
+                vi.cursor.0 = 0;
+            }
+            Motion::DocEnd => {
+                term.reset_view();
+                vi.cursor.0 = rows.saturating_sub(1);
+            }
+            Motion::ScreenTop => vi.cursor.0 = 0,
+            Motion::ScreenMiddle => vi.cursor.0 = rows / 2,
+            Motion::ScreenBottom => vi.cursor.0 = rows.saturating_sub(1),
+            Motion::HalfPageUp => term.scroll_view((rows / 2) as isize),
+            Motion::HalfPageDown => term.scroll_view(-((rows / 2) as isize)),
+            Motion::FullPageUp => term.scroll_view(rows.saturating_sub(1) as isize),
+            Motion::FullPageDown => term.scroll_view(-(rows.saturating_sub(1) as isize)),
+            Motion::WordNext { big } => word_next(vi, term, big, rows, cols),
+            Motion::WordEnd { big } => word_end(vi, term, big, rows, cols),
+            Motion::WordPrev { big } => word_prev(vi, term, big, cols),
+        }
+        // Final clamp — most arms set one coord and trust the other to
+        // already be in range, but motion logic that strays outside (e.g.
+        // a row count larger than the viewport) gets caught here.
+        vi.cursor.0 = vi.cursor.0.min(rows.saturating_sub(1));
+        vi.cursor.1 = vi.cursor.1.min(cols.saturating_sub(1));
+    }
+}
+
+fn char_move(
+    vi: &mut ViMode,
+    term: &mut Term,
+    drow: isize,
+    dcol: isize,
+    rows: usize,
+    cols: usize,
+) {
+    let r = vi.cursor.0 as isize + drow;
+    let c =
+        (vi.cursor.1 as isize + dcol).clamp(0, cols.saturating_sub(1) as isize) as usize;
+    if r < 0 {
+        // Scroll into history; pin cursor to the new top row.
+        term.scroll_view(-r);
+        vi.cursor = (0, c);
+    } else if r >= rows as isize {
+        let overshoot = r - (rows - 1) as isize;
+        term.scroll_view(-overshoot);
+        vi.cursor = (rows - 1, c);
+    } else {
+        vi.cursor = (r as usize, c);
+    }
+}
+
+fn first_non_blank(term: &Term, row: usize, cols: usize) -> usize {
+    term.viewport_row(row)
+        .cells
+        .iter()
+        .take(cols)
+        .position(|c| !c.ch.is_whitespace() && c.ch != '\0')
+        .unwrap_or(0)
+}
+
+fn last_non_blank(term: &Term, row: usize, cols: usize) -> usize {
+    term.viewport_row(row)
+        .cells
+        .iter()
+        .take(cols)
+        .rposition(|c| !c.ch.is_whitespace() && c.ch != '\0')
+        .unwrap_or(0)
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum WordClass {
+    Whitespace,
+    Word,
+    Punct,
+}
+
+fn classify(ch: char, big: bool) -> WordClass {
+    if ch.is_whitespace() || ch == '\0' {
+        WordClass::Whitespace
+    } else if big || ch.is_alphanumeric() || ch == '_' {
+        // In WORD mode (`big`), every non-whitespace char is "Word"; in
+        // word mode, only alphanumerics + underscore.
+        WordClass::Word
+    } else {
+        WordClass::Punct
+    }
+}
+
+fn cell_char(term: &Term, row: usize, col: usize) -> char {
+    term.viewport_row(row)
+        .cells
+        .get(col)
+        .map(|c| c.ch)
+        .unwrap_or('\0')
+}
+
+/// Move (row, col) to the next cell in row-major order across the
+/// viewport. Returns false at the very last cell.
+fn advance(row: &mut usize, col: &mut usize, rows: usize, cols: usize) -> bool {
+    if *col + 1 < cols {
+        *col += 1;
+        true
+    } else if *row + 1 < rows {
+        *col = 0;
+        *row += 1;
+        true
+    } else {
+        false
+    }
+}
+
+/// Move (row, col) to the previous cell. Returns false at (0, 0).
+fn retreat(row: &mut usize, col: &mut usize, cols: usize) -> bool {
+    if *col > 0 {
+        *col -= 1;
+        true
+    } else if *row > 0 {
+        *col = cols.saturating_sub(1);
+        *row -= 1;
+        true
+    } else {
+        false
+    }
+}
+
+/// Jump to the start of the next word (or WORD).
+fn word_next(vi: &mut ViMode, term: &Term, big: bool, rows: usize, cols: usize) {
+    let mut r = vi.cursor.0;
+    let mut c = vi.cursor.1;
+    let start = classify(cell_char(term, r, c), big);
+    // Skip the current run if it's not whitespace (whitespace already
+    // bleeds into the second loop).
+    if start != WordClass::Whitespace {
+        while classify(cell_char(term, r, c), big) == start {
+            if !advance(&mut r, &mut c, rows, cols) {
+                vi.cursor = (r, c);
+                return;
+            }
+        }
+    }
+    while classify(cell_char(term, r, c), big) == WordClass::Whitespace {
+        if !advance(&mut r, &mut c, rows, cols) {
+            vi.cursor = (r, c);
+            return;
+        }
+    }
+    vi.cursor = (r, c);
+}
+
+/// Jump to the end of the current word — or, if already at the end, to
+/// the end of the next word.
+fn word_end(vi: &mut ViMode, term: &Term, big: bool, rows: usize, cols: usize) {
+    let (mut r, mut c) = vi.cursor;
+    let (mut nr, mut nc) = (r, c);
+    if !advance(&mut nr, &mut nc, rows, cols) {
+        return;
+    }
+    let cur = classify(cell_char(term, r, c), big);
+    let next = classify(cell_char(term, nr, nc), big);
+    // Two cases that move us into a fresh word:
+    //   - we're sitting on whitespace
+    //   - we're at the end of the current word (next cell is a different class)
+    if cur == WordClass::Whitespace || next != cur {
+        r = nr;
+        c = nc;
+        while classify(cell_char(term, r, c), big) == WordClass::Whitespace {
+            if !advance(&mut r, &mut c, rows, cols) {
+                vi.cursor = (r, c);
+                return;
+            }
+        }
+    }
+    // Now within a word; advance to its last cell (look-ahead, commit only
+    // while the peek stays in the same class).
+    let cur = classify(cell_char(term, r, c), big);
+    loop {
+        let mut pr = r;
+        let mut pc = c;
+        if !advance(&mut pr, &mut pc, rows, cols) {
+            break;
+        }
+        if classify(cell_char(term, pr, pc), big) != cur {
+            break;
+        }
+        r = pr;
+        c = pc;
+    }
+    vi.cursor = (r, c);
+}
+
+/// Jump back to the start of the current word — or, if already at the
+/// start, to the start of the previous word.
+fn word_prev(vi: &mut ViMode, term: &Term, big: bool, cols: usize) {
+    let (mut r, mut c) = vi.cursor;
+    if !retreat(&mut r, &mut c, cols) {
+        return;
+    }
+    while classify(cell_char(term, r, c), big) == WordClass::Whitespace {
+        if !retreat(&mut r, &mut c, cols) {
+            vi.cursor = (r, c);
+            return;
+        }
+    }
+    let cur = classify(cell_char(term, r, c), big);
+    loop {
+        let mut pr = r;
+        let mut pc = c;
+        if !retreat(&mut pr, &mut pc, cols) {
+            break;
+        }
+        if classify(cell_char(term, pr, pc), big) != cur {
+            break;
+        }
+        r = pr;
+        c = pc;
+    }
+    vi.cursor = (r, c);
 }
 
 /// One keybind: a key plus a required modifier mask. Used for the vi-mode
@@ -306,5 +622,51 @@ mod tests {
         let sel = v.selection(80).unwrap();
         assert_eq!(sel.anchor, (2, 0));
         assert_eq!(sel.end, (5, 79));
+    }
+
+    #[test]
+    fn count_accumulates_digits() {
+        let mut v = ViMode::new();
+        v.push_digit(1);
+        v.push_digit(5);
+        assert_eq!(v.pending_count, Some(15));
+        // take_count returns and resets.
+        assert_eq!(v.take_count(), 15);
+        assert_eq!(v.pending_count, None);
+        // No digits → defaults to 1.
+        assert_eq!(v.take_count(), 1);
+    }
+
+    #[test]
+    fn count_caps_to_avoid_runaway() {
+        let mut v = ViMode::new();
+        for _ in 0..20 {
+            v.push_digit(9);
+        }
+        assert!(v.pending_count.unwrap() <= 10_000);
+    }
+
+    #[test]
+    fn cancel_pending_clears_count_and_op() {
+        let mut v = ViMode::new();
+        v.push_digit(7);
+        v.pending_op = Some(PendingOp::Goto);
+        v.cancel_pending();
+        assert!(v.pending_count.is_none());
+        assert!(v.pending_op.is_none());
+    }
+
+    #[test]
+    fn classify_word_vs_punct_vs_ws() {
+        assert_eq!(classify('a', false), WordClass::Word);
+        assert_eq!(classify('_', false), WordClass::Word);
+        assert_eq!(classify('5', false), WordClass::Word);
+        assert_eq!(classify(',', false), WordClass::Punct);
+        assert_eq!(classify('/', false), WordClass::Punct);
+        assert_eq!(classify(' ', false), WordClass::Whitespace);
+        // Big-word mode collapses Word and Punct into Word.
+        assert_eq!(classify(',', true), WordClass::Word);
+        assert_eq!(classify('a', true), WordClass::Word);
+        assert_eq!(classify(' ', true), WordClass::Whitespace);
     }
 }

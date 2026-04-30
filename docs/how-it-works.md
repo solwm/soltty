@@ -712,30 +712,56 @@ State lives in `src/vi.rs::ViMode`:
     (inverse highlight in `Renderer::prepare`, `extract_text` for yank)
     just works.
 
-Keys (M1):
+Keys:
 
-| Key       | Action                                                     |
-|-----------|------------------------------------------------------------|
-| `h j k l` | Move. At row 0, `k` scrolls into history; at row N-1, `j` scrolls toward live. |
-| `v`       | Start char-wise visual; further motions extend selection.  |
-| `V`       | Start line-wise visual; selection covers full rows.        |
-| `y`       | Yank selection to clipboard + primary, exit vi-mode.       |
-| `Esc`     | Exit visual back to vi-normal, or exit vi-mode entirely.   |
+| Key                       | Action                                                       |
+|---------------------------|--------------------------------------------------------------|
+| `h` `j` `k` `l`           | Move one cell. Past row 0 scrolls into history; past the bottom scrolls toward live. |
+| `0` `^` `$`               | Column 0 / first non-blank / last non-blank of the row.      |
+| `gg` `G`                  | Top of scrollback / bottom of live grid.                     |
+| `H` `M` `L`               | Top / middle / bottom of the visible viewport.               |
+| `Ctrl-u` `Ctrl-d`         | Scroll half page up / down.                                  |
+| `Ctrl-b` `Ctrl-f`         | Scroll full page up / down.                                  |
+| `w` `e` `b`               | Word next-start / current-or-next-end / previous-start.      |
+| `W` `E` `B`               | Same but on WORDs (non-whitespace runs, punctuation glued).  |
+| `v`                       | Char-wise visual; further motions extend the selection.      |
+| `V`                       | Line-wise visual; selection covers full rows from anchor.    |
+| `y`                       | Yank selection to clipboard + primary, exit vi-mode.         |
+| `<count>` (e.g. `5j`)     | Count prefix — repeats the next motion N times.              |
+| `Esc`                     | Cancel pending count/op; if none, exit visual; else exit vi. |
 
-`apply_vi_move` in `main.rs` does the cursor update + viewport scroll on
-edge. It's a free function rather than an `App` method so the destructure
-at the top of `window_event` (which holds `&mut self.gpu`) doesn't block
-the call — disjoint field borrows compose fine when the call site names
-the fields directly.
+Motion dispatch lives in `vi::apply_motion` (a free function, not a
+`ViMode` method, so the caller in `App::window_event` can pass disjoint
+borrows of `vi` and `term` while still holding `&mut self.gpu` from the
+destructure at the top of that function). Counts are taken from
+`ViMode::pending_count` and the motion is run that many times.
 
-The activation keybind is parsed by `vi::parse_vi_key` from a string like
-`"ctrl+shift+space"` or `"alt+v"`. Comparison against winit events
-requires *exact* modifier match — `Ctrl+Shift+Space` doesn't fire on
-`Ctrl+Shift+Alt+Space`. Bad env var values fall back to default with a
-warning.
+State machine:
 
-More motions (`w`/`b`/`e`, `0`/`^`/`$`, `gg`/`G`, page motions, count
-prefixes), search, and block-visual are later milestones.
+  - `pending_count: Option<u32>` — accumulates digit keys (`5j` parses
+    `5` here before applying `j`). Bare leading `0` is the LineStart
+    motion rather than a digit; once `pending_count` is non-None, `0`
+    becomes a digit too.
+  - `pending_op: Option<PendingOp>` — set after `g`, cleared by the
+    next key. Only `g` completes (to `DocStart`); anything else cancels.
+    Future two-key sequences extend this enum.
+
+Word semantics match vim: `word` = `[A-Za-z0-9_]+` runs, `WORD` = any
+non-whitespace run. The classifier (`classify` in `vi.rs`) folds
+characters into Word / Punct / Whitespace; in `WORD` mode, Punct
+collapses into Word. Word motions cross row boundaries — at the bottom
+or top of the visible viewport they stop without scrolling, matching
+"don't aggressively page through history just because the user typed
+`w`."
+
+The activation keybind is parsed by `vi::parse_vi_key` from a string
+like `"ctrl+shift+space"` or `"alt+v"`. Comparison against winit
+events requires *exact* modifier match — `Ctrl+Shift+Space` doesn't
+fire on `Ctrl+Shift+Alt+Space`. Bad env var values log a warning and
+fall back to the default.
+
+Search (`/`, `?`, `n`/`N`) and block-visual (`Ctrl-v`) are later
+milestones.
 
 ## Window resize
 
