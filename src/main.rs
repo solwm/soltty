@@ -785,22 +785,32 @@ impl ApplicationHandler<UserEvent> for App {
                             let raw = s.chars().next().unwrap_or('\0');
                             let ch = raw.to_ascii_lowercase();
 
-                            // Page motions are ctrl-modified letters. Take
-                            // them before the digit/letter split so 'd' /
-                            // 'u' etc. don't get swallowed.
+                            // Ctrl-modified letters: page motions and
+                            // block-visual. Pulled out before the
+                            // digit/letter split so 'd'/'u'/'v' etc.
+                            // don't get swallowed by the regular dispatch.
+                            let mut ctrl_handled = false;
                             let page_motion = if ctrl {
                                 match ch {
                                     'd' => Some(vi::Motion::HalfPageDown),
                                     'u' => Some(vi::Motion::HalfPageUp),
                                     'f' => Some(vi::Motion::FullPageDown),
                                     'b' => Some(vi::Motion::FullPageUp),
+                                    'v' => {
+                                        self.vi.start_visual_block();
+                                        ctrl_handled = true;
+                                        None
+                                    }
                                     _ => None,
                                 }
                             } else {
                                 None
                             };
 
-                            if let Some(m) = page_motion {
+                            if ctrl_handled {
+                                // Block-visual already activated; nothing
+                                // else to dispatch this keystroke.
+                            } else if let Some(m) = page_motion {
                                 motion = Some(m);
                             } else if ch.is_ascii_digit()
                                 && (ch != '0' || self.vi.pending_count.is_some())

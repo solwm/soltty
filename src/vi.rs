@@ -11,17 +11,18 @@
 
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-use crate::selection::Selection;
+use crate::selection::{Selection, SelectionMode};
 use crate::term::Term;
 
 /// What kind of visual selection the user is in. `None` means vi-mode
-/// normal (motion only); `Char` and `Line` correspond to vim's `v` and
-/// `V`. Block (`Ctrl-v`) is a future milestone.
+/// normal (motion only); `Char`, `Line`, `Block` correspond to vim's
+/// `v`, `V`, `Ctrl-v`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VisualMode {
     None,
     Char,
     Line,
+    Block,
 }
 
 /// Two-key sequences in vim wait for the second key — `gg` is the only
@@ -157,6 +158,11 @@ impl ViMode {
         self.visual_anchor = Some(self.cursor);
     }
 
+    pub fn start_visual_block(&mut self) {
+        self.visual = VisualMode::Block;
+        self.visual_anchor = Some(self.cursor);
+    }
+
     /// Build the Selection that corresponds to the current visual state,
     /// or `None` if there's nothing to show. `cols` is the grid width;
     /// line-wise mode uses it to extend selections to the right edge.
@@ -168,6 +174,7 @@ impl ViMode {
                 let mut sel = Selection::new(anchor);
                 sel.end = self.cursor;
                 sel.dragging = false;
+                sel.mode = SelectionMode::Char;
                 Some(sel)
             }
             VisualMode::Line => {
@@ -180,6 +187,17 @@ impl ViMode {
                 let mut sel = Selection::new((sr, 0));
                 sel.end = (er, cols.saturating_sub(1));
                 sel.dragging = false;
+                sel.mode = SelectionMode::Char;
+                Some(sel)
+            }
+            VisualMode::Block => {
+                // Block mode keeps anchor and cursor as the diagonal
+                // corners — `Selection::contains` and `extract_text`
+                // do per-axis min/max via `block_bounds`.
+                let mut sel = Selection::new(anchor);
+                sel.end = self.cursor;
+                sel.dragging = false;
+                sel.mode = SelectionMode::Block;
                 Some(sel)
             }
         }
@@ -479,12 +497,15 @@ enum KeyMatch {
 }
 
 impl ViKeyBind {
-    /// Default activation: `Ctrl+Shift+Space`.
+    /// Default activation: `Ctrl+N`. Note: this shadows readline's
+    /// "next history" binding at the shell prompt; users who want that
+    /// back can set `SOLTTY_VI_KEY` to e.g. `ctrl+shift+space` or
+    /// `alt+v`.
     pub fn default_activation() -> Self {
         Self {
-            key: KeyMatch::Named(NamedKey::Space),
+            key: KeyMatch::Char('n'),
             ctrl: true,
-            shift: true,
+            shift: false,
             alt: false,
         }
     }
@@ -501,9 +522,7 @@ impl ViKeyBind {
                     k
                 }
                 None => {
-                    log::warn!(
-                        "SOLTTY_VI_KEY={s:?} did not parse, using default ctrl+shift+space"
-                    );
+                    log::warn!("SOLTTY_VI_KEY={s:?} did not parse, using default ctrl+n");
                     Self::default_activation()
                 }
             },
@@ -705,15 +724,13 @@ mod tests {
     #[test]
     fn matches_exact_modifiers() {
         let k = ViKeyBind::default_activation();
-        let space = Key::Named(NamedKey::Space);
-        assert!(k.matches(&space, ModifiersState::CONTROL | ModifiersState::SHIFT));
-        // Extra alt → reject.
-        assert!(!k.matches(
-            &space,
-            ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT
-        ));
-        // Missing shift → reject.
-        assert!(!k.matches(&space, ModifiersState::CONTROL));
+        let n = Key::Character(SmolStr::new("n"));
+        // Plain Ctrl+N → match.
+        assert!(k.matches(&n, ModifiersState::CONTROL));
+        // Extra modifiers → reject.
+        assert!(!k.matches(&n, ModifiersState::CONTROL | ModifiersState::SHIFT));
+        // Missing ctrl → reject.
+        assert!(!k.matches(&n, ModifiersState::empty()));
     }
 
     #[test]

@@ -692,9 +692,12 @@ the shell prompt cursor-less until something sends `?25h` — typically
 ## Vi mode
 
 A modal cursor for grabbing text without the mouse. Press the activation
-key (default `Ctrl+Shift+Space`, override via `SOLTTY_VI_KEY`) to enter,
-`Esc` to exit. While active, the PTY sees nothing — keystrokes drive a
-separate vi cursor over the visible viewport (and into scrollback).
+key (default `Ctrl+N`, override via `SOLTTY_VI_KEY`) to enter, `Esc` to
+exit. While active, the PTY sees nothing — keystrokes drive a separate
+vi cursor over the visible viewport (and into scrollback). The default
+shadows readline's "next history" binding at the shell prompt; pick a
+different combo via `SOLTTY_VI_KEY="ctrl+shift+space"` or similar if
+that bothers you.
 
 Indicator: a faint green wash over the whole window so it's obvious
 when you're "in" vi mode. Drawn as a separate fullscreen-quad pass
@@ -726,6 +729,7 @@ Keys:
 | `W` `E` `B`               | Same but on WORDs (non-whitespace runs, punctuation glued).  |
 | `v`                       | Char-wise visual; further motions extend the selection.      |
 | `V`                       | Line-wise visual; selection covers full rows from anchor.    |
+| `Ctrl-v`                  | Block-wise visual; selection is a rectangle from anchor to cursor. |
 | `y`                       | Yank selection to clipboard + primary, exit vi-mode.         |
 | `<count>` (e.g. `5j`)     | Count prefix — repeats the next motion N times.              |
 | `/<query>` `?<query>`     | Forward / backward live search. Matches highlight as you type, cursor jumps live to the best one. |
@@ -793,7 +797,22 @@ restores the origin cursor + viewport (so live-preview feels
 reversible); `Esc` post-commit dismisses highlights but keeps you
 where you are.
 
-Block-visual (`Ctrl-v`) is the only milestone left.
+#### Block visual
+
+`Ctrl-v` enters block-rect selection. The selection is the axis-aligned
+rectangle whose opposite corners are the anchor (where Ctrl-v fired)
+and the current vi cursor — no row-major sloshing through the middle.
+
+`selection::Selection` gained a `mode: SelectionMode` field (default
+`Char`), with `Block` toggling rect semantics in `contains()` and
+`extract_text()`. Block extract preserves trailing whitespace inside
+the rect so column-aligned data round-trips through paste — `ls -la`
+size-column → clipboard → another terminal stays a clean column of
+numbers.
+
+Mouse selection always uses `Char`. Vi `v` / `V` use `Char` (line is
+char with full-row columns). Vi `Ctrl-v` is the only producer of
+`Block`.
 
 ## Window resize
 
