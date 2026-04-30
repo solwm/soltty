@@ -19,6 +19,10 @@ out vec2 v_glyph_size_px;
 out vec2 v_glyph_offset_px;
 out vec4 v_fg;
 out vec4 v_bg;
+// `flat` because integer varyings have no defined interpolation in GLSL.
+// All six vertices of a cell quad get the same value, which is what we want
+// for the cursor-cell match in the fragment shader.
+flat out ivec2 v_cell_xy;
 
 const vec2 CORNERS[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -41,4 +45,5 @@ void main() {
     v_glyph_offset_px  = vec2(a_glyph_offset);
     v_fg               = a_fg;
     v_bg               = a_bg;
+    v_cell_xy          = ivec2(a_cell_xy);
 }

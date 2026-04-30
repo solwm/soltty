@@ -78,6 +78,17 @@ impl Row {
     }
 }
 
+/// DECSCUSR (`CSI Ps SP q`) cursor shape. We collapse blink/steady — we
+/// don't animate. Apps like vim and zsh-vi-mode set this to communicate
+/// editor state (insert vs. normal mode).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Cursor {
     pub row: usize,
@@ -87,6 +98,7 @@ pub struct Cursor {
     /// Standard xterm "cursor stickiness" — printing at the right edge does NOT
     /// wrap until the next character actually arrives.
     pub wrap_next: bool,
+    pub shape: CursorShape,
 }
 
 #[derive(Copy, Clone, Debug, Default)]

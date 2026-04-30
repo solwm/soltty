@@ -1,6 +1,6 @@
 use vte::{Params, Parser, Perform};
 
-use crate::grid::{CellAttrs, Color, Grid, Row};
+use crate::grid::{CellAttrs, Color, CursorShape, Grid, Row};
 
 pub struct Term {
     primary: Grid,
@@ -128,6 +128,12 @@ impl Term {
     /// screen legitimately. If a program exits without restoring (`?25h`)
     /// the user's shell prompt will be cursor-less until the next keypress
     /// or `tput cnorm`; that's the same behavior as every other terminal.
+    /// Current cursor shape (per-grid; alt and primary are independent).
+    /// Set by DECSCUSR; defaults to Block.
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.grid().cursor.shape
+    }
+
     pub fn viewport_cursor(&self) -> Option<(usize, usize)> {
         let g = self.grid();
         if !g.cursor.visible {
@@ -195,6 +201,15 @@ impl<'a> Perform for Performer<'a> {
         _ignore: bool,
         action: char,
     ) {
+        // DECSCUSR (`CSI Ps SP q`): cursor shape. The space intermediate
+        // distinguishes it from any plain `CSI Ps q` (which we don't
+        // implement). Apps like vim and zsh-vi-mode emit this to signal
+        // editor mode (insert vs. normal/visual).
+        if intermediates == [b' '] && action == 'q' {
+            self.set_cursor_shape(arg(params, 0, 0));
+            return;
+        }
+
         // Private modes (CSI ? ... h/l) get their own intermediate byte.
         let private = intermediates.first().copied() == Some(b'?');
 
@@ -322,6 +337,19 @@ impl<'a> Performer<'a> {
             }
             _ => {}
         }
+    }
+
+    /// DECSCUSR `Ps` → cursor shape. We collapse blink and steady (we
+    /// don't animate). Unknown codes leave the shape untouched, which
+    /// matches what real terminals do.
+    fn set_cursor_shape(&mut self, ps: u16) {
+        let shape = match ps {
+            0 | 1 | 2 => CursorShape::Block,
+            3 | 4 => CursorShape::Underline,
+            5 | 6 => CursorShape::Bar,
+            _ => return,
+        };
+        self.grid().cursor.shape = shape;
     }
 
     fn set_private_modes(&mut self, params: &Params, on: bool) {
@@ -536,6 +564,37 @@ mod tests {
         // Anchored: top of viewport should still show 'a'
         assert_eq!(top_before, 'a');
         assert_eq!(t.viewport_row(0).cells[0].ch, 'a');
+    }
+
+    #[test]
+    fn decscusr_sets_cursor_shape() {
+        let mut t = Term::new(2, 4);
+        // Default is Block.
+        assert_eq!(t.cursor_shape(), CursorShape::Block);
+        // Steady bar.
+        t.feed(b"\x1b[6 q");
+        assert_eq!(t.cursor_shape(), CursorShape::Bar);
+        // Blinking underline collapses to plain Underline.
+        t.feed(b"\x1b[3 q");
+        assert_eq!(t.cursor_shape(), CursorShape::Underline);
+        // No-arg form == reset to default Block.
+        t.feed(b"\x1b[ q");
+        assert_eq!(t.cursor_shape(), CursorShape::Block);
+    }
+
+    #[test]
+    fn cursor_shape_is_per_grid() {
+        let mut t = Term::new(3, 4);
+        t.feed(b"\x1b[5 q"); // Bar on primary
+        assert_eq!(t.cursor_shape(), CursorShape::Bar);
+        t.feed(b"\x1b[?1049h"); // enter alt
+        // Alt starts fresh, default Block.
+        assert_eq!(t.cursor_shape(), CursorShape::Block);
+        t.feed(b"\x1b[3 q"); // Underline on alt
+        assert_eq!(t.cursor_shape(), CursorShape::Underline);
+        t.feed(b"\x1b[?1049l"); // back to primary
+        // Primary's shape preserved.
+        assert_eq!(t.cursor_shape(), CursorShape::Bar);
     }
 
     #[test]

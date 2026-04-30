@@ -623,39 +623,36 @@ The shader never knows about gamma; it just blends.
 
 ### The cursor
 
-Originally the cursor was "swap fg/bg at the cursor cell." That worked
-in the trivial case (default colors) but broke quietly when a cell had
-a custom background that happened to be similar to the page foreground.
+Cursor rendering is entirely on the GPU side. The fragment shader takes
+the cursor cell, shape, and two colors as uniforms, then overlays the
+chosen shape on top of whatever the cell would otherwise paint:
 
-The fix in `Renderer::prepare`:
+| Shape       | Code | What the shader does                                                |
+|-------------|------|---------------------------------------------------------------------|
+| Block       | 1    | Replace the cell's bg/fg with `cursor_bg`/`cursor_fg` so the glyph appears "punched out" of a solid block. |
+| Underline   | 2    | Leave the cell as-is, paint a band ~10% of cell height (min 2 px) at the bottom in `cursor_bg`. |
+| Bar         | 3    | Leave the cell as-is, paint a column ~15% of cell width (min 2 px) at the left in `cursor_bg`. |
+| None        | 0    | No overlay — used when the cursor is hidden, scrolled out of view, or unfocused. |
 
-```rust
-if cursor == Some((vrow, col_idx)) {
-    bg = self.cursor_bg;       // fixed near-white
-    fg = self.cursor_fg;       // fixed = page bg
-}
-```
+Apps select the shape with DECSCUSR (`CSI Ps SP q`); we collapse blink
+vs. steady because we don't animate. Mapping is in
+`term::Performer::set_cursor_shape`. Each grid (primary and alt) carries
+its own shape, so vim setting bar-on-insert in alt screen doesn't leak
+back to the shell on exit.
 
-The cursor cell now has constant colors regardless of what's underneath.
-The glyph (if any) is drawn in `cursor_fg`, which is the page background
-color, so it looks like it's "punched out" of the cursor block. Standard
-block-cursor look, predictable contrast.
+Why the shader and not CPU-side color overrides? Selection and SGR
+inversion compose into the cell's bg/fg in `Renderer::prepare`; the
+cursor needs to win over both. Doing the cursor in the fragment stage
+runs after that compositing without needing per-cell instance changes.
 
-There's also the policy choice that **`?25l` (DECTCEM hide) is ignored
-on the primary screen.** The reason is concrete: a buggy program (gol-c
-in our test corpus) hides the cursor and crashes without restoring it,
-and you'd be left with a permanently invisible cursor at the shell
-prompt. Vim/less/htop all use the *alt* screen, so they're unaffected —
-they still get to manage their own cursor visibility there.
+The `cursor_bg`/`cursor_fg` colors come from the active theme — the
+same pair the theme picker overlay uses for its highlight, which means
+they're guaranteed readable against any palette.
 
-This is `Term::viewport_cursor`:
-
-```rust
-let visible = if self.on_alt { g.cursor.visible } else { true };
-```
-
-It's an opinionated divergence from spec, but it's the kind of opinion
-soltty was built to hold.
+`?25l` (DECTCEM hide) is honored on both primary and alt screens. A
+program that hides the cursor and crashes without restoring it leaves
+the shell prompt cursor-less until something sends `?25h` — typically
+`tput cnorm` or a fresh shell. Same behavior as every other terminal.
 
 ## Window resize
 
@@ -717,9 +714,6 @@ Roughly in order of "you might miss it":
   attribute bits but the renderer ignores them — every glyph uses the
   regular face. Adding bold/italic means loading bold/italic TTF files
   and indexing the atlas by `(face, glyph_id)` instead of `glyph_id`.
-- **DECSCUSR cursor styles.** Programs send `CSI <n> SP q` to pick block
-  vs. underscore vs. bar (and steady vs. blinking). We always render a
-  steady block.
 - **Application cursor keys (DECCKM).** In some modes vim and tmux
   expect arrow keys to send `SS3 A/B/C/D` instead of `CSI A/B/C/D`. We
   always send `CSI`. Most things still work; specific edge cases in vim
@@ -781,10 +775,16 @@ A small triage cheat sheet:
   the surface is sRGB (`format=Bgra8UnormSrgb` in startup log). If we
   pick a non-sRGB format, our linear-light shader output would display
   raw, looking too dark.
-- **Cursor invisible.** First check `viewport_cursor` is returning
-  `Some` (it ignores `?25l` on primary, so this should rarely fail).
-  Then check the cursor cell really is being inverted in
-  `Renderer::prepare`.
+- **Cursor invisible.** Check `Term::viewport_cursor` first — it
+  returns `None` if `?25l` (DECTCEM hide) is in effect on either
+  screen, or if the cursor scrolled out of view. If a program hid the
+  cursor and crashed without restoring, send `tput cnorm`. Past that,
+  verify `Renderer::prepare` is setting `cursor_cell` to something
+  other than `(-1, -1)` and that `cursor_shape_id` is non-zero.
+- **Cursor draws as the wrong shape.** Apps drive shape via DECSCUSR
+  (`CSI Ps SP q`); zsh and vim re-set on every prompt / mode change.
+  Confirm `Term::cursor_shape()` reflects what the app sent, then
+  check the fragment shader's shape branches.
 - **Ctrl+C doesn't work.** Either modifiers aren't being tracked
   (verify `WindowEvent::ModifiersChanged` is being processed), or
   the channel is so backed up that `KeyboardInput` is queued behind a

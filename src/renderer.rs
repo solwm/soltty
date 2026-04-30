@@ -3,7 +3,7 @@ use std::time::Instant;
 use glow::HasContext;
 
 use crate::font::FontAtlas;
-use crate::grid::{CellAttrs, Color};
+use crate::grid::{CellAttrs, Color, CursorShape};
 use crate::picker::Picker;
 use crate::selection::Selection;
 use crate::term::Term;
@@ -81,6 +81,10 @@ pub struct Renderer {
     u_atlas_size: glow::UniformLocation,
     u_grid_offset: glow::UniformLocation,
     u_atlas: glow::UniformLocation,
+    u_cursor_cell: glow::UniformLocation,
+    u_cursor_shape: glow::UniformLocation,
+    u_cursor_color: glow::UniformLocation,
+    u_cursor_text: glow::UniformLocation,
 
     palette: [[f32; 4]; 256],
     default_fg: [f32; 4],
@@ -91,6 +95,13 @@ pub struct Renderer {
     screen_size: (u32, u32),
     cell_size: (u32, u32),
     atlas_size: (u32, u32),
+
+    /// Cursor cell as (col, row) in viewport coords; (-1, -1) when the
+    /// cursor isn't visible. Set in `prepare`, uploaded in `draw`.
+    cursor_cell: (i32, i32),
+    /// Encoded shape: 0 = none, 1 = block, 2 = underline, 3 = bar.
+    /// Mirrors the constants the fragment shader branches on.
+    cursor_shape_id: i32,
 
     fps: FpsCounter,
 }
@@ -108,8 +119,20 @@ impl Renderer {
         let cursor_bg = srgb_to_linear_rgba_3(theme.cursor_bg);
         let cursor_fg = srgb_to_linear_rgba_3(theme.cursor_fg);
 
-        let (program, u_screen_size, u_cell_size, u_atlas_size, u_grid_offset, u_atlas) =
-            unsafe { build_program(gl) };
+        let program = unsafe { build_program(gl) };
+        let u = |name: &str| unsafe {
+            gl.get_uniform_location(program, name)
+                .unwrap_or_else(|| panic!("uniform {name} not found"))
+        };
+        let u_screen_size = u("u_screen_size");
+        let u_cell_size = u("u_cell_size");
+        let u_atlas_size = u("u_atlas_size");
+        let u_grid_offset = u("u_grid_offset");
+        let u_atlas = u("u_atlas");
+        let u_cursor_cell = u("u_cursor_cell");
+        let u_cursor_shape = u("u_cursor_shape");
+        let u_cursor_color = u("u_cursor_color");
+        let u_cursor_text = u("u_cursor_text");
 
         let (vao, vbo) = unsafe { build_vao_vbo(gl, INITIAL_INSTANCE_CAPACITY) };
 
@@ -131,6 +154,10 @@ impl Renderer {
             u_atlas_size,
             u_grid_offset,
             u_atlas,
+            u_cursor_cell,
+            u_cursor_shape,
+            u_cursor_color,
+            u_cursor_text,
             palette,
             default_fg,
             default_bg,
@@ -139,6 +166,8 @@ impl Renderer {
             screen_size,
             cell_size: (atlas.metrics.cell_w, atlas.metrics.cell_h),
             atlas_size: (atlas.atlas_w, atlas.atlas_h),
+            cursor_cell: (-1, -1),
+            cursor_shape_id: 0,
             fps: FpsCounter::new(),
         };
         unsafe { renderer.upload_uniforms(gl) };
@@ -207,7 +236,30 @@ impl Renderer {
     ) {
         let rows = term.grid().rows;
         let cols = term.grid().cols;
-        let cursor = term.viewport_cursor();
+
+        // Cursor info goes to the shader via uniforms; the fragment stage
+        // overlays the chosen shape on top of the cursor cell. Keeping it
+        // out of the per-cell instance pack means selection and SGR-inverse
+        // compose normally and the cursor wins because the shader runs last.
+        //
+        // Suppressed when the picker is open: the shader matches by cell_xy,
+        // so without this the overlay would bleed through the picker modal
+        // for any picker cell that happens to align with the cursor.
+        let cursor = term.viewport_cursor().filter(|_| picker.is_none());
+        match cursor {
+            Some((row, col)) => {
+                self.cursor_cell = (col as i32, row as i32);
+                self.cursor_shape_id = match term.cursor_shape() {
+                    CursorShape::Block => 1,
+                    CursorShape::Underline => 2,
+                    CursorShape::Bar => 3,
+                };
+            }
+            None => {
+                self.cursor_cell = (-1, -1);
+                self.cursor_shape_id = 0;
+            }
+        }
 
         // Single pass: ensure each cell's glyph in the atlas, then pack the
         // instance immediately. Same shape as the wgpu version was.
@@ -224,16 +276,10 @@ impl Renderer {
                     std::mem::swap(&mut fg, &mut bg);
                 }
                 // Selection: classic xterm-style inverse highlighting.
-                // Composes after SGR-inverse but before the cursor, so a
-                // selected cell under the cursor still shows as the cursor.
                 if let Some(sel) = selection {
                     if sel.contains(vrow, col_idx) {
                         std::mem::swap(&mut fg, &mut bg);
                     }
-                }
-                if cursor == Some((vrow, col_idx)) {
-                    bg = self.cursor_bg;
-                    fg = self.cursor_fg;
                 }
                 let glyph = atlas.get(cell.ch).unwrap_or_default();
                 self.instances_scratch.push(CellInstance {
@@ -319,6 +365,30 @@ impl Renderer {
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas_tex));
             gl.uniform_1_i32(Some(&self.u_atlas), 0);
+            // Cursor state changes per frame (movement, blink-ish toggles
+            // when programs hide/show via DECTCEM, viewport scrolling).
+            // Uploaded here rather than in `upload_uniforms` because that
+            // path only runs on resize/font reload.
+            gl.uniform_2_i32(
+                Some(&self.u_cursor_cell),
+                self.cursor_cell.0,
+                self.cursor_cell.1,
+            );
+            gl.uniform_1_i32(Some(&self.u_cursor_shape), self.cursor_shape_id);
+            gl.uniform_4_f32(
+                Some(&self.u_cursor_color),
+                self.cursor_bg[0],
+                self.cursor_bg[1],
+                self.cursor_bg[2],
+                self.cursor_bg[3],
+            );
+            gl.uniform_4_f32(
+                Some(&self.u_cursor_text),
+                self.cursor_fg[0],
+                self.cursor_fg[1],
+                self.cursor_fg[2],
+                self.cursor_fg[3],
+            );
             gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, self.instance_count);
         }
     }
@@ -478,16 +548,7 @@ impl Renderer {
 
 const INITIAL_INSTANCE_CAPACITY: usize = 4096;
 
-unsafe fn build_program(
-    gl: &glow::Context,
-) -> (
-    glow::Program,
-    glow::UniformLocation,
-    glow::UniformLocation,
-    glow::UniformLocation,
-    glow::UniformLocation,
-    glow::UniformLocation,
-) {
+unsafe fn build_program(gl: &glow::Context) -> glow::Program {
     let vs_src = include_str!("shader.vert");
     let fs_src = include_str!("shader.frag");
 
@@ -505,19 +566,7 @@ unsafe fn build_program(
     gl.detach_shader(program, fs);
     gl.delete_shader(vs);
     gl.delete_shader(fs);
-
-    let u = |name: &str| {
-        gl.get_uniform_location(program, name)
-            .unwrap_or_else(|| panic!("uniform {name} not found"))
-    };
-    (
-        program,
-        u("u_screen_size"),
-        u("u_cell_size"),
-        u("u_atlas_size"),
-        u("u_grid_offset"),
-        u("u_atlas"),
-    )
+    program
 }
 
 unsafe fn compile_shader(gl: &glow::Context, kind: u32, src: &str) -> glow::Shader {
