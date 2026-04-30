@@ -20,6 +20,7 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::gpu::{Gpu, DEFAULT_FONT_SIZE_PX};
+use crate::grid::CursorShape;
 use crate::pty::Pty;
 use crate::term::Term;
 
@@ -101,6 +102,7 @@ fn main() {
         last_render: None,
         // Real value is set in `resumed` once we have a window to ask.
         frame_interval: Duration::from_millis(8),
+        blink_epoch: Instant::now(),
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -189,6 +191,10 @@ struct App {
     /// `resumed`; the `Default::default()` here only covers the
     /// vanishingly small window before that.
     frame_interval: Duration,
+    /// Reference time for the cursor blink phase. Reset whenever the user
+    /// types so the cursor flashes on right after activity instead of
+    /// continuing whatever stale phase it was in.
+    blink_epoch: Instant,
 }
 
 /// Even with the per-display cap, we always paint immediately if we've
@@ -203,6 +209,13 @@ const MAX_FRAME_HZ: u32 = 240;
 /// empty. 120 is a safer default than 60 — modern panels are mostly
 /// faster than that and the cost of capping high is negligible.
 const DEFAULT_FRAME_HZ: u32 = 120;
+
+/// Half a blink period — cursor is on for this long, then off for the same.
+/// 500 ms gives a 1 Hz cycle, the xterm/Alacritty default. Block-shape
+/// cursors don't blink at all (see `App::cursor_blinks`); only Bar and
+/// Underline do, which corresponds to insert/replace mode in vim and the
+/// active prompt cursor in zsh-vi-mode.
+const BLINK_HALF_PERIOD: Duration = Duration::from_millis(500);
 
 /// Pick the redraw cap. `SOLTTY_FRAME_HZ` env var wins, then the
 /// current monitor's refresh rate from winit, then a 120 Hz default.
@@ -277,10 +290,30 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+
+        // If the cursor is in a blinking shape and the phase boundary has
+        // passed since our last paint, mark dirty so the throttle path
+        // below repaints to flip the cursor on/off.
+        if self.cursor_blinks() && !self.redraw_pending {
+            if let Some(last) = self.last_render {
+                if self.cursor_visible_now(last) != self.cursor_visible_now(now) {
+                    self.dirty = true;
+                }
+            }
+        }
+
         // If there's pending data we deferred during the throttle window,
         // either request a redraw now (deadline elapsed) or arm a timer
         // wakeup so we paint exactly when the next slot opens.
         if !self.dirty || self.redraw_pending {
+            // Nothing to paint right now, but if the cursor is blinking
+            // we still need to wake at the next phase boundary so the
+            // toggle isn't delayed indefinitely waiting for input.
+            if !self.redraw_pending && self.cursor_blinks() {
+                event_loop
+                    .set_control_flow(ControlFlow::WaitUntil(self.next_blink_toggle(now)));
+            }
             return;
         }
         match self.last_render {
@@ -288,7 +321,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.do_request_redraw();
             }
             Some(t) => {
-                let elapsed = Instant::now().duration_since(t);
+                let elapsed = now.duration_since(t);
                 if elapsed >= self.frame_interval || elapsed >= IDLE_THRESHOLD {
                     self.do_request_redraw();
                 } else {
@@ -368,15 +401,31 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                // Inline `cursor_visible_now` here — calling a `&self`
+                // method while the destructuring at the top of this fn
+                // holds `&mut self.gpu` trips the borrow checker, even
+                // though the fields we touch are disjoint from gpu. Going
+                // through field access directly lets disjoint-borrow do
+                // its job.
+                let cursor_visible = match self.term.cursor_shape() {
+                    CursorShape::Block => true,
+                    CursorShape::Bar | CursorShape::Underline => {
+                        let elapsed = now.duration_since(self.blink_epoch);
+                        let half_ms = BLINK_HALF_PERIOD.as_millis();
+                        (elapsed.as_millis() / half_ms) % 2 == 0
+                    }
+                };
                 gpu.render(
                     &self.term,
                     self.picker.as_mut(),
                     self.selection.as_ref(),
                     self.trace,
+                    cursor_visible,
                 );
                 self.redraw_pending = false;
                 self.dirty = false;
-                self.last_render = Some(Instant::now());
+                self.last_render = Some(now);
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -644,6 +693,11 @@ impl ApplicationHandler<UserEvent> for App {
                         self.term.reset_view();
                         // Typing also clears the selection.
                         self.selection = None;
+                        // Reset the blink phase so the cursor is solidly on
+                        // for the next half-period after the user typed
+                        // something. Without this, fast typing through an
+                        // off-phase looks like the cursor is missing.
+                        self.blink_epoch = Instant::now();
                         pty.write(&bytes);
                         window.request_redraw();
                     }
@@ -685,6 +739,40 @@ impl App {
             window.request_redraw();
             self.redraw_pending = true;
         }
+    }
+
+    /// True when the active grid's cursor shape is one we blink. Block
+    /// stays steady (matches alacritty's default and avoids flicker
+    /// while reading in normal/visual mode); Bar and Underline blink at
+    /// `BLINK_HALF_PERIOD * 2`.
+    fn cursor_blinks(&self) -> bool {
+        match self.term.cursor_shape() {
+            CursorShape::Block => false,
+            CursorShape::Bar | CursorShape::Underline => true,
+        }
+    }
+
+    /// Whether the cursor should be drawn this frame given the current
+    /// blink phase. Always true for non-blinking shapes.
+    fn cursor_visible_now(&self, now: Instant) -> bool {
+        if !self.cursor_blinks() {
+            return true;
+        }
+        let elapsed = now.duration_since(self.blink_epoch);
+        let half_ms = BLINK_HALF_PERIOD.as_millis();
+        // On for the first half, off for the second half, repeating.
+        (elapsed.as_millis() / half_ms) % 2 == 0
+    }
+
+    /// Wall-clock time of the next blink phase change after `now`. Used
+    /// to schedule a `WaitUntil` so the event loop wakes in time to flip
+    /// the cursor.
+    fn next_blink_toggle(&self, now: Instant) -> Instant {
+        let elapsed = now.duration_since(self.blink_epoch);
+        let half_ms = BLINK_HALF_PERIOD.as_millis() as u64;
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let next_boundary_ms = (elapsed_ms / half_ms + 1) * half_ms;
+        self.blink_epoch + Duration::from_millis(next_boundary_ms)
     }
 }
 

@@ -233,6 +233,7 @@ impl Renderer {
         picker: Option<&mut Picker>,
         selection: Option<&Selection>,
         trace: bool,
+        cursor_visible_now: bool,
     ) {
         let rows = term.grid().rows;
         let cols = term.grid().cols;
@@ -242,10 +243,16 @@ impl Renderer {
         // out of the per-cell instance pack means selection and SGR-inverse
         // compose normally and the cursor wins because the shader runs last.
         //
-        // Suppressed when the picker is open: the shader matches by cell_xy,
-        // so without this the overlay would bleed through the picker modal
-        // for any picker cell that happens to align with the cursor.
-        let cursor = term.viewport_cursor().filter(|_| picker.is_none());
+        // Suppressed when:
+        //   - the picker is open (overlay would bleed through the modal,
+        //     since the shader matches by cell_xy regardless of which
+        //     instance is being drawn at that position);
+        //   - blink is in its off phase (App passes cursor_visible_now=false
+        //     for that frame).
+        let cursor = term
+            .viewport_cursor()
+            .filter(|_| picker.is_none())
+            .filter(|_| cursor_visible_now);
         match cursor {
             Some((row, col)) => {
                 self.cursor_cell = (col as i32, row as i32);

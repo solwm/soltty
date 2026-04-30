@@ -296,11 +296,17 @@ unchanged rows.
 This would matter most for big grids with sparse updates. The bench
 suite doesn't really exercise that pattern; vim/editing would.
 
-### Cursor blink (any rate-limited UI animation)
+### Cursor blink (and other rate-limited UI animation)
 
-We don't blink anything. If we did, the throttle gives us a free
-~60 Hz ticker. `dirty=true` from a timer + `request_redraw` is the
-shape.
+The cursor blinks at 1 Hz when the shape is Bar or Underline (insert /
+replace mode). `App::about_to_wait` arms a `ControlFlow::WaitUntil` for
+the next phase boundary, the event loop wakes, dirty gets set, and the
+existing throttle path repaints. Two paints per second when nothing else
+is happening — well below any noise floor.
+
+Same idea would apply to any future rate-limited animation: don't run
+your own timer thread, just compute the next deadline and feed it to
+the existing dirty/throttle pipeline.
 
 ### vte parser
 

@@ -641,11 +641,38 @@ chosen shape on top of whatever the cell would otherwise paint:
 | Bar         | 3    | Leave the cell as-is, paint a column ~15% of cell width (min 2 px) at the left in `cursor_bg`. |
 | None        | 0    | No overlay — used when the cursor is hidden, scrolled out of view, or unfocused. |
 
-Apps select the shape with DECSCUSR (`CSI Ps SP q`); we collapse blink
-vs. steady because we don't animate. Mapping is in
-`term::Performer::set_cursor_shape`. Each grid (primary and alt) carries
-its own shape, so vim setting bar-on-insert in alt screen doesn't leak
-back to the shell on exit.
+Apps select the shape with DECSCUSR (`CSI Ps SP q`). We don't honor
+the spec's blink-vs-steady distinction byte-for-byte: the codes
+`1/3/5` (blinking) and `2/4/6` (steady) collapse to shape only.
+Mapping is in `term::Performer::set_cursor_shape`. Each grid (primary
+and alt) carries its own shape, so vim setting bar-on-insert in alt
+screen doesn't leak back to the shell on exit.
+
+#### Blinking
+
+Whether the cursor blinks is decided by *shape*, not by the DECSCUSR
+blink bit:
+
+| Shape     | Behavior                                |
+|-----------|-----------------------------------------|
+| Block     | Steady — never blinks.                  |
+| Bar       | Blinks at 1 Hz (500 ms on, 500 ms off). |
+| Underline | Blinks at 1 Hz.                         |
+
+The reasoning is UX: Block almost always means a "reading" cursor
+(vim normal/visual, zsh-vi-mode normal) where flicker is just
+distraction. Bar and Underline mean an "editing" cursor (insert/replace)
+where the blink helps you find where you are. This deviates from the
+DECSCUSR spec — apps that want a blinking block don't get one — but
+the alternative (let apps wreck your reading flow) is worse.
+
+`App::cursor_visible_now` computes the on/off phase from
+`(now - blink_epoch) / 500ms`. The renderer takes a `cursor_visible_now`
+flag and suppresses the cursor uniform when it's false (same path the
+picker uses). `App::about_to_wait` schedules a `WaitUntil` for the
+next phase boundary so the event loop doesn't sleep through the
+toggle. Typing resets `blink_epoch` so the cursor always lights up
+solid right after a keystroke instead of catching mid-off-phase.
 
 Why the shader and not CPU-side color overrides? Selection and SGR
 inversion compose into the cell's bg/fg in `Renderer::prepare`; the

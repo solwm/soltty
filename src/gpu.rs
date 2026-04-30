@@ -213,9 +213,17 @@ impl Gpu {
         picker: Option<&mut Picker>,
         selection: Option<&Selection>,
         trace: bool,
+        cursor_visible_now: bool,
     ) {
-        self.renderer
-            .prepare(&self.gl, term, &mut self.atlas, picker, selection, trace);
+        self.renderer.prepare(
+            &self.gl,
+            term,
+            &mut self.atlas,
+            picker,
+            selection,
+            trace,
+            cursor_visible_now,
+        );
         self.renderer.draw(&self.gl);
         if let Err(e) = self.surface.swap_buffers(&self.context) {
             log::warn!("swap_buffers: {e}");
