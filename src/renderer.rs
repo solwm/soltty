@@ -50,6 +50,27 @@ impl FpsCounter {
     }
 }
 
+/// One match in viewport coords. Built by App from `vi::Search` state
+/// before each frame and passed to `Renderer::prepare` so the cell loop
+/// can highlight the cells inside the range. Both columns are inclusive.
+pub struct MatchView {
+    pub vrow: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+}
+
+/// Search-bar + match-highlight bundle. App constructs this from the
+/// vi-mode state; renderer doesn't need to know `vi::Search` exists.
+pub struct SearchOverlay<'a> {
+    pub prompt: char, // '/' for forward, '?' for backward
+    pub query: &'a str,
+    pub typing: bool,
+    pub matches: Vec<MatchView>,
+    /// Index into `matches` of the current selection (highlighted more
+    /// prominently). `None` if nothing matched.
+    pub current: Option<usize>,
+}
+
 /// One instance per cell. Layout has to match the vertex shader's attribute
 /// declarations (locations 0..=5) and the `vertex_attrib_pointer_*` calls in
 /// `Renderer::new`.
@@ -254,6 +275,7 @@ impl Renderer {
         trace: bool,
         cursor_visible_now: bool,
         vi_cursor: Option<(usize, usize)>,
+        search: Option<&SearchOverlay<'_>>,
     ) {
         let rows = term.grid().rows;
         let cols = term.grid().cols;
@@ -316,6 +338,29 @@ impl Renderer {
                         std::mem::swap(&mut fg, &mut bg);
                     }
                 }
+                // Search match highlight wins over both — it's a hard
+                // override, not a tint, because we want the user to spot
+                // matches at a glance even on a busy background.
+                if let Some(ov) = search {
+                    let mut hit: Option<bool> = None; // Some(is_current)
+                    for (i, m) in ov.matches.iter().enumerate() {
+                        if m.vrow == vrow && col_idx >= m.col_start && col_idx <= m.col_end
+                        {
+                            hit = Some(Some(i) == ov.current);
+                            break;
+                        }
+                    }
+                    match hit {
+                        Some(true) => {
+                            bg = MATCH_BG_CURRENT;
+                            fg = MATCH_FG_CURRENT;
+                        }
+                        Some(false) => {
+                            bg = MATCH_BG_OTHER;
+                        }
+                        None => {}
+                    }
+                }
                 let glyph = atlas.get(cell.ch).unwrap_or_default();
                 self.instances_scratch.push(CellInstance {
                     cell_xy: [col_idx as u32, vrow as u32],
@@ -326,6 +371,13 @@ impl Renderer {
                     bg,
                 });
             }
+        }
+
+        // Search bar at the bottom row. After the cell loop so it
+        // overwrites whatever's there. Before picker so an open picker
+        // (which is centered) can still draw on top.
+        if let Some(ov) = search {
+            self.append_search_bar(ov, rows, cols, atlas);
         }
 
         // Picker overlay. Drawn AFTER grid instances, which works because
@@ -448,6 +500,46 @@ impl Renderer {
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
             gl.draw_arrays(glow::TRIANGLES, 0, 6);
             gl.disable(glow::BLEND);
+        }
+    }
+
+    /// Render the search bar over the bottom row: a `/` or `?` prompt
+    /// followed by the live query. Uses theme cursor colors so it reads
+    /// against any palette without us picking literal RGB.
+    fn append_search_bar(
+        &mut self,
+        overlay: &SearchOverlay<'_>,
+        rows: usize,
+        cols: usize,
+        atlas: &mut FontAtlas,
+    ) {
+        if rows == 0 {
+            return;
+        }
+        let bar_row = rows - 1;
+        let bar_bg = self.cursor_bg;
+        let bar_fg = self.cursor_fg;
+        // Fill the row so old grid content underneath is hidden.
+        for col in 0..cols {
+            self.push_overlay_cell(' ', bar_row, col, bar_fg, bar_bg, atlas);
+        }
+        let mut col = 0usize;
+        if col < cols {
+            self.push_overlay_cell(overlay.prompt, bar_row, col, bar_fg, bar_bg, atlas);
+            col += 1;
+        }
+        for ch in overlay.query.chars() {
+            if col >= cols {
+                break;
+            }
+            self.push_overlay_cell(ch, bar_row, col, bar_fg, bar_bg, atlas);
+            col += 1;
+        }
+        // Caret: a small under-bar at the typing position so the user
+        // sees where their input lands. Skipped post-commit (typing=false)
+        // since the bar then just shows the committed query.
+        if overlay.typing && col < cols {
+            self.push_overlay_cell('_', bar_row, col, bar_fg, bar_bg, atlas);
         }
     }
 
@@ -605,6 +697,17 @@ impl Renderer {
 }
 
 const INITIAL_INSTANCE_CAPACITY: usize = 4096;
+
+/// Search-match highlight colors, pre-converted from sRGB to linear-light
+/// for the sRGB framebuffer. Yellow/amber palette so matches read at a
+/// glance against any theme background.
+///
+///   Other:  rgb(128, 104, 0)  — dim amber, bg only (keeps original fg)
+///   Current bg: rgb(255, 215, 0)  — bright gold, paired with black fg
+///                                   so the cell pops where the user is.
+const MATCH_BG_OTHER: [f32; 4] = [0.216, 0.139, 0.0, 1.0];
+const MATCH_BG_CURRENT: [f32; 4] = [1.0, 0.679, 0.0, 1.0];
+const MATCH_FG_CURRENT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 unsafe fn build_program(gl: &glow::Context) -> glow::Program {
     link_program(

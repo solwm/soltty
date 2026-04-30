@@ -728,7 +728,10 @@ Keys:
 | `V`                       | Line-wise visual; selection covers full rows from anchor.    |
 | `y`                       | Yank selection to clipboard + primary, exit vi-mode.         |
 | `<count>` (e.g. `5j`)     | Count prefix — repeats the next motion N times.              |
-| `Esc`                     | Cancel pending count/op; if none, exit visual; else exit vi. |
+| `/<query>` `?<query>`     | Forward / backward live search. Matches highlight as you type, cursor jumps live to the best one. |
+| `Enter` (in search)       | Commit search; matches stay highlighted, `n`/`N` navigates.  |
+| `n` `N`                   | Next / previous match relative to original search direction. |
+| `Esc`                     | Cancel search → cancel pending count/op → exit visual → exit vi (cascade). |
 
 Motion dispatch lives in `vi::apply_motion` (a free function, not a
 `ViMode` method, so the caller in `App::window_event` can pass disjoint
@@ -760,8 +763,37 @@ events requires *exact* modifier match — `Ctrl+Shift+Space` doesn't
 fire on `Ctrl+Shift+Alt+Space`. Bad env var values log a warning and
 fall back to the default.
 
-Search (`/`, `?`, `n`/`N`) and block-visual (`Ctrl-v`) are later
-milestones.
+#### Search
+
+`/query` and `?query` open a live-search modal at the bottom of the
+viewport. State lives in `vi::Search`: query buffer, direction, the
+match list (`Vec<Match>` in absolute scrollback ++ live coords), the
+"current" match index, and the origin cursor + viewport_offset for
+Esc-cancel restore.
+
+`vi::find_matches` is a dumb O(N) substring scan — collect each row
+into a `String`, walk it with `str::find`. Cells are 1 char each so
+column index == char index. Non-overlapping matches: a hit at col `c`
+advances the search cursor by `query.len()` so `aaaa`/`aa` returns
+two hits, not three.
+
+The renderer takes a `SearchOverlay` from App each frame and:
+
+  - Highlights any cell inside a match. Current match gets a bright
+    gold bg with black fg; others get a dim amber bg, fg unchanged.
+    Match override happens *after* SGR-inverse and selection-inverse
+    in the cell loop, so it always wins — the user can spot matches
+    even on a busy background.
+  - Renders a search bar at the bottom row showing `/query` or
+    `?query` plus a `_` caret while typing.
+
+`n`/`N` navigate matches in the original search direction (vim
+semantics — `N` reverses, never just "next"). `Esc` while typing
+restores the origin cursor + viewport (so live-preview feels
+reversible); `Esc` post-commit dismisses highlights but keeps you
+where you are.
+
+Block-visual (`Ctrl-v`) is the only milestone left.
 
 ## Window resize
 

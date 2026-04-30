@@ -31,6 +31,37 @@ pub enum PendingOp {
     Goto, // saw 'g', waiting for the second 'g' to mean DocStart
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SearchDirection {
+    Forward,  // /query
+    Backward, // ?query
+}
+
+/// One substring hit, in absolute (scrollback ++ live) row coords. The
+/// columns are inclusive — `col_end` is the cell of the last char of
+/// the match, not one past it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Match {
+    pub row: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+}
+
+/// Live-search state. Set when the user presses `/` or `?`; cleared on
+/// Esc-cancel or vi-mode exit. While `typing` is true, every keystroke
+/// either edits the query or commits/cancels — vi motions are inert.
+pub struct Search {
+    pub direction: SearchDirection,
+    pub query: String,
+    pub typing: bool,
+    pub matches: Vec<Match>,
+    pub current: Option<usize>,
+    /// Where the vi cursor was when search opened. Esc-cancel restores
+    /// this so the user lands back at their starting point.
+    pub origin_cursor: (usize, usize),
+    pub origin_viewport_offset: usize,
+}
+
 pub struct ViMode {
     pub active: bool,
     /// Vi cursor position, in viewport coords (row, col). Independent of
@@ -50,6 +81,10 @@ pub struct ViMode {
     /// the next key to complete `gg`). Cleared once the sequence
     /// completes or is cancelled by Esc / a non-matching follow-up.
     pub pending_op: Option<PendingOp>,
+    /// Active search (live-as-typed and post-commit). `None` when no
+    /// search is running. The `typing` flag inside distinguishes "user
+    /// is editing query" from "matches are highlighted, n/N navigates".
+    pub search: Option<Search>,
 }
 
 impl ViMode {
@@ -61,6 +96,7 @@ impl ViMode {
             visual_anchor: None,
             pending_count: None,
             pending_op: None,
+            search: None,
         }
     }
 
@@ -74,6 +110,7 @@ impl ViMode {
         self.visual_anchor = None;
         self.pending_count = None;
         self.pending_op = None;
+        self.search = None;
     }
 
     pub fn exit(&mut self) {
@@ -82,6 +119,7 @@ impl ViMode {
         self.visual_anchor = None;
         self.pending_count = None;
         self.pending_op = None;
+        self.search = None;
     }
 
     pub fn exit_visual(&mut self) {
@@ -532,6 +570,106 @@ fn parse_vi_key(s: &str) -> Option<ViKeyBind> {
     })
 }
 
+/// Substring scan over the entire scrollback + live grid. Returns hits
+/// in absolute (scrollback ++ live) row coords. Empty query → empty
+/// list. Cells are 1 char each so column index == char index.
+///
+/// Non-overlapping: after a hit at (row, c), the next search on that
+/// row resumes at `c + query.len()`. "aaaa" / "aa" → 2 matches at 0
+/// and 2, not 3 with overlap. Matches what most users expect.
+pub fn find_matches(term: &Term, query: &str) -> Vec<Match> {
+    let mut out = Vec::new();
+    if query.is_empty() {
+        return out;
+    }
+    let g = term.grid();
+    let sb_len = g.scrollback.len();
+    let total = sb_len + g.lines.len();
+    let qlen = query.chars().count();
+    for abs_row in 0..total {
+        let row = if abs_row < sb_len {
+            &g.scrollback[abs_row]
+        } else {
+            &g.lines[abs_row - sb_len]
+        };
+        let line: String = row.cells.iter().map(|c| c.ch).collect();
+        let mut byte_from = 0usize;
+        while let Some(rel) = line[byte_from..].find(query) {
+            let abs_byte = byte_from + rel;
+            let start_char = line[..abs_byte].chars().count();
+            out.push(Match {
+                row: abs_row,
+                col_start: start_char,
+                col_end: start_char + qlen - 1,
+            });
+            byte_from = abs_byte + query.len();
+            if byte_from >= line.len() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Choose the "current" match index given the search-origin position
+/// and direction. Wraps around at ends — vim does this and users expect
+/// it so a single-match-far-away search is still findable.
+pub fn pick_current_match(
+    matches: &[Match],
+    from_row: usize,
+    from_col: usize,
+    direction: SearchDirection,
+) -> Option<usize> {
+    if matches.is_empty() {
+        return None;
+    }
+    match direction {
+        SearchDirection::Forward => matches
+            .iter()
+            .position(|m| {
+                m.row > from_row || (m.row == from_row && m.col_start >= from_col)
+            })
+            .or(Some(0)),
+        SearchDirection::Backward => matches
+            .iter()
+            .rposition(|m| {
+                m.row < from_row || (m.row == from_row && m.col_start <= from_col)
+            })
+            .or(Some(matches.len() - 1)),
+    }
+}
+
+/// Convert a viewport-relative row to absolute (scrollback ++ live)
+/// coords given a specific viewport_offset. Used when we need to
+/// remember an origin even after the viewport scrolls.
+pub fn viewport_to_absolute(term: &Term, vrow: usize, viewport_offset: usize) -> usize {
+    let sb_len = term.grid().scrollback.len();
+    let top = sb_len.saturating_sub(viewport_offset);
+    top + vrow
+}
+
+/// Scroll the viewport (if needed) so that `match_row` (absolute) is
+/// visible. Returns the viewport row the match ended up on. We center
+/// when the match was off-screen; if it's already in view, we leave
+/// the viewport alone.
+pub fn jump_viewport_to(term: &mut Term, match_row: usize, view_rows: usize) -> usize {
+    let sb_len = term.grid().scrollback.len();
+    let cur_top = sb_len.saturating_sub(term.viewport_offset);
+    let in_view = match_row >= cur_top && match_row < cur_top + view_rows;
+    if !in_view {
+        let target_top = match_row.saturating_sub(view_rows / 2);
+        let new_offset = sb_len.saturating_sub(target_top);
+        let delta = new_offset as isize - term.viewport_offset as isize;
+        term.scroll_view(delta);
+    }
+    let new_top = term
+        .grid()
+        .scrollback
+        .len()
+        .saturating_sub(term.viewport_offset);
+    match_row.saturating_sub(new_top)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +792,76 @@ mod tests {
         v.cancel_pending();
         assert!(v.pending_count.is_none());
         assert!(v.pending_op.is_none());
+    }
+
+    #[test]
+    fn find_matches_basic() {
+        let mut t = Term::new(4, 20);
+        t.feed(b"hello world\r\nfoo bar baz\r\nhello again");
+        let m = find_matches(&t, "hello");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].row, 0);
+        assert_eq!(m[0].col_start, 0);
+        assert_eq!(m[0].col_end, 4);
+        assert_eq!(m[1].row, 2);
+        assert_eq!(m[1].col_start, 0);
+        assert_eq!(m[1].col_end, 4);
+    }
+
+    #[test]
+    fn find_matches_multiple_per_line() {
+        let mut t = Term::new(2, 30);
+        t.feed(b"foofoo bar foo baz");
+        // "foo" appears at cols 0, 3, 11. We don't allow overlap, so the
+        // run "foofoo" yields hits at 0 and 3, not 0/1/2/3 as overlapping
+        // would. A hit at 0 advances 3 chars, so the next viable position
+        // is col 3.
+        let m = find_matches(&t, "foo");
+        let cols: Vec<usize> = m.iter().map(|x| x.col_start).collect();
+        assert_eq!(cols, vec![0, 3, 11]);
+    }
+
+    #[test]
+    fn find_matches_empty_query_is_empty() {
+        let mut t = Term::new(2, 10);
+        t.feed(b"hello");
+        assert!(find_matches(&t, "").is_empty());
+    }
+
+    #[test]
+    fn pick_current_match_forward_picks_next() {
+        let ms = vec![
+            Match { row: 1, col_start: 0, col_end: 2 },
+            Match { row: 5, col_start: 3, col_end: 5 },
+            Match { row: 10, col_start: 0, col_end: 2 },
+        ];
+        assert_eq!(
+            pick_current_match(&ms, 3, 0, SearchDirection::Forward),
+            Some(1)
+        );
+        // Past the last → wrap to first.
+        assert_eq!(
+            pick_current_match(&ms, 11, 0, SearchDirection::Forward),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn pick_current_match_backward_picks_prev() {
+        let ms = vec![
+            Match { row: 1, col_start: 0, col_end: 2 },
+            Match { row: 5, col_start: 3, col_end: 5 },
+            Match { row: 10, col_start: 0, col_end: 2 },
+        ];
+        assert_eq!(
+            pick_current_match(&ms, 7, 0, SearchDirection::Backward),
+            Some(1)
+        );
+        // Before the first → wrap to last.
+        assert_eq!(
+            pick_current_match(&ms, 0, 0, SearchDirection::Backward),
+            Some(2)
+        );
     }
 
     #[test]

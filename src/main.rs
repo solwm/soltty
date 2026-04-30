@@ -428,6 +428,41 @@ impl ApplicationHandler<UserEvent> for App {
                 } else {
                     None
                 };
+                // Build the renderer's search-overlay view from vi state.
+                // Only matches inside the current viewport are listed —
+                // off-screen ones get skipped, since the renderer matches
+                // by viewport row.
+                let search_overlay = self.vi.search.as_ref().map(|s| {
+                    let g = self.term.grid();
+                    let sb_len = g.scrollback.len();
+                    let top_abs = sb_len.saturating_sub(self.term.viewport_offset);
+                    let view_rows = g.rows;
+                    let mut visible = Vec::new();
+                    let mut current_visible = None;
+                    for (i, m) in s.matches.iter().enumerate() {
+                        if m.row >= top_abs && m.row < top_abs + view_rows {
+                            if Some(i) == s.current {
+                                current_visible = Some(visible.len());
+                            }
+                            visible.push(renderer::MatchView {
+                                vrow: m.row - top_abs,
+                                col_start: m.col_start,
+                                col_end: m.col_end,
+                            });
+                        }
+                    }
+                    let prompt = match s.direction {
+                        vi::SearchDirection::Forward => '/',
+                        vi::SearchDirection::Backward => '?',
+                    };
+                    renderer::SearchOverlay {
+                        prompt,
+                        query: &s.query,
+                        typing: s.typing,
+                        matches: visible,
+                        current: current_visible,
+                    }
+                });
                 gpu.render(
                     &self.term,
                     self.picker.as_mut(),
@@ -436,6 +471,7 @@ impl ApplicationHandler<UserEvent> for App {
                     cursor_visible,
                     vi_cursor,
                     self.vi.active,
+                    search_overlay.as_ref(),
                 );
                 self.redraw_pending = false;
                 self.dirty = false;
@@ -679,6 +715,51 @@ impl ApplicationHandler<UserEvent> for App {
                 // nothing reaches the PTY. Esc cancels pending count/op
                 // first, then exits visual, then exits vi-mode entirely.
                 if self.vi.active {
+                    // Search-typing has its own input rules: every key
+                    // edits the query, navigates it, or commits/cancels.
+                    // Vi motions are inert until commit.
+                    let typing = self
+                        .vi
+                        .search
+                        .as_ref()
+                        .map(|s| s.typing)
+                        .unwrap_or(false);
+                    if typing {
+                        let cols = self.term.grid().cols;
+                        match &logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                cancel_search(&mut self.vi, &mut self.term);
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                if let Some(s) = self.vi.search.as_mut() {
+                                    s.typing = false;
+                                }
+                            }
+                            Key::Named(NamedKey::Backspace) => {
+                                if let Some(s) = self.vi.search.as_mut() {
+                                    s.query.pop();
+                                }
+                                refresh_search(&mut self.vi, &mut self.term);
+                            }
+                            Key::Character(text) if !self.modifiers.control_key() => {
+                                if let Some(c) = text.chars().next() {
+                                    if !c.is_control() {
+                                        if let Some(s) = self.vi.search.as_mut() {
+                                            s.query.push(c);
+                                        }
+                                        refresh_search(&mut self.vi, &mut self.term);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        if self.vi.visual != vi::VisualMode::None {
+                            self.selection = self.vi.selection(cols);
+                        }
+                        window.request_redraw();
+                        return;
+                    }
+
                     let cols = self.term.grid().cols;
                     let shift = self.modifiers.shift_key();
                     let ctrl = self.modifiers.control_key();
@@ -688,6 +769,10 @@ impl ApplicationHandler<UserEvent> for App {
                         Key::Named(NamedKey::Escape) => {
                             if self.vi.pending_count.is_some() || self.vi.pending_op.is_some() {
                                 self.vi.cancel_pending();
+                            } else if self.vi.search.is_some() {
+                                // Dismiss highlighted matches; the next
+                                // Esc will exit visual / vi-mode.
+                                self.vi.search = None;
                             } else if self.vi.visual != vi::VisualMode::None {
                                 self.vi.exit_visual();
                                 self.selection = None;
@@ -791,6 +876,23 @@ impl ApplicationHandler<UserEvent> for App {
                                         }
                                         self.vi.exit();
                                         self.selection = None;
+                                    }
+                                    // Search.
+                                    ('/', _) => start_search(
+                                        &mut self.vi,
+                                        &self.term,
+                                        vi::SearchDirection::Forward,
+                                    ),
+                                    ('?', _) => start_search(
+                                        &mut self.vi,
+                                        &self.term,
+                                        vi::SearchDirection::Backward,
+                                    ),
+                                    ('n', false) => {
+                                        search_navigate(&mut self.vi, &mut self.term, false)
+                                    }
+                                    ('n', true) => {
+                                        search_navigate(&mut self.vi, &mut self.term, true)
                                     }
                                     _ => {}
                                 }
@@ -955,6 +1057,111 @@ fn font_zoom_target(key: &Key, mods: ModifiersState, current_px: f32) -> Option<
         "0" => Some(DEFAULT_FONT_SIZE_PX),
         _ => None,
     }
+}
+
+/// Open a vi-mode search at the current cursor / viewport. The user is
+/// now in `typing=true` mode; subsequent printable keys edit the query.
+fn start_search(vi_state: &mut vi::ViMode, term: &Term, direction: vi::SearchDirection) {
+    vi_state.search = Some(vi::Search {
+        direction,
+        query: String::new(),
+        typing: true,
+        matches: Vec::new(),
+        current: None,
+        origin_cursor: vi_state.cursor,
+        origin_viewport_offset: term.viewport_offset,
+    });
+}
+
+/// Recompute matches for the current query, pick the new "current"
+/// match relative to the search origin, and live-jump the cursor +
+/// viewport to it. Empty query → restore origin (so backspacing back
+/// to nothing returns the user to where they came from).
+fn refresh_search(vi_state: &mut vi::ViMode, term: &mut Term) {
+    if vi_state.search.is_none() {
+        return;
+    }
+    // Phase 1: read-only — compute fresh matches + current index from
+    // origin. Drops the immutable vi.search borrow before phase 2.
+    let (new_matches, new_current, query_empty) = {
+        let s = vi_state.search.as_ref().unwrap();
+        let origin_abs =
+            vi::viewport_to_absolute(term, s.origin_cursor.0, s.origin_viewport_offset);
+        let matches = vi::find_matches(term, &s.query);
+        let current =
+            vi::pick_current_match(&matches, origin_abs, s.origin_cursor.1, s.direction);
+        (matches, current, s.query.is_empty())
+    };
+    // Phase 2: write back, extract jump target.
+    let to_jump = {
+        let s = vi_state.search.as_mut().unwrap();
+        s.matches = new_matches;
+        s.current = new_current;
+        s.current.map(|i| s.matches[i])
+    };
+    if let Some(m) = to_jump {
+        let view_rows = term.grid().rows;
+        let new_vrow = vi::jump_viewport_to(term, m.row, view_rows);
+        vi_state.cursor = (new_vrow, m.col_start);
+    } else if query_empty {
+        // No query → put the user back where they started so live
+        // typing feels reversible.
+        let (cursor, offset) = {
+            let s = vi_state.search.as_ref().unwrap();
+            (s.origin_cursor, s.origin_viewport_offset)
+        };
+        let cur = term.viewport_offset;
+        let delta = offset as isize - cur as isize;
+        term.scroll_view(delta);
+        vi_state.cursor = cursor;
+    }
+    // Else: query non-empty but no matches — leave cursor where it is.
+}
+
+/// Esc out of search. Restores the cursor + viewport to where they
+/// were when search opened.
+fn cancel_search(vi_state: &mut vi::ViMode, term: &mut Term) {
+    if let Some(s) = vi_state.search.take() {
+        let cur = term.viewport_offset;
+        let delta = s.origin_viewport_offset as isize - cur as isize;
+        term.scroll_view(delta);
+        vi_state.cursor = s.origin_cursor;
+    }
+}
+
+/// `n` / `N` after commit. `reverse` flips relative to the original
+/// search direction so `n` always means "continue in original direction"
+/// — matching vim.
+fn search_navigate(vi_state: &mut vi::ViMode, term: &mut Term, reverse: bool) {
+    if vi_state.search.is_none() {
+        return;
+    }
+    let (m, new_idx, view_rows) = {
+        let s = vi_state.search.as_ref().unwrap();
+        if s.matches.is_empty() {
+            return;
+        }
+        let advance_forward = match (s.direction, reverse) {
+            (vi::SearchDirection::Forward, false) => true,
+            (vi::SearchDirection::Forward, true) => false,
+            (vi::SearchDirection::Backward, false) => false,
+            (vi::SearchDirection::Backward, true) => true,
+        };
+        let cur = s.current.unwrap_or(0);
+        let new_idx = if advance_forward {
+            (cur + 1) % s.matches.len()
+        } else if cur == 0 {
+            s.matches.len() - 1
+        } else {
+            cur - 1
+        };
+        let m = s.matches[new_idx];
+        let view_rows = term.grid().rows;
+        (m, new_idx, view_rows)
+    };
+    vi_state.search.as_mut().unwrap().current = Some(new_idx);
+    let new_vrow = vi::jump_viewport_to(term, m.row, view_rows);
+    vi_state.cursor = (new_vrow, m.col_start);
 }
 
 fn apply_picker_preview(gpu: &mut Gpu, picker: &picker::Picker, lib: &theme::ThemeLib) {

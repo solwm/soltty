@@ -16,7 +16,7 @@ use winit::window::{Window, WindowAttributes};
 
 use crate::font::FontAtlas;
 use crate::picker::Picker;
-use crate::renderer::Renderer;
+use crate::renderer::{Renderer, SearchOverlay};
 use crate::selection::Selection;
 use crate::term::Term;
 use crate::theme::Theme;
@@ -216,6 +216,7 @@ impl Gpu {
         cursor_visible_now: bool,
         vi_cursor: Option<(usize, usize)>,
         vi_active: bool,
+        search: Option<&SearchOverlay<'_>>,
     ) {
         self.renderer.prepare(
             &self.gl,
@@ -226,6 +227,7 @@ impl Gpu {
             trace,
             cursor_visible_now,
             vi_cursor,
+            search,
         );
         self.renderer.draw(&self.gl);
         if vi_active {
