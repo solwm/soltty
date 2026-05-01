@@ -1,4 +1,6 @@
 mod clipboard;
+#[cfg(unix)]
+mod clipboard_wayland;
 mod font;
 mod gpu;
 mod grid;

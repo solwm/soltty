@@ -66,6 +66,17 @@ impl Clipboard {
 
     /// Read regular clipboard contents. Returns empty string on failure.
     pub fn get_text(&mut self) -> String {
+        // Native wl_data_device read first when on Wayland — sidesteps
+        // wl-paste, which segfaults in wl-clipboard 2.3.0 on at least
+        // one tested setup. arboard would also work but it requires
+        // wlr-data-control / ext-data-control, which not every
+        // compositor exposes.
+        #[cfg(unix)]
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            if let Some(s) = crate::clipboard_wayland::read_clipboard() {
+                return s;
+            }
+        }
         if self.has_wl_copy {
             if let Some(s) = read_from_wl_paste(false) {
                 return s;
@@ -81,8 +92,15 @@ impl Clipboard {
 
     /// Read the X11/Wayland *primary* selection — the one populated by
     /// mouse selection and pasted with middle-click. arboard doesn't
-    /// expose primary on Linux, so this is wl-paste-only.
+    /// expose primary on Linux, so this is Wayland-protocol or
+    /// wl-paste-only.
     pub fn get_primary(&mut self) -> String {
+        #[cfg(unix)]
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            if let Some(s) = crate::clipboard_wayland::read_primary() {
+                return s;
+            }
+        }
         if self.has_wl_copy {
             if let Some(s) = read_from_wl_paste(true) {
                 return s;

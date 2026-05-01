@@ -1996,11 +1996,14 @@ dependencies = [
  "glow",
  "glutin",
  "glutin-winit",
+ "libc",
  "log",
  "portable-pty",
  "raw-window-handle",
  "swash",
  "vte",
+ "wayland-client",
+ "wayland-protocols",
  "winit",
 ]
 

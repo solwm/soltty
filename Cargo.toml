@@ -21,6 +21,15 @@ swash = "0.1"
 etagere = "0.2"
 clap = { version = "4", features = ["derive"] }
 arboard = { version = "3", features = ["wayland-data-control"] }
+# Already transitive via winit; declared here so we can call them directly
+# for the Wayland clipboard read path (replaces shelling out to wl-paste,
+# which segfaults in wl-clipboard 2.3.0 on at least one user's setup).
+[target.'cfg(unix)'.dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+# pipe2 + poll for the receive-fd path; std doesn't expose pipe() until 1.87
+# and our MSRV is 1.80.
+libc = "0.2"
 
 [profile.release]
 lto = "thin"
