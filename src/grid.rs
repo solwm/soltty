@@ -13,6 +13,13 @@ use std::collections::VecDeque;
 /// the rest of the grid module combined.
 pub fn char_width(ch: char) -> u8 {
     let c = ch as u32;
+    // Hot path: ASCII + Latin Extended A/B + IPA + Cyrillic + Greek
+    // are *never* wide. Short-circuit so the per-cell cost in heavy
+    // ASCII workloads (gol-c, syntax-highlighted code, plain text)
+    // doesn't pay for the full EAW range scan.
+    if c < 0x300 {
+        return 1;
+    }
     let wide = matches!(
         c,
         // CJK Symbols & Punctuation, Hiragana, Katakana, Bopomofo,
@@ -185,7 +192,11 @@ impl Pen {
 pub struct Grid {
     pub rows: usize,
     pub cols: usize,
-    pub lines: Vec<Row>,
+    /// Live grid rows. Stored as a `VecDeque` so full-screen scrolling
+    /// (the common case) is O(1) — pop the evicted top and push a
+    /// fresh blank at the bottom, no shifting. Region scrolls inside
+    /// a scroll region are still O(n) but those are much rarer.
+    pub lines: VecDeque<Row>,
     pub scrollback: VecDeque<Row>,
     pub scrollback_limit: usize,
     pub cursor: Cursor,
@@ -200,7 +211,10 @@ pub struct Grid {
 impl Grid {
     pub fn new(rows: usize, cols: usize, scrollback_limit: usize) -> Self {
         let pen = Pen::default();
-        let lines = (0..rows).map(|_| Row::blank(cols, pen)).collect();
+        let mut lines: VecDeque<Row> = VecDeque::with_capacity(rows);
+        for _ in 0..rows {
+            lines.push_back(Row::blank(cols, pen));
+        }
         Self {
             rows,
             cols,
@@ -229,7 +243,7 @@ impl Grid {
         if rows != self.rows {
             if rows > self.rows {
                 for _ in self.rows..rows {
-                    self.lines.push(Row::blank(cols, self.pen));
+                    self.lines.push_back(Row::blank(cols, self.pen));
                 }
             } else {
                 self.lines.truncate(rows);
@@ -352,23 +366,30 @@ impl Grid {
         let full_screen = self.scroll_top == 0 && self.scroll_bot == self.rows - 1;
         for _ in 0..n {
             if !full_screen {
+                // Region scroll: rotate the [scroll_top..=scroll_bot]
+                // sub-range. VecDeque doesn't have a slice rotate, so
+                // do it by hand via swap pairs — same O(n) cost as
+                // Vec's rotate_left.
                 let blank = Row::blank(self.cols, self.pen);
-                self.lines[self.scroll_top..=self.scroll_bot].rotate_left(1);
+                for i in self.scroll_top..self.scroll_bot {
+                    self.lines.swap(i, i + 1);
+                }
                 self.lines[self.scroll_bot] = blank;
                 continue;
             }
             if self.scrollback_limit == 0 {
-                // Alt-screen scroll without history. The displaced row
-                // would be pushed and immediately popped — short-circuit
-                // to clearing in place, no VecDeque churn.
-                self.lines[0].clear_with(self.pen);
-                self.lines.rotate_left(1);
+                // Alt-screen scroll without history. Recycle: take the
+                // top row, clear it, push to bottom. O(1) on VecDeque.
+                let mut row = self.lines.pop_front().expect("rows > 0");
+                row.clear_with(self.pen);
+                self.lines.push_back(row);
                 continue;
             }
-            // In steady state scrollback is full and we'd otherwise
-            // allocate a fresh blank `Vec<Cell>` AND free the oldest
-            // scrollback row's. Recycle: pop the oldest, reset it, use
-            // it as the new blank. Saves one alloc + one free per scroll.
+            // Full-screen scroll with scrollback. Pop the top row off
+            // the live grid (O(1) on VecDeque), push it onto scrollback,
+            // and put a fresh blank at the bottom. Recycle the oldest
+            // scrollback row when scrollback is full — saves an
+            // alloc/free per scroll.
             let blank = if self.scrollback.len() >= self.scrollback_limit {
                 let mut row = self.scrollback.pop_front().expect("len > 0");
                 // `Grid::resize` doesn't touch scrollback, so a row
@@ -381,16 +402,20 @@ impl Grid {
             } else {
                 Row::blank(self.cols, self.pen)
             };
-            let old = std::mem::replace(&mut self.lines[0], blank);
+            let old = self.lines.pop_front().expect("rows > 0");
             self.scrollback.push_back(old);
-            self.lines.rotate_left(1);
+            self.lines.push_back(blank);
         }
     }
 
     pub fn scroll_down_in_region(&mut self, n: usize) {
         let n = n.min(self.scroll_bot - self.scroll_top + 1);
         for _ in 0..n {
-            self.lines[self.scroll_top..=self.scroll_bot].rotate_right(1);
+            // VecDeque has no slice rotate_right; bubble in the other
+            // direction by hand.
+            for i in (self.scroll_top..self.scroll_bot).rev() {
+                self.lines.swap(i, i + 1);
+            }
             self.lines[self.scroll_top] = Row::blank(self.cols, self.pen);
         }
     }
@@ -478,7 +503,9 @@ impl Grid {
         }
         let n = n.min(self.scroll_bot - self.cursor.row + 1);
         for _ in 0..n {
-            self.lines[self.cursor.row..=self.scroll_bot].rotate_right(1);
+            for i in (self.cursor.row..self.scroll_bot).rev() {
+                self.lines.swap(i, i + 1);
+            }
             self.lines[self.cursor.row] = Row::blank(self.cols, self.pen);
         }
     }
@@ -489,7 +516,9 @@ impl Grid {
         }
         let n = n.min(self.scroll_bot - self.cursor.row + 1);
         for _ in 0..n {
-            self.lines[self.cursor.row..=self.scroll_bot].rotate_left(1);
+            for i in self.cursor.row..self.scroll_bot {
+                self.lines.swap(i, i + 1);
+            }
             self.lines[self.scroll_bot] = Row::blank(self.cols, self.pen);
         }
     }

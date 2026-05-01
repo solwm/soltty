@@ -288,9 +288,18 @@ impl Renderer {
                     cell.attrs.has(CellAttrs::BOLD),
                     cell.attrs.has(CellAttrs::ITALIC),
                 );
-                if !is_blank_glyph(cell.ch) {
+                // Pull the glyph entry once: blank cells (' ' / '\0')
+                // have no glyph and don't need a HashMap lookup —
+                // gol-c-style workloads where most cells are spaces
+                // hit this every frame, so skipping the lookup saves
+                // real time. The shader's `glyph_size_px.x > 0` check
+                // already handles the empty entry naturally.
+                let glyph = if is_blank_glyph(cell.ch) {
+                    Default::default()
+                } else {
                     atlas.ensure(cell.ch, style);
-                }
+                    atlas.get(cell.ch, style).unwrap_or_default()
+                };
                 let mut fg = resolve_color(cell.fg, &self.palette, self.default_fg);
                 let mut bg = resolve_color(cell.bg, &self.palette, self.default_bg);
                 if cell.attrs.has(CellAttrs::INVERSE) {
@@ -325,7 +334,6 @@ impl Renderer {
                         None => {}
                     }
                 }
-                let glyph = atlas.get(cell.ch, style).unwrap_or_default();
                 self.instances_scratch.push(CellInstance {
                     cell_xy: [col_idx as u32, vrow as u32],
                     glyph_origin: [glyph.atlas_x as u32, glyph.atlas_y as u32],
