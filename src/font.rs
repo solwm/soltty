@@ -6,6 +6,8 @@ use swash::scale::image::Image as SwashImage;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::FontRef;
 
+use crate::config::Config;
+
 /// Which face to use for a glyph. Derived from cell attrs (BOLD /
 /// ITALIC bits) at render time. The atlas keys glyphs by `(char, style)`
 /// so we can hold separate rasterizations of e.g. `A` Regular vs Bold.
@@ -103,9 +105,9 @@ pub struct FontAtlas {
 }
 
 impl FontAtlas {
-    pub fn new(px_size: f32) -> std::io::Result<Self> {
-        let primary_path = discover_font().ok_or_else(|| io_err(
-            "no monospace font found; set SOLTTY_FONT to a TTF/OTF path",
+    pub fn new(px_size: f32, config: &Config) -> std::io::Result<Self> {
+        let primary_path = discover_font(config).ok_or_else(|| io_err(
+            "no monospace font found; set SOLTTY_FONT or `font` in soltty.conf",
         ))?;
         log::info!("font: {}", primary_path.display());
         let primary_data = std::fs::read(&primary_path)?;
@@ -177,7 +179,7 @@ impl FontAtlas {
             (FontStyle::Italic, "italic"),
             (FontStyle::BoldItalic, "bold-italic"),
         ] {
-            let Some(path) = discover_variant(&primary_path, style) else {
+            let Some(path) = discover_variant(&primary_path, style, config) else {
                 continue;
             };
             let Ok(data) = std::fs::read(&path) else {
@@ -402,11 +404,18 @@ fn compute_cell_metrics(font: &FontRef<'_>, px: f32) -> CellMetrics {
     }
 }
 
-fn discover_font() -> Option<PathBuf> {
+fn discover_font(config: &Config) -> Option<PathBuf> {
+    // Precedence: SOLTTY_FONT env > config file `font` > built-in
+    // candidate list. First existing file wins.
     if let Ok(p) = std::env::var("SOLTTY_FONT") {
         let p = PathBuf::from(p);
         if p.is_file() {
             return Some(p);
+        }
+    }
+    if let Some(p) = config.font.as_deref() {
+        if p.is_file() {
+            return Some(p.to_path_buf());
         }
     }
     const CANDIDATES: &[&str] = &[
@@ -481,10 +490,13 @@ fn variant_candidates(primary: &Path, style: FontStyle) -> Vec<PathBuf> {
 }
 
 /// First existing variant for `style`, or `None` if no variant could be
-/// found. Honors `SOLTTY_FONT_BOLD` / `SOLTTY_FONT_ITALIC` /
-/// `SOLTTY_FONT_BOLD_ITALIC` env vars as overrides — useful for
-/// non-standard setups or to point at a different family entirely.
-fn discover_variant(primary: &Path, style: FontStyle) -> Option<PathBuf> {
+/// found. Precedence: env var > config file > suffix-substitution
+/// search on the primary path.
+///   - `SOLTTY_FONT_BOLD` / `SOLTTY_FONT_ITALIC` /
+///     `SOLTTY_FONT_BOLD_ITALIC` env vars
+///   - `font_bold` / `font_italic` / `font_bold_italic` keys in
+///     `~/.config/soltty/soltty.conf`
+fn discover_variant(primary: &Path, style: FontStyle, config: &Config) -> Option<PathBuf> {
     let env_var = match style {
         FontStyle::Bold => "SOLTTY_FONT_BOLD",
         FontStyle::Italic => "SOLTTY_FONT_ITALIC",
@@ -495,6 +507,17 @@ fn discover_variant(primary: &Path, style: FontStyle) -> Option<PathBuf> {
         let p = PathBuf::from(p);
         if p.is_file() {
             return Some(p);
+        }
+    }
+    let cfg_path = match style {
+        FontStyle::Bold => config.font_bold.as_deref(),
+        FontStyle::Italic => config.font_italic.as_deref(),
+        FontStyle::BoldItalic => config.font_bold_italic.as_deref(),
+        FontStyle::Regular => None,
+    };
+    if let Some(p) = cfg_path {
+        if p.is_file() {
+            return Some(p.to_path_buf());
         }
     }
     variant_candidates(primary, style)
@@ -631,7 +654,7 @@ mod tests {
         // the candidate list.
         std::env::set_var("SOLTTY_FONT", regular.as_os_str());
 
-        let mut atlas = FontAtlas::new(16.0).unwrap();
+        let mut atlas = FontAtlas::new(16.0, &Config::default()).unwrap();
         atlas.ensure('A', FontStyle::Regular);
         atlas.ensure('A', FontStyle::Bold);
         let r = atlas.get('A', FontStyle::Regular).unwrap();

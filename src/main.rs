@@ -1,4 +1,5 @@
 mod clipboard;
+mod config;
 #[cfg(unix)]
 mod clipboard_wayland;
 mod font;
@@ -48,6 +49,7 @@ fn main() {
     .init();
 
     let cli = Cli::parse();
+    let cfg = config::Config::load();
 
     let theme_lib = theme::ThemeLib::load();
 
@@ -58,6 +60,10 @@ fn main() {
         return;
     }
 
+    // Theme precedence: CLI flag > config file > built-in default. CLI
+    // misses are fatal (the user explicitly asked for it); config-file
+    // misses warn and fall back so a typo in the config doesn't take
+    // the terminal down.
     let initial_theme_name = match cli.theme.as_deref() {
         Some(n) => match theme_lib.find(n) {
             Some(t) => t.name.clone(),
@@ -68,7 +74,15 @@ fn main() {
                 std::process::exit(2);
             }
         },
-        None => theme_lib.default().name.clone(),
+        None => match cfg.theme.as_deref().and_then(|n| theme_lib.find(n)) {
+            Some(t) => t.name.clone(),
+            None => {
+                if let Some(n) = cfg.theme.as_deref() {
+                    log::warn!("config theme {n:?} not found, using default");
+                }
+                theme_lib.default().name.clone()
+            }
+        },
     };
 
     let (program, args) = match cli.command.as_slice() {
@@ -107,9 +121,10 @@ fn main() {
         frame_interval: Duration::from_millis(8),
         blink_epoch: Instant::now(),
         vi: vi::ViMode::new(),
-        vi_keybind: vi::ViKeyBind::from_env_or_default(),
+        vi_keybind: vi::ViKeyBind::resolve(cfg.vi_keybind.as_deref()),
         held_buttons: 0,
         last_reported_cell: None,
+        config: cfg,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -216,6 +231,11 @@ struct App {
     /// pixel-granular but the protocol is cell-granular; without dedup
     /// a single drag floods the PTY with redundant events.
     last_reported_cell: Option<(usize, usize)>,
+    /// Loaded user config. Consulted in `resumed` for font / frame
+    /// settings that we don't know how to apply until the window
+    /// exists. Other settings (theme, vi keybind) are already resolved
+    /// in `main` and stored as concrete values.
+    config: config::Config,
 }
 
 /// Even with the per-display cap, we always paint immediately if we've
@@ -238,15 +258,18 @@ const DEFAULT_FRAME_HZ: u32 = 120;
 /// active prompt cursor in zsh-vi-mode.
 const BLINK_HALF_PERIOD: Duration = Duration::from_millis(500);
 
-/// Pick the redraw cap. `SOLTTY_FRAME_HZ` env var wins, then the
-/// current monitor's refresh rate from winit, then a 120 Hz default.
-/// Result is clamped to a sane range so a misconfigured monitor can't
-/// pin us at 5 Hz or 1 kHz.
-fn detect_frame_interval(window: &Window) -> Duration {
+/// Pick the redraw cap. Precedence: `SOLTTY_FRAME_HZ` env var > config
+/// `frame_hz` > monitor refresh rate from winit > 120 Hz default.
+/// Result is clamped so a misconfigured source can't pin us at 5 Hz or
+/// 1 kHz. A config value of 0 means "auto" — explicitly fall through
+/// to the monitor query.
+fn detect_frame_interval(window: &Window, config_hz: Option<u32>) -> Duration {
     let env_hz = std::env::var("SOLTTY_FRAME_HZ")
         .ok()
         .and_then(|s| s.parse::<u32>().ok());
+    let cfg_hz = config_hz.filter(|&h| h > 0);
     let hz = env_hz
+        .or(cfg_hz)
         .or_else(|| {
             window
                 .current_monitor()
@@ -279,7 +302,7 @@ impl ApplicationHandler<UserEvent> for App {
             .cloned()
             .unwrap_or_else(|| self.theme_lib.default().clone());
         log::info!("theme: {}", initial_theme.name);
-        let (window, gpu) = Gpu::new(event_loop, attrs, &initial_theme);
+        let (window, gpu) = Gpu::new(event_loop, attrs, &initial_theme, &self.config);
 
         let inner = window.inner_size();
         let (rows, cols) = grid_dims_for_window(gpu.cell_size(), inner.width, inner.height);
@@ -311,7 +334,7 @@ impl ApplicationHandler<UserEvent> for App {
         .expect("spawn pty");
 
         log::info!("grid: {cols}x{rows}");
-        self.frame_interval = detect_frame_interval(&window);
+        self.frame_interval = detect_frame_interval(&window, self.config.frame_hz);
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.pty = Some(pty);

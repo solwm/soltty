@@ -1,0 +1,46 @@
+# Example soltty config. Copy to ~/.config/soltty/soltty.conf and
+# uncomment the bits you want to override.
+#
+# Precedence (highest first):
+#   1. CLI flag (--theme)
+#   2. Env var (SOLTTY_THEME, SOLTTY_FONT, SOLTTY_FONT_PX,
+#                SOLTTY_FONT_BOLD, SOLTTY_FONT_ITALIC,
+#                SOLTTY_FONT_BOLD_ITALIC, SOLTTY_FRAME_HZ,
+#                SOLTTY_VI_KEY)
+#   3. This file
+#   4. Built-in defaults
+#
+# Unknown keys are silently ignored — a config from a newer build
+# of soltty won't break this one.
+
+[appearance]
+# Theme name (case-insensitive substring match against the bundled
+# library; `soltty --list-themes` lists them all). Drop additional
+# .toml themes into ~/.config/soltty/themes/ to add your own.
+# theme = "Dracula"
+
+# Font paths. If unset, soltty walks a built-in candidate list
+# (JetBrainsMono → CascadiaMono → FiraCode → Hack → DejaVuSansMono on
+# Linux; Menlo / Monaco on macOS; CascadiaMono / Consolas on Windows).
+# font             = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf"
+# font_bold        = "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf"
+# font_italic      = "/usr/share/fonts/TTF/JetBrainsMono-Italic.ttf"
+# font_bold_italic = "/usr/share/fonts/TTF/JetBrainsMono-BoldItalic.ttf"
+
+# Font size in pixels. Clamped to [6, 96]. Default ~21 (16 * 1.3).
+# font_size = 21.0
+
+[behavior]
+# Frame rate cap. 0 = use the monitor's refresh rate (the default).
+# Values are clamped to [60, 240] so a misconfigured panel can't pin
+# us at 5 Hz or 1 kHz.
+# frame_hz = 0
+
+[keybinds]
+# Activation key for vi mode. Format: `+`-separated tokens, case
+# insensitive. Modifiers: `ctrl`, `shift`, `alt`. Special keys:
+# `space`, `tab`, `enter`, `backspace`. Letters and digits as-is.
+#
+# Default is Ctrl+N — note this shadows readline's "next history".
+# Pick something else (e.g. ctrl+shift+space) if that bothers you.
+# vi_mode = "ctrl+n"

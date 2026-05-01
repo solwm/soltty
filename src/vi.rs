@@ -524,24 +524,36 @@ impl ViKeyBind {
         }
     }
 
-    /// Read the keybind from the `SOLTTY_VI_KEY` env var, falling back
-    /// to the default if unset or unparseable. Logs a warning on bad
-    /// input rather than failing — a bad env var shouldn't keep the
-    /// terminal from starting.
-    pub fn from_env_or_default() -> Self {
-        match std::env::var("SOLTTY_VI_KEY") {
-            Ok(s) => match parse_vi_key(&s) {
+    /// Resolve the activation keybind. Precedence: `SOLTTY_VI_KEY`
+    /// env var > config-file value > built-in default (`Ctrl+N`). Bad
+    /// input at any source logs a warning and falls through; the
+    /// terminal always starts.
+    pub fn resolve(config_value: Option<&str>) -> Self {
+        if let Ok(s) = std::env::var("SOLTTY_VI_KEY") {
+            match parse_vi_key(&s) {
                 Some(k) => {
-                    log::info!("vi-mode keybind: {s:?}");
-                    k
+                    log::info!("vi-mode keybind: {s:?} (from SOLTTY_VI_KEY)");
+                    return k;
                 }
                 None => {
-                    log::warn!("SOLTTY_VI_KEY={s:?} did not parse, using default ctrl+n");
-                    Self::default_activation()
+                    log::warn!(
+                        "SOLTTY_VI_KEY={s:?} did not parse; trying config-file value"
+                    );
                 }
-            },
-            Err(_) => Self::default_activation(),
+            }
         }
+        if let Some(s) = config_value {
+            match parse_vi_key(s) {
+                Some(k) => {
+                    log::info!("vi-mode keybind: {s:?} (from config)");
+                    return k;
+                }
+                None => {
+                    log::warn!("config vi_mode={s:?} did not parse; using default");
+                }
+            }
+        }
+        Self::default_activation()
     }
 
     /// Match a winit key event against this binding. Modifiers must be

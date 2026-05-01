@@ -14,6 +14,7 @@ use raw_window_handle::HasWindowHandle;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
 
+use crate::config::Config;
 use crate::font::FontAtlas;
 use crate::picker::Picker;
 use crate::renderer::{Renderer, SearchOverlay};
@@ -26,13 +27,14 @@ pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0 * 1.3;
 const MIN_FONT_SIZE_PX: f32 = 6.0;
 const MAX_FONT_SIZE_PX: f32 = 96.0;
 
-/// `SOLTTY_FONT_PX=12.5` overrides the default at startup. Useful for
-/// benchmarking and for users who want a fixed startup size without
-/// editing the source. Out-of-range values are clamped silently.
-pub fn startup_font_px() -> f32 {
+/// Resolve startup font size. Precedence: `SOLTTY_FONT_PX` env var >
+/// config-file `font_size` > built-in default. Out-of-range values are
+/// clamped silently so a misplaced 0 or huge number can't brick startup.
+pub fn startup_font_px(config: &Config) -> f32 {
     std::env::var("SOLTTY_FONT_PX")
         .ok()
         .and_then(|s| s.parse::<f32>().ok())
+        .or(config.font_size)
         .map(|px| px.clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX))
         .unwrap_or(DEFAULT_FONT_SIZE_PX)
 }
@@ -44,6 +46,10 @@ pub struct Gpu {
     renderer: Renderer,
     atlas: FontAtlas,
     font_px: f32,
+    /// Cached so `set_font_size` (font zoom on Ctrl+=) can re-resolve
+    /// the user's font paths without us threading the config through
+    /// every winit event handler.
+    config: Config,
 }
 
 impl Gpu {
@@ -53,6 +59,7 @@ impl Gpu {
         event_loop: &ActiveEventLoop,
         window_attrs: WindowAttributes,
         theme: &Theme,
+        config: &Config,
     ) -> (Arc<Window>, Self) {
         let template = ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(Some(true))
@@ -139,8 +146,8 @@ impl Gpu {
             unsafe { gl.get_parameter_string(glow::VENDOR) },
         );
 
-        let initial_font_px = startup_font_px();
-        let mut atlas = FontAtlas::new(initial_font_px).expect("load font");
+        let initial_font_px = startup_font_px(config);
+        let mut atlas = FontAtlas::new(initial_font_px, config).expect("load font");
         let inner = window.inner_size();
         let renderer = Renderer::new(&gl, (inner.width, inner.height), &mut atlas, theme);
 
@@ -151,6 +158,7 @@ impl Gpu {
             renderer,
             atlas,
             font_px: initial_font_px,
+            config: config.clone(),
         };
 
         // Suppress the "unused" check for fields that aren't read yet.
@@ -179,7 +187,7 @@ impl Gpu {
         if (px - self.font_px).abs() < 0.05 {
             return self.renderer.cell_size();
         }
-        match FontAtlas::new(px) {
+        match FontAtlas::new(px, &self.config) {
             Ok(atlas) => {
                 self.atlas = atlas;
                 self.renderer.reload_font(&self.gl, &mut self.atlas);
