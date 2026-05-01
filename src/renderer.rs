@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use glow::HasContext;
 
-use crate::font::FontAtlas;
+use crate::font::{FontAtlas, FontStyle};
 use crate::grid::{CellAttrs, Color, CursorShape};
 use crate::picker::Picker;
 use crate::selection::Selection;
@@ -324,8 +324,12 @@ impl Renderer {
         for vrow in 0..rows {
             let row = term.viewport_row(vrow);
             for (col_idx, cell) in row.cells.iter().take(cols).enumerate() {
+                let style = FontStyle::from_attrs(
+                    cell.attrs.has(CellAttrs::BOLD),
+                    cell.attrs.has(CellAttrs::ITALIC),
+                );
                 if !is_blank_glyph(cell.ch) {
-                    atlas.ensure(cell.ch);
+                    atlas.ensure(cell.ch, style);
                 }
                 let mut fg = resolve_color(cell.fg, &self.palette, self.default_fg);
                 let mut bg = resolve_color(cell.bg, &self.palette, self.default_bg);
@@ -361,7 +365,7 @@ impl Renderer {
                         None => {}
                     }
                 }
-                let glyph = atlas.get(cell.ch).unwrap_or_default();
+                let glyph = atlas.get(cell.ch, style).unwrap_or_default();
                 self.instances_scratch.push(CellInstance {
                     cell_xy: [col_idx as u32, vrow as u32],
                     glyph_origin: [glyph.atlas_x as u32, glyph.atlas_y as u32],
@@ -661,10 +665,13 @@ impl Renderer {
         bg: [f32; 4],
         atlas: &mut FontAtlas,
     ) {
+        // Picker / search bar / FPS overlays are always rendered in
+        // regular weight — the underlying terminal cell's bold/italic
+        // attrs don't propagate to overlay text.
         if ch != ' ' && ch != '\0' {
-            atlas.ensure(ch);
+            atlas.ensure(ch, FontStyle::Regular);
         }
-        let glyph = atlas.get(ch).unwrap_or_default();
+        let glyph = atlas.get(ch, FontStyle::Regular).unwrap_or_default();
         self.instances_scratch.push(CellInstance {
             cell_xy: [col as u32, row as u32],
             glyph_origin: [glyph.atlas_x as u32, glyph.atlas_y as u32],

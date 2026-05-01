@@ -1,10 +1,34 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use etagere::{size2, AtlasAllocator};
 use swash::scale::image::Image as SwashImage;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::FontRef;
+
+/// Which face to use for a glyph. Derived from cell attrs (BOLD /
+/// ITALIC bits) at render time. The atlas keys glyphs by `(char, style)`
+/// so we can hold separate rasterizations of e.g. `A` Regular vs Bold.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FontStyle {
+    Regular = 0,
+    Bold = 1,
+    Italic = 2,
+    BoldItalic = 3,
+}
+
+impl FontStyle {
+    /// Map cell attribute bits to a style. Pure data → trivial test.
+    pub fn from_attrs(bold: bool, italic: bool) -> Self {
+        match (bold, italic) {
+            (false, false) => FontStyle::Regular,
+            (true, false) => FontStyle::Bold,
+            (false, true) => FontStyle::Italic,
+            (true, true) => FontStyle::BoldItalic,
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct GlyphEntry {
@@ -52,13 +76,17 @@ impl LoadedFont {
 }
 
 pub struct FontAtlas {
-    /// Loaded fonts, primary at [0] and fallbacks at [1..]. We try the
-    /// primary first when rasterizing a glyph, then walk the fallbacks
-    /// in order — first font that has the codepoint wins. JetBrainsMono
-    /// (a common primary) lacks ballot boxes, geometric shapes, and
-    /// many other symbol blocks, so the chain is what makes box-drawing
-    /// task lists and similar UI render at all.
+    /// All loaded fonts (primary + variant primaries + fallbacks). We
+    /// hold the bytes once each; chains below reference them by index.
     fonts: Vec<LoadedFont>,
+    /// Search chains per FontStyle. Each chain is a list of indices
+    /// into `fonts`; rasterize walks them and picks the first font
+    /// that has the codepoint. Chain order: variant primary (if loaded)
+    /// followed by the shared fallback list.
+    chains_regular: Vec<usize>,
+    chains_bold: Vec<usize>,
+    chains_italic: Vec<usize>,
+    chains_bold_italic: Vec<usize>,
     px_size: f32,
     pub metrics: CellMetrics,
     pub atlas_w: u32,
@@ -67,7 +95,9 @@ pub struct FontAtlas {
     /// Per-glyph rects added to the atlas since the last GPU upload.
     /// Empty == clean, no upload needed.
     pub dirty_rects: Vec<DirtyRect>,
-    glyphs: HashMap<char, GlyphEntry>,
+    /// Keyed by `(codepoint, style)` so the same char can have separate
+    /// regular / bold / italic / bold-italic entries.
+    glyphs: HashMap<(char, FontStyle), GlyphEntry>,
     allocator: AtlasAllocator,
     scale_ctx: ScaleContext,
 }
@@ -99,10 +129,18 @@ impl FontAtlas {
             offset: primary_offset,
         }];
 
+        // Regular chain starts with the primary; all other chains are
+        // built up below.
+        let mut chains_regular: Vec<usize> = vec![0];
+        let mut chains_bold: Vec<usize> = Vec::new();
+        let mut chains_italic: Vec<usize> = Vec::new();
+        let mut chains_bold_italic: Vec<usize> = Vec::new();
+
         // Load broad-coverage fallbacks for symbols the primary lacks.
-        // Skipped silently if the file doesn't exist or fails to parse —
-        // worst case we end up with primary-only, which is what we had
-        // before this commit.
+        // Each fallback is appended to *every* style's chain — without
+        // bold/italic fallback variants, a missing-glyph in bold mode
+        // shows the regular DejaVu glyph, which is acceptable; the
+        // alternative (empty cell) is not.
         let primary_canonical = primary_path.canonicalize().ok();
         for path in discover_fallback_fonts() {
             if path.canonicalize().ok() == primary_canonical {
@@ -121,7 +159,46 @@ impl FontAtlas {
             };
             let offset = font.offset;
             log::info!("font fallback: {}", path.display());
+            let idx = fonts.len();
             fonts.push(LoadedFont { data, offset });
+            chains_regular.push(idx);
+            chains_bold.push(idx);
+            chains_italic.push(idx);
+            chains_bold_italic.push(idx);
+        }
+
+        // Variant primaries (Bold / Italic / BoldItalic). If a variant
+        // exists, prepend it to its style's chain — it gets searched
+        // before the shared fallbacks, so JetBrainsMono-Bold wins for
+        // glyphs it has, and only missing chars fall through to
+        // DejaVuSansMono (regular).
+        for (style, label) in [
+            (FontStyle::Bold, "bold"),
+            (FontStyle::Italic, "italic"),
+            (FontStyle::BoldItalic, "bold-italic"),
+        ] {
+            let Some(path) = discover_variant(&primary_path, style) else {
+                continue;
+            };
+            let Ok(data) = std::fs::read(&path) else {
+                log::debug!("variant {} unreadable: {}", label, path.display());
+                continue;
+            };
+            let Some(font) = FontRef::from_index(&data, 0) else {
+                log::debug!("variant {}: unparseable", path.display());
+                continue;
+            };
+            let offset = font.offset;
+            log::info!("font {label}: {}", path.display());
+            let idx = fonts.len();
+            fonts.push(LoadedFont { data, offset });
+            let chain = match style {
+                FontStyle::Bold => &mut chains_bold,
+                FontStyle::Italic => &mut chains_italic,
+                FontStyle::BoldItalic => &mut chains_bold_italic,
+                FontStyle::Regular => unreachable!(),
+            };
+            chain.insert(0, idx);
         }
 
         let (atlas_w, atlas_h) = (1024u32, 1024u32);
@@ -130,6 +207,10 @@ impl FontAtlas {
 
         let mut atlas = Self {
             fonts,
+            chains_regular,
+            chains_bold,
+            chains_italic,
+            chains_bold_italic,
             px_size,
             metrics,
             atlas_w,
@@ -141,42 +222,54 @@ impl FontAtlas {
             scale_ctx: ScaleContext::new(),
         };
 
-        // Pre-bake printable ASCII so the common case is hot from frame 0.
+        // Pre-bake printable ASCII in Regular so the common case is hot
+        // from frame 0. Bold/italic ASCII gets rasterized lazily.
         for code in 0x20u8..=0x7Eu8 {
-            atlas.rasterize(code as char);
+            atlas.rasterize(code as char, FontStyle::Regular);
         }
 
         Ok(atlas)
     }
 
-    pub fn ensure(&mut self, ch: char) {
-        if !self.glyphs.contains_key(&ch) {
-            self.rasterize(ch);
+    pub fn ensure(&mut self, ch: char, style: FontStyle) {
+        if !self.glyphs.contains_key(&(ch, style)) {
+            self.rasterize(ch, style);
         }
     }
 
-    pub fn get(&self, ch: char) -> Option<GlyphEntry> {
-        self.glyphs.get(&ch).copied()
+    pub fn get(&self, ch: char, style: FontStyle) -> Option<GlyphEntry> {
+        self.glyphs.get(&(ch, style)).copied()
     }
 
-    fn rasterize(&mut self, ch: char) {
-        // Walk the font chain to find one that has the codepoint. Primary
-        // first, then fallbacks in load order. None match → cache empty so
-        // we don't try again next frame; this is what kept JetBrainsMono's
-        // ballot-box gap silent before we had a fallback chain at all.
-        let mut found: Option<usize> = None;
-        for (i, f) in self.fonts.iter().enumerate() {
-            let Some(font) = f.font() else { continue };
-            if font.charmap().map(ch) != 0 {
-                found = Some(i);
-                break;
+    fn rasterize(&mut self, ch: char, style: FontStyle) {
+        // Walk the style's chain to find a font with the codepoint.
+        // Variant primary first (when one exists), then the shared
+        // fallbacks. None match → cache empty so we don't retry next
+        // frame; same policy as before, just per-style now.
+        let font_idx = {
+            let chain: &[usize] = match style {
+                FontStyle::Regular => &self.chains_regular,
+                FontStyle::Bold => &self.chains_bold,
+                FontStyle::Italic => &self.chains_italic,
+                FontStyle::BoldItalic => &self.chains_bold_italic,
+            };
+            let mut found: Option<usize> = None;
+            for &idx in chain {
+                let Some(font) = self.fonts[idx].font() else {
+                    continue;
+                };
+                if font.charmap().map(ch) != 0 {
+                    found = Some(idx);
+                    break;
+                }
             }
-        }
-        let font_idx = match found {
+            found
+        };
+        let font_idx = match font_idx {
             Some(i) => i,
-            None if ch == '\0' => 0, // render primary's .notdef for a literal NUL
+            None if ch == '\0' => 0, // primary's .notdef for a literal NUL
             None => {
-                self.glyphs.insert(ch, GlyphEntry::default());
+                self.glyphs.insert((ch, style), GlyphEntry::default());
                 return;
             }
         };
@@ -202,14 +295,14 @@ impl FontAtlas {
         let ok = Render::new(&[Source::Outline, Source::Bitmap(StrikeWith::BestFit)])
             .render_into(&mut scaler, glyph_id, &mut image);
         if !ok {
-            self.glyphs.insert(ch, GlyphEntry::default());
+            self.glyphs.insert((ch, style), GlyphEntry::default());
             return;
         }
 
         let placement = image.placement;
         let (w, h) = (placement.width, placement.height);
         if w == 0 || h == 0 {
-            self.glyphs.insert(ch, GlyphEntry::default());
+            self.glyphs.insert((ch, style), GlyphEntry::default());
             return;
         }
 
@@ -218,7 +311,7 @@ impl FontAtlas {
             Some(a) => a,
             None => {
                 log::warn!("glyph atlas full, dropping {ch:?}");
-                self.glyphs.insert(ch, GlyphEntry::default());
+                self.glyphs.insert((ch, style), GlyphEntry::default());
                 return;
             }
         };
@@ -273,7 +366,7 @@ impl FontAtlas {
             h,
         });
         self.glyphs.insert(
-            ch,
+            (ch, style),
             GlyphEntry {
                 atlas_x: ax as u16,
                 atlas_y: ay as u16,
@@ -347,6 +440,68 @@ fn discover_font() -> Option<PathBuf> {
     None
 }
 
+/// All paths we'd accept as a Bold/Italic/BoldItalic variant of `primary`.
+/// Returned in priority order; `discover_variant` filters for the first
+/// one that exists. Pure path math — no filesystem access — so unit
+/// tests can assert on candidate construction without needing real
+/// fonts on disk.
+fn variant_candidates(primary: &Path, style: FontStyle) -> Vec<PathBuf> {
+    if matches!(style, FontStyle::Regular) {
+        return Vec::new();
+    }
+    let Some(stem) = primary.file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let ext = primary
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ttf");
+    let parent = primary.parent().unwrap_or_else(|| Path::new(""));
+
+    // Suffix variants in preference order. `Italic` is the canonical
+    // name; `Oblique` is what DejaVu and a few others use. For
+    // bold-italic we accept both forms plus `BoldOblique`.
+    let suffixes: &[&str] = match style {
+        FontStyle::Bold => &["Bold"],
+        FontStyle::Italic => &["Italic", "Oblique"],
+        FontStyle::BoldItalic => &["BoldItalic", "BoldOblique"],
+        FontStyle::Regular => unreachable!(),
+    };
+
+    let mut out = Vec::with_capacity(suffixes.len() * 2);
+    for s in suffixes {
+        // 1) Replace "-Regular" suffix on the stem (e.g. JetBrainsMono-Regular).
+        if let Some(rest) = stem.strip_suffix("-Regular") {
+            out.push(parent.join(format!("{rest}-{s}.{ext}")));
+        }
+        // 2) Append "-<suffix>" to the bare stem (e.g. DejaVuSansMono → DejaVuSansMono-Bold).
+        out.push(parent.join(format!("{stem}-{s}.{ext}")));
+    }
+    out
+}
+
+/// First existing variant for `style`, or `None` if no variant could be
+/// found. Honors `SOLTTY_FONT_BOLD` / `SOLTTY_FONT_ITALIC` /
+/// `SOLTTY_FONT_BOLD_ITALIC` env vars as overrides — useful for
+/// non-standard setups or to point at a different family entirely.
+fn discover_variant(primary: &Path, style: FontStyle) -> Option<PathBuf> {
+    let env_var = match style {
+        FontStyle::Bold => "SOLTTY_FONT_BOLD",
+        FontStyle::Italic => "SOLTTY_FONT_ITALIC",
+        FontStyle::BoldItalic => "SOLTTY_FONT_BOLD_ITALIC",
+        FontStyle::Regular => return None,
+    };
+    if let Ok(p) = std::env::var(env_var) {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    variant_candidates(primary, style)
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
 /// Broad-coverage fonts loaded after the primary so we can render symbols
 /// the primary lacks. JetBrainsMono is missing ballot boxes (U+2610-2612)
 /// and the geometric-shape range (U+25A0-25CF), among others; DejaVuSansMono
@@ -393,4 +548,101 @@ fn discover_fallback_fonts() -> Vec<PathBuf> {
 
 fn io_err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::NotFound, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_style_from_attrs() {
+        assert_eq!(FontStyle::from_attrs(false, false), FontStyle::Regular);
+        assert_eq!(FontStyle::from_attrs(true, false), FontStyle::Bold);
+        assert_eq!(FontStyle::from_attrs(false, true), FontStyle::Italic);
+        assert_eq!(FontStyle::from_attrs(true, true), FontStyle::BoldItalic);
+    }
+
+    #[test]
+    fn variant_replaces_regular_suffix() {
+        // Most distros lay out fonts as `Foo-Regular.ttf` / `Foo-Bold.ttf`;
+        // the candidate set should include the name swap.
+        let primary = Path::new("/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf");
+        let cands = variant_candidates(primary, FontStyle::Bold);
+        assert!(
+            cands
+                .iter()
+                .any(|p| p.ends_with("JetBrainsMono-Bold.ttf")),
+            "expected JetBrainsMono-Bold.ttf among {cands:?}"
+        );
+    }
+
+    #[test]
+    fn variant_appends_for_unsuffixed_stem() {
+        // DejaVuSansMono.ttf has no `-Regular` so we just append.
+        let primary = Path::new("/usr/share/fonts/TTF/DejaVuSansMono.ttf");
+        let cands = variant_candidates(primary, FontStyle::Bold);
+        assert!(cands
+            .iter()
+            .any(|p| p.ends_with("DejaVuSansMono-Bold.ttf")));
+    }
+
+    #[test]
+    fn variant_italic_accepts_oblique_alias() {
+        // DejaVu uses `Oblique` rather than `Italic`; both should be in
+        // the candidate set so the discovery succeeds.
+        let primary = Path::new("/usr/share/fonts/TTF/DejaVuSansMono.ttf");
+        let cands = variant_candidates(primary, FontStyle::Italic);
+        let has_italic = cands.iter().any(|p| p.ends_with("DejaVuSansMono-Italic.ttf"));
+        let has_oblique = cands.iter().any(|p| p.ends_with("DejaVuSansMono-Oblique.ttf"));
+        assert!(has_italic && has_oblique, "candidates: {cands:?}");
+    }
+
+    #[test]
+    fn variant_bold_italic_accepts_both_aliases() {
+        // Both `BoldItalic` and `BoldOblique` should be candidates so
+        // we work across font families.
+        let primary = Path::new("/x/foo.ttf");
+        let cands = variant_candidates(primary, FontStyle::BoldItalic);
+        assert!(cands.iter().any(|p| p.ends_with("foo-BoldItalic.ttf")));
+        assert!(cands.iter().any(|p| p.ends_with("foo-BoldOblique.ttf")));
+    }
+
+    #[test]
+    fn regular_returns_no_variant_candidates() {
+        // Regular is the *primary*, not a variant — there's no path
+        // search for it.
+        let primary = Path::new("/x/foo.ttf");
+        assert!(variant_candidates(primary, FontStyle::Regular).is_empty());
+    }
+
+    /// Integration test: requires JetBrainsMono-Regular + -Bold to be
+    /// installed at the standard Arch path. Skips silently otherwise so
+    /// the CI-style minimal-image case still passes.
+    #[test]
+    fn atlas_distinguishes_bold_from_regular() {
+        let regular = Path::new("/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf");
+        let bold = Path::new("/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf");
+        if !regular.is_file() || !bold.is_file() {
+            eprintln!("skip: required JetBrainsMono Regular + Bold not installed");
+            return;
+        }
+        // Force discover_font to pick our known regular path so the
+        // test isn't sensitive to which font happens to come first in
+        // the candidate list.
+        std::env::set_var("SOLTTY_FONT", regular.as_os_str());
+
+        let mut atlas = FontAtlas::new(16.0).unwrap();
+        atlas.ensure('A', FontStyle::Regular);
+        atlas.ensure('A', FontStyle::Bold);
+        let r = atlas.get('A', FontStyle::Regular).unwrap();
+        let b = atlas.get('A', FontStyle::Bold).unwrap();
+        // Bold and regular get separate atlas slots — different positions.
+        assert_ne!(
+            (r.atlas_x, r.atlas_y),
+            (b.atlas_x, b.atlas_y),
+            "regular and bold ended up in the same atlas slot"
+        );
+
+        std::env::remove_var("SOLTTY_FONT");
+    }
 }

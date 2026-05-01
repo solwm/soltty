@@ -573,21 +573,39 @@ renderer drains that list each frame and uploads only the per-glyph
 sub-rectangles via `tex_sub_image_2d`. Steady state is no upload at all.
 See `docs/performance.md` for the per-rect upload mechanics.
 
-#### Font fallback chain
+#### Font chains (fallback + bold / italic)
+
+The atlas keys glyphs by `(char, FontStyle)` where `FontStyle` is one
+of `Regular`, `Bold`, `Italic`, `BoldItalic` derived from the cell's
+attribute bits in `Renderer::prepare`. Each style has its own search
+chain: a variant primary (e.g. `JetBrainsMono-Bold.ttf`) when one was
+discovered, followed by the shared fallback list.
 
 JetBrainsMono — our default primary — lacks ballot boxes (U+2610..2612),
 the geometric-shape range (U+25A0..25CF), and several other symbol
-blocks. Without a fallback those characters silently render as empty
+blocks. Without fallbacks those characters silently render as empty
 cells. So `FontAtlas::new` loads a small chain: the primary first, then
 broad-coverage fallbacks (DejaVuSansMono on Linux; Menlo/Monaco on
 macOS; Segoe UI Symbol on Windows) discovered by hand-probing fixed
 paths.
 
-`rasterize` walks the chain on each new glyph, picks the first font
-whose `charmap.map(ch) != 0`, and rasterizes from that one. Cell
-metrics still come from the primary, so a fallback glyph wider than the
-primary's advance gets clipped to the cell — acceptable since the
-alternative is "doesn't render at all".
+Bold / italic variant discovery uses suffix substitution on the primary
+path: `JetBrainsMono-Regular.ttf` → `JetBrainsMono-Bold.ttf` /
+`-Italic.ttf` / `-BoldItalic.ttf`. Names without `-Regular` get the
+suffix appended (e.g. `DejaVuSansMono.ttf` →
+`DejaVuSansMono-Bold.ttf`). Italic accepts both `Italic` and `Oblique`
+since DejaVu and a few others use the latter. `SOLTTY_FONT_BOLD`,
+`SOLTTY_FONT_ITALIC`, `SOLTTY_FONT_BOLD_ITALIC` env vars override the
+search.
+
+When no variant exists for a style, the chain is just the (regular)
+fallback list — a bold cell shows in regular DejaVu, weight-less but
+still legible. The alternative (empty cell) is worse.
+
+`rasterize(ch, style)` walks the chain for that style, picks the first
+font whose `charmap.map(ch) != 0`, and rasterizes. Cell metrics still
+come from the primary, so a fallback glyph wider than the primary's
+advance gets clipped to the cell.
 
 Color emoji (U+2705 ✅, U+274C ❌, etc.) deliberately stays outside the
 chain. Our atlas is alpha-only; doing color glyphs needs an RGBA path
@@ -874,10 +892,6 @@ Each step is on the order of a millisecond. There's no visible hitch.
 
 Roughly in order of "you might miss it":
 
-- **Bold/italic font variants.** SGR bold currently changes the cell's
-  attribute bits but the renderer ignores them — every glyph uses the
-  regular face. Adding bold/italic means loading bold/italic TTF files
-  and indexing the atlas by `(face, glyph_id)` instead of `glyph_id`.
 - **Application cursor keys (DECCKM).** In some modes vim and tmux
   expect arrow keys to send `SS3 A/B/C/D` instead of `CSI A/B/C/D`. We
   always send `CSI`. Most things still work; specific edge cases in vim
