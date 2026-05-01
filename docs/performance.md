@@ -178,9 +178,6 @@ These weren't pure perf but came out of the same investigation:
   workaround was a UX papercut.
 - `14d5002` — DSR replies (`CSI 5 n`, `CSI 6 n`). Required for the
   bench harness to ping-and-wait correctly. See harness section.
-- The `--trace` HUD (`195bb08`) is a small EWMA-smoothed FPS
-  counter in the top-right corner. Useful for eyeballing render
-  rate under load. Code in `src/renderer.rs::FpsCounter`.
 
 ## The bench harness
 
@@ -327,9 +324,9 @@ someone hits it.
 
 ### Real frame-time histogram
 
-The `--trace` HUD shows EWMA fps, which smooths over jitter. A
-proper p50/p95/p99 frame-time histogram would surface stalls that
-EWMA hides. ~20 lines if anyone cares.
+A proper p50/p95/p99 frame-time histogram would surface stalls that a
+running average hides — useful when chasing a regression. ~20 lines
+if anyone cares.
 
 ## Where to look in the code
 
@@ -344,7 +341,6 @@ EWMA hides. ~20 lines if anyone cares.
 | Scroll row recycle     | `src/grid.rs::scroll_up_in_region` |
 | Atlas dirty rects      | `src/font.rs::FontAtlas::rasterize`, `dirty_rects: Vec<DirtyRect>` |
 | Atlas upload           | `src/renderer.rs::prepare` (the `atlas.dirty_rects` block) |
-| FPS HUD                | `src/renderer.rs::FpsCounter`, `append_fps_overlay` |
 | DSR-ping in benches    | `bench/src/lib.rs::ping_terminal` |
 
 ## Working on perf yourself
@@ -354,10 +350,7 @@ The shortest viable loop:
 1. `cargo build --release` (everything; bench crate too)
 2. `./bench/compare.sh --bench <name> --runs 5` for the axis you
    touched
-3. `./target/release/soltty --trace` and watch the HUD on a
-   real-world workload (try `find / 2>/dev/null` or a `cat` of a
-   big colorful log)
-4. For absolute claims, run gol-c with 3+ second sleeps between
+3. For absolute claims, run gol-c with 3+ second sleeps between
    runs and report the median of 5
 
 Don't trust a single `compare.sh` invocation to tell you anything

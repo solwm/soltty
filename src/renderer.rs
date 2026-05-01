@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use glow::HasContext;
 
 use crate::font::{FontAtlas, FontStyle};
@@ -8,47 +6,6 @@ use crate::picker::Picker;
 use crate::selection::Selection;
 use crate::term::Term;
 use crate::theme::Theme;
-
-/// Smoothed FPS tracker for the `--trace` HUD. A raw "1000/dt" number
-/// jitters wildly when frames are uneven — an EWMA reads as a steady
-/// value you can eyeball.
-struct FpsCounter {
-    last_paint: Option<Instant>,
-    /// Exponentially-weighted moving average of frame interval, in ms.
-    /// Zero = no second sample yet.
-    ewma_ms: f32,
-}
-
-impl FpsCounter {
-    const ALPHA: f32 = 0.1;
-
-    const fn new() -> Self {
-        Self {
-            last_paint: None,
-            ewma_ms: 0.0,
-        }
-    }
-
-    /// Call once per painted frame. Returns the current smoothed FPS,
-    /// or 0.0 before the second sample arrives.
-    fn tick(&mut self) -> f32 {
-        let now = Instant::now();
-        if let Some(prev) = self.last_paint {
-            let dt_ms = now.duration_since(prev).as_secs_f32() * 1000.0;
-            self.ewma_ms = if self.ewma_ms == 0.0 {
-                dt_ms
-            } else {
-                Self::ALPHA * dt_ms + (1.0 - Self::ALPHA) * self.ewma_ms
-            };
-        }
-        self.last_paint = Some(now);
-        if self.ewma_ms > 0.0 {
-            1000.0 / self.ewma_ms
-        } else {
-            0.0
-        }
-    }
-}
 
 /// One match in viewport coords. Built by App from `vi::Search` state
 /// before each frame and passed to `Renderer::prepare` so the cell loop
@@ -130,8 +87,6 @@ pub struct Renderer {
     /// Encoded shape: 0 = none, 1 = block, 2 = underline, 3 = bar,
     /// 4 = hollow block (vi-mode). Mirrors the fragment shader constants.
     cursor_shape_id: i32,
-
-    fps: FpsCounter,
 }
 
 impl Renderer {
@@ -208,7 +163,6 @@ impl Renderer {
             atlas_size: (atlas.atlas_w, atlas.atlas_h),
             cursor_cell: (-1, -1),
             cursor_shape_id: 0,
-            fps: FpsCounter::new(),
         };
         unsafe { renderer.upload_uniforms(gl) };
         renderer
@@ -272,7 +226,6 @@ impl Renderer {
         atlas: &mut FontAtlas,
         picker: Option<&mut Picker>,
         selection: Option<&Selection>,
-        trace: bool,
         cursor_visible_now: bool,
         vi_cursor: Option<(usize, usize)>,
         search: Option<&SearchOverlay<'_>>,
@@ -414,10 +367,6 @@ impl Renderer {
         // instances overwrite earlier ones at the same pixel.
         if let Some(picker) = picker {
             self.append_picker_overlay(picker, rows, cols, atlas);
-        }
-
-        if trace {
-            self.append_fps_overlay(rows, cols, atlas);
         }
 
         if !atlas.dirty_rects.is_empty() {
@@ -656,28 +605,6 @@ impl Renderer {
                 col,
                 origin_col + width - col,
             );
-        }
-    }
-
-    /// Tick the FPS counter and stamp `" 60.0 fps "` onto row 0 in the
-    /// top-right corner. Skipped silently if the grid is too narrow.
-    fn append_fps_overlay(&mut self, rows: usize, cols: usize, atlas: &mut FontAtlas) {
-        let fps = self.fps.tick();
-        if rows == 0 {
-            return;
-        }
-        let label: String = format!(" {fps:5.1} fps ");
-        let len = label.chars().count();
-        if cols < len {
-            return;
-        }
-        let col_start = cols - len;
-        // Cursor colors are the theme's "stand-out" pair — readable on
-        // top of any palette without us picking literal RGB.
-        let fg = self.cursor_fg;
-        let bg = self.cursor_bg;
-        for (i, ch) in label.chars().enumerate() {
-            self.push_overlay_cell(ch, 0, col_start + i, fg, bg, atlas);
         }
     }
 

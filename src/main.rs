@@ -113,7 +113,6 @@ fn main() {
         selection: None,
         last_click: None,
         clipboard: clipboard::Clipboard::new(),
-        trace: cli.trace,
         redraw_pending: false,
         dirty: false,
         last_render: None,
@@ -163,11 +162,6 @@ struct Cli {
         value_name = "CMD",
     )]
     command: Vec<String>,
-
-    /// Show a small FPS counter in the top-right corner. Useful for
-    /// eyeballing render-loop performance under load.
-    #[arg(long = "trace")]
-    trace: bool,
 }
 
 struct App {
@@ -194,8 +188,6 @@ struct App {
     /// select on rapid repeats.
     last_click: Option<(Instant, (usize, usize), u32)>,
     clipboard: clipboard::Clipboard,
-    /// `--trace`: draw an FPS counter overlay in the top-right corner.
-    trace: bool,
     /// While true, we've called `request_redraw` and the matching
     /// `RedrawRequested` hasn't fired yet. Suppresses extra calls.
     redraw_pending: bool,
@@ -512,7 +504,6 @@ impl ApplicationHandler<UserEvent> for App {
                     &self.term,
                     self.picker.as_mut(),
                     self.selection.as_ref(),
-                    self.trace,
                     cursor_visible,
                     vi_cursor,
                     self.vi.active,
