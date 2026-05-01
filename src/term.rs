@@ -15,6 +15,13 @@ pub struct Term {
     /// `ESC [ 200~ ... ESC [ 201~` so the application can distinguish
     /// pasted text from typed input.
     pub bracketed_paste: bool,
+    /// DECCKM (DECSET 1). When true, unmodified arrow keys + Home/End
+    /// emit `SS3 <letter>` (`ESC O A`) instead of `CSI <letter>`
+    /// (`ESC [ A`). Vim and tmux ask for this in some modes; emitting
+    /// the wrong form turns vim's normal-mode arrows into noise.
+    /// Modifier-encoded arrows (Shift/Ctrl/Alt) keep the `CSI 1;<m><L>`
+    /// form regardless — DECCKM only affects the unmodified path.
+    pub application_cursor_keys: bool,
     /// Bytes the parser wants to send back to the application (e.g. DSR
     /// cursor-position reports). Drained by the host loop after each
     /// `feed` and written to the PTY master.
@@ -31,6 +38,7 @@ impl Term {
             title: String::new(),
             viewport_offset: 0,
             bracketed_paste: false,
+            application_cursor_keys: false,
             reply: Vec::new(),
         }
     }
@@ -356,6 +364,7 @@ impl<'a> Performer<'a> {
         for sub in params.iter() {
             let n = sub.first().copied().unwrap_or(0);
             match n {
+                1 => self.term.application_cursor_keys = on,
                 25 => self.grid().cursor.visible = on,
                 47 | 1047 | 1049 => {
                     if on {
@@ -595,6 +604,23 @@ mod tests {
         t.feed(b"\x1b[?1049l"); // back to primary
         // Primary's shape preserved.
         assert_eq!(t.cursor_shape(), CursorShape::Bar);
+    }
+
+    #[test]
+    fn decckm_toggles_application_cursor_keys() {
+        let mut t = Term::new(2, 4);
+        // Default off.
+        assert!(!t.application_cursor_keys);
+        // DECSET 1 → on.
+        t.feed(b"\x1b[?1h");
+        assert!(t.application_cursor_keys);
+        // DECRESET 1 → off.
+        t.feed(b"\x1b[?1l");
+        assert!(!t.application_cursor_keys);
+        // Combined DECSET with multiple modes: only DECCKM should flip.
+        t.feed(b"\x1b[?1;2004h");
+        assert!(t.application_cursor_keys);
+        assert!(t.bracketed_paste);
     }
 
     #[test]

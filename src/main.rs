@@ -1086,7 +1086,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if let Some(pty) = self.pty.as_mut() {
-                    if let Some(bytes) = encode_key(&logical_key, text.as_deref(), self.modifiers) {
+                    if let Some(bytes) = encode_key(
+                        &logical_key,
+                        text.as_deref(),
+                        self.modifiers,
+                        self.term.application_cursor_keys,
+                    ) {
                         // Any keypress that produces output snaps the viewport
                         // back to the live grid — matches what every other
                         // terminal does and is what users expect.
@@ -1395,7 +1400,12 @@ fn grid_dims_for_window(cell_size: (u32, u32), w: u32, h: u32) -> (u16, u16) {
 
 /// Map a winit key event into the byte sequence a terminal expects.
 /// Returns None for keys with no associated output (modifier presses, dead keys).
-fn encode_key(logical: &Key, text: Option<&str>, mods: ModifiersState) -> Option<Vec<u8>> {
+fn encode_key(
+    logical: &Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
     let ctrl = mods.control_key();
     let alt = mods.alt_key();
     let shift = mods.shift_key();
@@ -1410,7 +1420,7 @@ fn encode_key(logical: &Key, text: Option<&str>, mods: ModifiersState) -> Option
 
     // Named keys with potentially modifier-encoded sequences.
     if let Key::Named(named) = logical {
-        if let Some(seq) = named_key_seq(*named, ctrl, alt, shift) {
+        if let Some(seq) = named_key_seq(*named, ctrl, alt, shift, app_cursor) {
             return Some(seq);
         }
     }
@@ -1457,10 +1467,18 @@ fn mod_param(ctrl: bool, alt: bool, shift: bool) -> u8 {
     1 + (shift as u8) + ((alt as u8) << 1) + ((ctrl as u8) << 2)
 }
 
-/// `CSI [1;<m>]<letter>` form (arrows, Home, End).
-fn csi_letter(letter: u8, m: u8) -> Vec<u8> {
+/// Cursor / Home / End encoding. Default form is `CSI [1;<m>]<letter>`
+/// (`ESC [ A` etc.), but in DECCKM application-cursor mode the
+/// *unmodified* form switches to the SS3 sequence `ESC O <letter>`.
+/// Modifier-encoded forms (`CSI 1;<m><letter>`) keep the CSI form
+/// regardless — DECCKM only swaps the no-modifier branch.
+fn csi_letter(letter: u8, m: u8, app_cursor: bool) -> Vec<u8> {
     if m == 1 {
-        vec![0x1b, b'[', letter]
+        if app_cursor {
+            vec![0x1b, b'O', letter]
+        } else {
+            vec![0x1b, b'[', letter]
+        }
     } else {
         format!("\x1b[1;{m}{}", letter as char).into_bytes()
     }
@@ -1475,7 +1493,13 @@ fn csi_tilde(n: u16, m: u8) -> Vec<u8> {
     }
 }
 
-fn named_key_seq(named: NamedKey, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<u8>> {
+fn named_key_seq(
+    named: NamedKey,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
     let m = mod_param(ctrl, alt, shift);
     Some(match named {
         NamedKey::Enter => {
@@ -1505,12 +1529,12 @@ fn named_key_seq(named: NamedKey, ctrl: bool, alt: bool, shift: bool) -> Option<
             }
         }
         NamedKey::Escape => vec![0x1b],
-        NamedKey::ArrowUp => csi_letter(b'A', m),
-        NamedKey::ArrowDown => csi_letter(b'B', m),
-        NamedKey::ArrowRight => csi_letter(b'C', m),
-        NamedKey::ArrowLeft => csi_letter(b'D', m),
-        NamedKey::Home => csi_letter(b'H', m),
-        NamedKey::End => csi_letter(b'F', m),
+        NamedKey::ArrowUp => csi_letter(b'A', m, app_cursor),
+        NamedKey::ArrowDown => csi_letter(b'B', m, app_cursor),
+        NamedKey::ArrowRight => csi_letter(b'C', m, app_cursor),
+        NamedKey::ArrowLeft => csi_letter(b'D', m, app_cursor),
+        NamedKey::Home => csi_letter(b'H', m, app_cursor),
+        NamedKey::End => csi_letter(b'F', m, app_cursor),
         NamedKey::PageUp => csi_tilde(5, m),
         NamedKey::PageDown => csi_tilde(6, m),
         NamedKey::Insert => csi_tilde(2, m),
@@ -1543,32 +1567,35 @@ mod key_tests {
     #[test]
     fn ctrl_c_emits_etx() {
         let mods = ModifiersState::CONTROL;
-        assert_eq!(encode_key(&ch("c"), None, mods), Some(vec![0x03]));
+        assert_eq!(encode_key(&ch("c"), None, mods, false), Some(vec![0x03]));
     }
 
     #[test]
     fn ctrl_d_emits_eot() {
         let mods = ModifiersState::CONTROL;
-        assert_eq!(encode_key(&ch("d"), None, mods), Some(vec![0x04]));
+        assert_eq!(encode_key(&ch("d"), None, mods, false), Some(vec![0x04]));
     }
 
     #[test]
     fn ctrl_open_bracket_is_escape() {
         let mods = ModifiersState::CONTROL;
-        assert_eq!(encode_key(&ch("["), None, mods), Some(vec![0x1b]));
+        assert_eq!(encode_key(&ch("["), None, mods, false), Some(vec![0x1b]));
     }
 
     #[test]
     fn alt_b_prefixes_with_escape() {
         let mods = ModifiersState::ALT;
-        assert_eq!(encode_key(&ch("b"), Some("b"), mods), Some(vec![0x1b, b'b']));
+        assert_eq!(
+            encode_key(&ch("b"), Some("b"), mods, false),
+            Some(vec![0x1b, b'b'])
+        );
     }
 
     #[test]
     fn shift_tab_emits_back_tab() {
         let mods = ModifiersState::SHIFT;
         assert_eq!(
-            encode_key(&Key::Named(NamedKey::Tab), None, mods),
+            encode_key(&Key::Named(NamedKey::Tab), None, mods, false),
             Some(b"\x1b[Z".to_vec())
         );
     }
@@ -1577,7 +1604,7 @@ mod key_tests {
     fn shift_arrow_uses_modifier_param() {
         let mods = ModifiersState::SHIFT;
         assert_eq!(
-            encode_key(&Key::Named(NamedKey::ArrowUp), None, mods),
+            encode_key(&Key::Named(NamedKey::ArrowUp), None, mods, false),
             Some(b"\x1b[1;2A".to_vec())
         );
     }
@@ -1586,7 +1613,7 @@ mod key_tests {
     fn ctrl_arrow_uses_modifier_param() {
         let mods = ModifiersState::CONTROL;
         assert_eq!(
-            encode_key(&Key::Named(NamedKey::ArrowRight), None, mods),
+            encode_key(&Key::Named(NamedKey::ArrowRight), None, mods, false),
             Some(b"\x1b[1;5C".to_vec())
         );
     }
@@ -1594,6 +1621,88 @@ mod key_tests {
     #[test]
     fn plain_char_passthrough() {
         let mods = ModifiersState::empty();
-        assert_eq!(encode_key(&ch("a"), Some("a"), mods), Some(vec![b'a']));
+        assert_eq!(
+            encode_key(&ch("a"), Some("a"), mods, false),
+            Some(vec![b'a'])
+        );
+    }
+
+    // ---------- DECCKM (application cursor keys) ----------
+
+    #[test]
+    fn decckm_off_emits_csi_arrows() {
+        // Default mode: arrows are CSI A/B/C/D.
+        let mods = ModifiersState::empty();
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowUp), None, mods, false),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Home), None, mods, false),
+            Some(b"\x1b[H".to_vec())
+        );
+    }
+
+    #[test]
+    fn decckm_on_swaps_unmodified_arrows_to_ss3() {
+        // App-cursor mode: unmodified arrows + Home/End become SS3 form
+        // (`ESC O <letter>`), which is what vim/tmux ask for.
+        let mods = ModifiersState::empty();
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowUp), None, mods, true),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowDown), None, mods, true),
+            Some(b"\x1bOB".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowRight), None, mods, true),
+            Some(b"\x1bOC".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowLeft), None, mods, true),
+            Some(b"\x1bOD".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Home), None, mods, true),
+            Some(b"\x1bOH".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::End), None, mods, true),
+            Some(b"\x1bOF".to_vec())
+        );
+    }
+
+    #[test]
+    fn decckm_on_keeps_csi_form_with_modifiers() {
+        // DECCKM only affects unmodified arrows. Shift/Ctrl/Alt+arrow
+        // still uses the CSI 1;<m><letter> form so xterm modifier
+        // encoding stays intact.
+        let shift = ModifiersState::SHIFT;
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowUp), None, shift, true),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowRight), None, ctrl, true),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+    }
+
+    #[test]
+    fn decckm_does_not_affect_pageup_or_function_keys() {
+        // PageUp/PageDown/Insert/Delete/Fn use the tilde form, which
+        // DECCKM doesn't touch — only arrows + Home/End swap to SS3.
+        let mods = ModifiersState::empty();
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::PageUp), None, mods, true),
+            Some(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::F5), None, mods, true),
+            Some(b"\x1b[15~".to_vec())
+        );
     }
 }
