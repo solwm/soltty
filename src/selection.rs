@@ -232,6 +232,21 @@ mod tests {
     }
 
     #[test]
+    fn extract_skips_wide_char_spacer() {
+        use crate::term::Term;
+        let mut t = Term::new(2, 20);
+        // Two wide chars + ASCII tail. Each wide char takes 2 cells:
+        // [中][spacer][文][spacer][a][b]. Selection covers all of them.
+        t.feed("中文ab".as_bytes());
+        let mut sel = Selection::new((0, 0));
+        sel.end = (0, 5);
+        sel.dragging = false;
+        let text = extract_text(&t, &sel);
+        // Spacers shouldn't be re-emitted as duplicates of the wide char.
+        assert_eq!(text, "中文ab");
+    }
+
+    #[test]
     fn block_extract_preserves_internal_whitespace() {
         use crate::term::Term;
         let mut t = Term::new(2, 20);
@@ -268,7 +283,13 @@ pub fn extract_text(term: &Term, sel: &Selection) -> String {
                 } else {
                     cols
                 };
-                let line: String = r.cells[start..end].iter().map(|c| c.ch).collect();
+                // Skip width=0 spacers — they're the right half of a
+                // wide character; pulling them would double the glyph.
+                let line: String = r.cells[start..end]
+                    .iter()
+                    .filter(|c| c.width != 0)
+                    .map(|c| c.ch)
+                    .collect();
                 out.push_str(line.trim_end());
                 if row < er {
                     out.push('\n');
@@ -280,7 +301,11 @@ pub fn extract_text(term: &Term, sel: &Selection) -> String {
             let end = (c2 + 1).min(cols);
             for row in r1..=r2 {
                 let r = term.viewport_row(row);
-                let line: String = r.cells[c1..end].iter().map(|c| c.ch).collect();
+                let line: String = r.cells[c1..end]
+                    .iter()
+                    .filter(|c| c.width != 0)
+                    .map(|c| c.ch)
+                    .collect();
                 out.push_str(&line);
                 if row < r2 {
                     out.push('\n');

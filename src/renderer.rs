@@ -324,6 +324,13 @@ impl Renderer {
         for vrow in 0..rows {
             let row = term.viewport_row(vrow);
             for (col_idx, cell) in row.cells.iter().take(cols).enumerate() {
+                // Spacer cells (the right half of a wide character)
+                // don't get their own instance — the leading cell's
+                // wide glyph already covers them via a second instance
+                // emitted below.
+                if cell.width == 0 {
+                    continue;
+                }
                 let style = FontStyle::from_attrs(
                     cell.attrs.has(CellAttrs::BOLD),
                     cell.attrs.has(CellAttrs::ITALIC),
@@ -374,6 +381,24 @@ impl Renderer {
                     fg,
                     bg,
                 });
+                // Wide leading: emit a second instance covering the
+                // right half. The shifted glyph_offset makes the shader
+                // sample the right half of the atlas glyph, so the two
+                // instances together render the wide character across
+                // both cells.
+                if cell.width == 2 && col_idx + 1 < cols {
+                    self.instances_scratch.push(CellInstance {
+                        cell_xy: [(col_idx + 1) as u32, vrow as u32],
+                        glyph_origin: [glyph.atlas_x as u32, glyph.atlas_y as u32],
+                        glyph_size: [glyph.w as u32, glyph.h as u32],
+                        glyph_offset: [
+                            glyph.offset_x as i32 - self.cell_size.0 as i32,
+                            glyph.offset_y as i32,
+                        ],
+                        fg,
+                        bg,
+                    });
+                }
             }
         }
 

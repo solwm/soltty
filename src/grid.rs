@@ -1,5 +1,59 @@
 use std::collections::VecDeque;
 
+/// Approximate East Asian Wide / Fullwidth detection. Returns 2 for
+/// codepoints that should occupy two terminal cells (CJK Unified
+/// Ideographs, Kana, Hangul, fullwidth forms, common emoji blocks);
+/// 1 for everything else.
+///
+/// This is hand-rolled from the obvious EAW=W/F ranges rather than
+/// pulling in `unicode-width` — coverage is ~98% of typical CJK use,
+/// and rare codepoints we miss simply render as width 1 (slightly
+/// misaligned, not broken). If a user reports a missing range we add
+/// it; the alternative (a multi-thousand-line table) is more code than
+/// the rest of the grid module combined.
+pub fn char_width(ch: char) -> u8 {
+    let c = ch as u32;
+    let wide = matches!(
+        c,
+        // CJK Symbols & Punctuation, Hiragana, Katakana, Bopomofo,
+        // Hangul Compatibility Jamo, Kanbun, Bopomofo Extended,
+        // CJK Strokes, Katakana Phonetic Extensions, Enclosed CJK,
+        // CJK Compatibility, CJK Ext A
+        0x3000..=0x303E
+            | 0x3040..=0x309F
+            | 0x30A0..=0x30FF
+            | 0x3100..=0x312F
+            | 0x3130..=0x318F
+            | 0x31C0..=0x31EF
+            | 0x31F0..=0x31FF
+            | 0x3200..=0x32FF
+            | 0x3300..=0x33FF
+            | 0x3400..=0x4DBF
+            // CJK Unified Ideographs (main block)
+            | 0x4E00..=0x9FFF
+            // Yi Syllables / Yi Radicals
+            | 0xA000..=0xA4CF
+            // Hangul Syllables
+            | 0xAC00..=0xD7A3
+            // CJK Compatibility Ideographs
+            | 0xF900..=0xFAFF
+            // Vertical Forms / CJK Compatibility Forms
+            | 0xFE30..=0xFE4F
+            // Fullwidth Forms (ASCII range fullwidth — but NOT halfwidth)
+            | 0xFF00..=0xFF60
+            // Fullwidth signs (¥ etc.)
+            | 0xFFE0..=0xFFE6
+            // Common emoji blocks (most are wide in monospace contexts)
+            | 0x1F300..=0x1F5FF
+            | 0x1F600..=0x1F64F
+            | 0x1F680..=0x1F6FF
+            | 0x1F900..=0x1F9FF
+            // CJK Unified Ideographs Extensions B-G
+            | 0x20000..=0x2FFFD
+    );
+    if wide { 2 } else { 1 }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Color {
     Default,
@@ -44,6 +98,11 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: CellAttrs,
+    /// Cell width category:
+    ///   1 = single-width (the common case)
+    ///   2 = leading half of a wide character (CJK / fullwidth / emoji)
+    ///   0 = spacer right of a wide character (no glyph of its own)
+    pub width: u8,
 }
 
 impl Default for Cell {
@@ -53,6 +112,7 @@ impl Default for Cell {
             fg: Color::Default,
             bg: Color::Default,
             attrs: CellAttrs::default(),
+            width: 1,
         }
     }
 }
@@ -117,6 +177,7 @@ impl Pen {
             fg: self.fg,
             bg: self.bg,
             attrs: CellAttrs::default(),
+            width: 1,
         }
     }
 }
@@ -183,11 +244,22 @@ impl Grid {
     }
 
     pub fn put_char(&mut self, ch: char) {
+        let width = char_width(ch);
+
         if self.cursor.wrap_next {
             self.cursor.col = 0;
             self.line_feed();
             self.cursor.wrap_next = false;
         }
+
+        // A wide character that would straddle the right edge can't be
+        // placed where it stands — wrap first so it lands intact at the
+        // start of the next row.
+        if width == 2 && self.cursor.col + 1 >= self.cols {
+            self.cursor.col = 0;
+            self.line_feed();
+        }
+
         let r = self.cursor.row;
         let c = self.cursor.col;
         if r < self.rows && c < self.cols {
@@ -196,11 +268,27 @@ impl Grid {
             cell.fg = self.pen.fg;
             cell.bg = self.pen.bg;
             cell.attrs = self.pen.attrs;
+            cell.width = width;
+            // For a wide leading, mark the next cell as a spacer
+            // (width=0) carrying the same bg/fg so the bg paints
+            // continuously across both cells. The spacer's ch is just
+            // ' ' — the leading's glyph is what actually gets drawn,
+            // spanning both cells in the renderer.
+            if width == 2 && c + 1 < self.cols {
+                let spacer = &mut self.lines[r].cells[c + 1];
+                spacer.ch = ' ';
+                spacer.fg = self.pen.fg;
+                spacer.bg = self.pen.bg;
+                spacer.attrs = self.pen.attrs;
+                spacer.width = 0;
+            }
         }
-        if c + 1 >= self.cols {
+
+        let advance = width as usize;
+        if c + advance >= self.cols {
             self.cursor.wrap_next = true;
         } else {
-            self.cursor.col = c + 1;
+            self.cursor.col = c + advance;
         }
     }
 
@@ -425,5 +513,102 @@ impl Grid {
             self.cursor = cur;
             self.pen = pen;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn char_width_ascii_is_single() {
+        assert_eq!(char_width('A'), 1);
+        assert_eq!(char_width(' '), 1);
+        assert_eq!(char_width('5'), 1);
+        assert_eq!(char_width('!'), 1);
+    }
+
+    #[test]
+    fn char_width_latin_extended_stays_single() {
+        // Accented Latin and Cyrillic are single-width in monospace.
+        assert_eq!(char_width('é'), 1);
+        assert_eq!(char_width('ñ'), 1);
+        assert_eq!(char_width('Я'), 1);
+    }
+
+    #[test]
+    fn char_width_cjk_unified_is_wide() {
+        assert_eq!(char_width('中'), 2);
+        assert_eq!(char_width('文'), 2);
+        assert_eq!(char_width('日'), 2);
+    }
+
+    #[test]
+    fn char_width_kana_and_hangul() {
+        assert_eq!(char_width('あ'), 2); // Hiragana
+        assert_eq!(char_width('カ'), 2); // Katakana
+        assert_eq!(char_width('한'), 2); // Hangul
+    }
+
+    #[test]
+    fn char_width_fullwidth_forms_are_wide() {
+        // Fullwidth ASCII letters / digits.
+        assert_eq!(char_width('Ａ'), 2);
+        assert_eq!(char_width('１'), 2);
+    }
+
+    #[test]
+    fn char_width_box_drawing_is_single() {
+        // Box-drawing chars are EAW=N → width 1, even though they look
+        // similar to wide chars culturally.
+        assert_eq!(char_width('┌'), 1);
+        assert_eq!(char_width('☐'), 1);
+    }
+
+    #[test]
+    fn put_char_wide_advances_by_two_and_marks_spacer() {
+        let mut g = Grid::new(3, 10, 0);
+        // Pen carries SGR attrs / colors that should propagate to the
+        // spacer too so the bg paints continuously.
+        g.pen.fg = Color::Indexed(2);
+        g.put_char('中');
+        assert_eq!(g.cursor.col, 2);
+        assert_eq!(g.lines[0].cells[0].ch, '中');
+        assert_eq!(g.lines[0].cells[0].width, 2);
+        assert_eq!(g.lines[0].cells[1].width, 0);
+        assert_eq!(g.lines[0].cells[1].fg, Color::Indexed(2));
+    }
+
+    #[test]
+    fn put_char_wide_at_right_edge_wraps_first() {
+        let mut g = Grid::new(3, 5, 0);
+        // Move cursor to last column.
+        g.put_char('a');
+        g.put_char('b');
+        g.put_char('c');
+        g.put_char('d');
+        // Now cursor is at col=4 (the last cell). A wide char here
+        // can't fit — should wrap to next row before placing.
+        g.put_char('中');
+        assert_eq!(g.cursor.row, 1);
+        assert_eq!(g.cursor.col, 2);
+        assert_eq!(g.lines[1].cells[0].ch, '中');
+        assert_eq!(g.lines[1].cells[0].width, 2);
+        assert_eq!(g.lines[1].cells[1].width, 0);
+    }
+
+    #[test]
+    fn put_char_normal_followed_by_wide_lays_out_correctly() {
+        let mut g = Grid::new(2, 10, 0);
+        g.put_char('a');
+        g.put_char('中');
+        g.put_char('b');
+        assert_eq!(g.lines[0].cells[0].ch, 'a');
+        assert_eq!(g.lines[0].cells[0].width, 1);
+        assert_eq!(g.lines[0].cells[1].ch, '中');
+        assert_eq!(g.lines[0].cells[1].width, 2);
+        assert_eq!(g.lines[0].cells[2].width, 0); // spacer
+        assert_eq!(g.lines[0].cells[3].ch, 'b');
+        assert_eq!(g.cursor.col, 4);
     }
 }
