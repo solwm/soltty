@@ -271,7 +271,15 @@ impl ApplicationHandler<UserEvent> for App {
 
         let inner = window.inner_size();
         let (rows, cols) = grid_dims_for_window(gpu.cell_size(), inner.width, inner.height);
-        let term = Term::new(rows as usize, cols as usize);
+        let mut term = Term::new(rows as usize, cols as usize);
+        // Seed the OSC-color cache so OSC 10/11/12 queries from a
+        // freshly-spawned shell get accurate values on the very first
+        // exchange.
+        term.set_theme_colors(
+            initial_theme.fg,
+            initial_theme.bg,
+            initial_theme.cursor_bg,
+        );
 
         let proxy_data = self.proxy.clone();
         let proxy_exit = self.proxy.clone();
@@ -662,27 +670,27 @@ impl ApplicationHandler<UserEvent> for App {
                     match &logical_key {
                         Key::Named(ArrowUp) => {
                             picker.move_up();
-                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
                         }
                         Key::Named(ArrowDown) => {
                             picker.move_down();
-                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
                         }
                         Key::Named(PageUp) => {
                             picker.page_up(8);
-                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
                         }
                         Key::Named(PageDown) => {
                             picker.page_down(8);
-                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
                         }
                         Key::Named(Home) => {
                             picker.home();
-                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
                         }
                         Key::Named(End) => {
                             picker.end();
-                            apply_picker_preview(gpu, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
                         }
                         Key::Named(Enter) => {
                             // Commit current selection.
@@ -694,6 +702,11 @@ impl ApplicationHandler<UserEvent> for App {
                             // Restore the original theme.
                             let original = picker.cancel(&self.theme_lib).clone();
                             gpu.set_theme(&original);
+                            self.term.set_theme_colors(
+                                original.fg,
+                                original.bg,
+                                original.cursor_bg,
+                            );
                             self.active_theme_name = original.name;
                             self.picker = None;
                         }
@@ -1358,9 +1371,15 @@ fn search_navigate(vi_state: &mut vi::ViMode, term: &mut Term, reverse: bool) {
     vi_state.cursor = (new_vrow, m.col_start);
 }
 
-fn apply_picker_preview(gpu: &mut Gpu, picker: &picker::Picker, lib: &theme::ThemeLib) {
+fn apply_picker_preview(
+    gpu: &mut Gpu,
+    term: &mut Term,
+    picker: &picker::Picker,
+    lib: &theme::ThemeLib,
+) {
     let theme = picker.current(lib);
     gpu.set_theme(theme);
+    term.set_theme_colors(theme.fg, theme.bg, theme.cursor_bg);
 }
 
 /// Write pasted text to the PTY, optionally wrapped in bracketed-paste

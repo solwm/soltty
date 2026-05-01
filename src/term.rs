@@ -22,6 +22,15 @@ pub struct Term {
     /// Modifier-encoded arrows (Shift/Ctrl/Alt) keep the `CSI 1;<m><L>`
     /// form regardless — DECCKM only affects the unmodified path.
     pub application_cursor_keys: bool,
+    /// Cached theme colors (sRGB). Used to answer `OSC 10/11/12;?`
+    /// queries — neovim and tmux ask the terminal for these to pick
+    /// contrasting colors. App keeps them in sync with the active
+    /// theme via `set_theme_colors`. Sets via `OSC 10/11/12;<color>`
+    /// are *ignored* — the theme owns the colors, and apps that try
+    /// to override them shouldn't get to.
+    pub default_fg: [u8; 3],
+    pub default_bg: [u8; 3],
+    pub cursor_color: [u8; 3],
     /// Bytes the parser wants to send back to the application (e.g. DSR
     /// cursor-position reports). Drained by the host loop after each
     /// `feed` and written to the PTY master.
@@ -39,8 +48,23 @@ impl Term {
             viewport_offset: 0,
             bracketed_paste: false,
             application_cursor_keys: false,
+            // Until App calls set_theme_colors, OSC color queries
+            // return all-black. App sets them right after construction
+            // in `resumed`, so this only affects the very first frame.
+            default_fg: [0, 0, 0],
+            default_bg: [0, 0, 0],
+            cursor_color: [0, 0, 0],
             reply: Vec::new(),
         }
+    }
+
+    /// Update the cached theme colors so OSC 10/11/12 queries return
+    /// the right values. App calls this on startup and after every
+    /// theme change.
+    pub fn set_theme_colors(&mut self, fg: [u8; 3], bg: [u8; 3], cursor: [u8; 3]) {
+        self.default_fg = fg;
+        self.default_bg = bg;
+        self.cursor_color = cursor;
     }
 
     /// Hand back any pending reply bytes (e.g. from DSR), clearing the
@@ -312,14 +336,44 @@ impl<'a> Perform for Performer<'a> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // Window/icon title: OSC 0;<title> or OSC 2;<title>.
-        if let [code, rest @ ..] = params {
-            if matches!(*code, b"0" | b"2") {
-                let title: Vec<u8> = rest.iter().flat_map(|p| p.iter().copied()).collect();
-                if let Ok(s) = std::str::from_utf8(&title) {
+        let Some(code) = params.first().copied() else {
+            return;
+        };
+        let payload: Vec<u8> = params[1..].iter().flat_map(|p| p.iter().copied()).collect();
+        match code {
+            b"0" | b"2" => {
+                // Window / icon title.
+                if let Ok(s) = std::str::from_utf8(&payload) {
                     self.term.title = s.to_owned();
                 }
             }
+            b"10" | b"11" | b"12" => {
+                // Default fg / bg / cursor color. Apps query with
+                // payload="?" to learn our theme; sets are ignored
+                // because the theme is the source of truth.
+                if payload == b"?" {
+                    let (n, color) = match code {
+                        b"10" => (10u8, self.term.default_fg),
+                        b"11" => (11u8, self.term.default_bg),
+                        b"12" => (12u8, self.term.cursor_color),
+                        _ => unreachable!(),
+                    };
+                    // xterm-style reply: `OSC <n>; rgb:RRRR/GGGG/BBBB
+                    // BEL`. Each component is 16-bit so we double the
+                    // 8-bit byte (`5e -> 5e5e`); apps that want the
+                    // truncated value just look at the high half.
+                    let resp = format!(
+                        "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x07",
+                        n,
+                        color[0], color[0],
+                        color[1], color[1],
+                        color[2], color[2],
+                    );
+                    self.term.reply.extend_from_slice(resp.as_bytes());
+                }
+                // Set requests are intentionally not honored.
+            }
+            _ => {}
         }
     }
 
@@ -604,6 +658,48 @@ mod tests {
         t.feed(b"\x1b[?1049l"); // back to primary
         // Primary's shape preserved.
         assert_eq!(t.cursor_shape(), CursorShape::Bar);
+    }
+
+    #[test]
+    fn osc_11_query_reports_default_bg() {
+        let mut t = Term::new(2, 4);
+        t.set_theme_colors([0xab, 0xcd, 0xef], [0x12, 0x34, 0x56], [0xff, 0xff, 0xff]);
+        // OSC 11 ; ? BEL  → query for default background.
+        t.feed(b"\x1b]11;?\x07");
+        let reply = t.take_reply();
+        let s = std::str::from_utf8(&reply).unwrap();
+        // Both 8-bit halves of each component should appear (16-bit
+        // form). Component bytes are 12 / 34 / 56 → "1212/3434/5656".
+        assert!(s.starts_with("\x1b]11;rgb:1212/3434/5656"));
+        assert!(s.ends_with('\x07'));
+    }
+
+    #[test]
+    fn osc_10_and_12_query_use_their_colors() {
+        let mut t = Term::new(2, 4);
+        t.set_theme_colors([0x10, 0x20, 0x30], [0x99, 0x88, 0x77], [0xaa, 0xbb, 0xcc]);
+        t.feed(b"\x1b]10;?\x07");
+        let r = t.take_reply();
+        assert!(std::str::from_utf8(&r)
+            .unwrap()
+            .starts_with("\x1b]10;rgb:1010/2020/3030"));
+        t.feed(b"\x1b]12;?\x07");
+        let r = t.take_reply();
+        assert!(std::str::from_utf8(&r)
+            .unwrap()
+            .starts_with("\x1b]12;rgb:aaaa/bbbb/cccc"));
+    }
+
+    #[test]
+    fn osc_11_set_request_is_ignored() {
+        let mut t = Term::new(2, 4);
+        let original_bg = [0x28, 0x2a, 0x36];
+        t.set_theme_colors([0xff, 0xff, 0xff], original_bg, [0xaa, 0xbb, 0xcc]);
+        // App tries to override the background.
+        t.feed(b"\x1b]11;rgb:ff0000\x07");
+        // No reply (it wasn't a query) and the cached bg didn't change.
+        assert!(t.take_reply().is_empty());
+        assert_eq!(t.default_bg, original_bg);
     }
 
     #[test]
