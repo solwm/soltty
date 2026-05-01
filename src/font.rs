@@ -97,8 +97,14 @@ pub struct FontAtlas {
     /// Per-glyph rects added to the atlas since the last GPU upload.
     /// Empty == clean, no upload needed.
     pub dirty_rects: Vec<DirtyRect>,
-    /// Keyed by `(codepoint, style)` so the same char can have separate
-    /// regular / bold / italic / bold-italic entries.
+    /// ASCII (0..=0x7F) × 4 styles = 512 slots, direct-indexed. Avoids
+    /// the HashMap hash for the 95%+ case (typical workloads are
+    /// overwhelmingly ASCII). `None` = not yet rasterized; `Some(empty)`
+    /// = no glyph in any chain font (cache the miss so we don't try
+    /// again next frame).
+    ascii_glyphs: [Option<GlyphEntry>; 128 * 4],
+    /// Keyed by `(codepoint, style)`. Holds non-ASCII codepoints that
+    /// fall through the ASCII array fast path.
     glyphs: HashMap<(char, FontStyle), GlyphEntry>,
     allocator: AtlasAllocator,
     scale_ctx: ScaleContext,
@@ -219,6 +225,7 @@ impl FontAtlas {
             atlas_h,
             atlas_data,
             dirty_rects: Vec::new(),
+            ascii_glyphs: [None; 128 * 4],
             glyphs: HashMap::new(),
             allocator,
             scale_ctx: ScaleContext::new(),
@@ -234,13 +241,40 @@ impl FontAtlas {
     }
 
     pub fn ensure(&mut self, ch: char, style: FontStyle) {
-        if !self.glyphs.contains_key(&(ch, style)) {
-            self.rasterize(ch, style);
+        let c = ch as u32;
+        if c < 128 {
+            // Hot path: ASCII array. One bounds-checked load to see if
+            // we already have it.
+            let idx = (c as usize) * 4 + style as usize;
+            if self.ascii_glyphs[idx].is_some() {
+                return;
+            }
+        } else if self.glyphs.contains_key(&(ch, style)) {
+            return;
         }
+        self.rasterize(ch, style);
     }
 
     pub fn get(&self, ch: char, style: FontStyle) -> Option<GlyphEntry> {
-        self.glyphs.get(&(ch, style)).copied()
+        let c = ch as u32;
+        if c < 128 {
+            // Direct index, no hash. ~10ns vs ~30ns for the HashMap
+            // path; matters because this is called per-cell per-frame.
+            self.ascii_glyphs[(c as usize) * 4 + style as usize]
+        } else {
+            self.glyphs.get(&(ch, style)).copied()
+        }
+    }
+
+    /// Internal: store a freshly-rasterized glyph. Picks ASCII array
+    /// vs. HashMap by codepoint range.
+    fn store_glyph(&mut self, ch: char, style: FontStyle, entry: GlyphEntry) {
+        let c = ch as u32;
+        if c < 128 {
+            self.ascii_glyphs[(c as usize) * 4 + style as usize] = Some(entry);
+        } else {
+            self.glyphs.insert((ch, style), entry);
+        }
     }
 
     fn rasterize(&mut self, ch: char, style: FontStyle) {
@@ -271,7 +305,7 @@ impl FontAtlas {
             Some(i) => i,
             None if ch == '\0' => 0, // primary's .notdef for a literal NUL
             None => {
-                self.glyphs.insert((ch, style), GlyphEntry::default());
+                self.store_glyph(ch, style, GlyphEntry::default());
                 return;
             }
         };
@@ -297,14 +331,14 @@ impl FontAtlas {
         let ok = Render::new(&[Source::Outline, Source::Bitmap(StrikeWith::BestFit)])
             .render_into(&mut scaler, glyph_id, &mut image);
         if !ok {
-            self.glyphs.insert((ch, style), GlyphEntry::default());
+            self.store_glyph(ch, style, GlyphEntry::default());
             return;
         }
 
         let placement = image.placement;
         let (w, h) = (placement.width, placement.height);
         if w == 0 || h == 0 {
-            self.glyphs.insert((ch, style), GlyphEntry::default());
+            self.store_glyph(ch, style, GlyphEntry::default());
             return;
         }
 
@@ -313,7 +347,7 @@ impl FontAtlas {
             Some(a) => a,
             None => {
                 log::warn!("glyph atlas full, dropping {ch:?}");
-                self.glyphs.insert((ch, style), GlyphEntry::default());
+                self.store_glyph(ch, style, GlyphEntry::default());
                 return;
             }
         };
@@ -367,8 +401,9 @@ impl FontAtlas {
             w,
             h,
         });
-        self.glyphs.insert(
-            (ch, style),
+        self.store_glyph(
+            ch,
+            style,
             GlyphEntry {
                 atlas_x: ax as u16,
                 atlas_y: ay as u16,

@@ -334,12 +334,22 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let blinking = self.cursor_blinks();
+        // Pre-screen: if there's nothing dirty and we're not blinking,
+        // there's no work to schedule. Skip the clock_gettime entirely
+        // — `about_to_wait` fires after every winit poll, and during a
+        // chatty PTY drain that's tens of thousands of times per
+        // bench. Adds up.
+        if !self.dirty && !blinking {
+            return;
+        }
+
         let now = Instant::now();
 
         // If the cursor is in a blinking shape and the phase boundary has
         // passed since our last paint, mark dirty so the throttle path
         // below repaints to flip the cursor on/off.
-        if self.cursor_blinks() && !self.redraw_pending {
+        if blinking && !self.redraw_pending {
             if let Some(last) = self.last_render {
                 if self.cursor_visible_now(last) != self.cursor_visible_now(now) {
                     self.dirty = true;
@@ -354,7 +364,7 @@ impl ApplicationHandler<UserEvent> for App {
             // Nothing to paint right now, but if the cursor is blinking
             // we still need to wake at the next phase boundary so the
             // toggle isn't delayed indefinitely waiting for input.
-            if !self.redraw_pending && self.cursor_blinks() {
+            if !self.redraw_pending && blinking {
                 event_loop
                     .set_control_flow(ControlFlow::WaitUntil(self.next_blink_toggle(now)));
             }
