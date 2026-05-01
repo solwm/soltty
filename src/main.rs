@@ -108,6 +108,8 @@ fn main() {
         blink_epoch: Instant::now(),
         vi: vi::ViMode::new(),
         vi_keybind: vi::ViKeyBind::from_env_or_default(),
+        held_buttons: 0,
+        last_reported_cell: None,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -204,6 +206,16 @@ struct App {
     /// Activation key for vi mode. Read from `SOLTTY_VI_KEY` at startup,
     /// defaults to Ctrl+Shift+Space.
     vi_keybind: vi::ViKeyBind,
+    /// Bit field of currently-held mouse buttons (bit 0 = left, 1 =
+    /// middle, 2 = right). Tracked here because winit only tells us
+    /// individual press/release events, but mouse-reporting modes
+    /// 1002/1003 need to know whether *any* button is held while
+    /// motion events fire (to attach the right button code).
+    held_buttons: u8,
+    /// Last cell we reported a motion event for. Mouse motion is
+    /// pixel-granular but the protocol is cell-granular; without dedup
+    /// a single drag floods the PTY with redundant events.
+    last_reported_cell: Option<(usize, usize)>,
 }
 
 /// Even with the per-display cap, we always paint immediately if we've
@@ -492,6 +504,51 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
+                let mode = self.term.mouse_mode;
+                let shift = self.modifiers.shift_key();
+                // Mouse-reporting forward path. Shift held = bypass
+                // (matches alacritty/xterm: hold Shift to escape an
+                // app's mouse grab and select text manually).
+                if mode != term::MouseMode::None && !shift {
+                    let want_motion = match mode {
+                        term::MouseMode::None => false,
+                        term::MouseMode::ButtonEvent => false,
+                        term::MouseMode::ButtonAndMotion => self.held_buttons != 0,
+                        term::MouseMode::AllMotion => true,
+                    };
+                    if want_motion {
+                        let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term);
+                        // Drop pixel-granular motion that didn't change
+                        // the cell — keeps a fast drag from drowning
+                        // the PTY in identical events.
+                        if self.last_reported_cell != Some(cell) {
+                            self.last_reported_cell = Some(cell);
+                            let button = if self.held_buttons & 0b001 != 0 {
+                                term::MouseButton::Left
+                            } else if self.held_buttons & 0b010 != 0 {
+                                term::MouseButton::Middle
+                            } else if self.held_buttons & 0b100 != 0 {
+                                term::MouseButton::Right
+                            } else {
+                                term::MouseButton::None
+                            };
+                            let event = term::MouseEvent {
+                                button,
+                                action: term::MouseAction::Motion,
+                                col: (cell.1 + 1) as u16,
+                                row: (cell.0 + 1) as u16,
+                                shift,
+                                alt: self.modifiers.alt_key(),
+                                ctrl: self.modifiers.control_key(),
+                            };
+                            if let Some(pty) = self.pty.as_mut() {
+                                pty.write(&term::encode_mouse(event, self.term.mouse_encoding));
+                            }
+                        }
+                    }
+                    return;
+                }
+                // Local selection path (existing behavior).
                 if let Some(sel) = self.selection.as_mut() {
                     if sel.dragging {
                         let (cw, ch) = gpu.cell_size();
@@ -518,6 +575,33 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                let mode = self.term.mouse_mode;
+                let shift = self.modifiers.shift_key();
+                if mode != term::MouseMode::None && !shift {
+                    // Update held mask first so motion handlers know
+                    // which button to attach to subsequent drag events.
+                    match state {
+                        ElementState::Pressed => self.held_buttons |= 0b001,
+                        ElementState::Released => self.held_buttons &= !0b001,
+                    }
+                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term);
+                    let event = term::MouseEvent {
+                        button: term::MouseButton::Left,
+                        action: match state {
+                            ElementState::Pressed => term::MouseAction::Press,
+                            ElementState::Released => term::MouseAction::Release,
+                        },
+                        col: (cell.1 + 1) as u16,
+                        row: (cell.0 + 1) as u16,
+                        shift,
+                        alt: self.modifiers.alt_key(),
+                        ctrl: self.modifiers.control_key(),
+                    };
+                    if let Some(pty) = self.pty.as_mut() {
+                        pty.write(&term::encode_mouse(event, self.term.mouse_encoding));
+                    }
+                    return;
+                }
                 let (cw, ch) = gpu.cell_size();
                 let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &self.term);
                 match state {
@@ -595,10 +679,40 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
+                state,
                 button: MouseButton::Middle,
                 ..
             } => {
+                let mode = self.term.mouse_mode;
+                let shift = self.modifiers.shift_key();
+                if mode != term::MouseMode::None && !shift {
+                    match state {
+                        ElementState::Pressed => self.held_buttons |= 0b010,
+                        ElementState::Released => self.held_buttons &= !0b010,
+                    }
+                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term);
+                    let event = term::MouseEvent {
+                        button: term::MouseButton::Middle,
+                        action: match state {
+                            ElementState::Pressed => term::MouseAction::Press,
+                            ElementState::Released => term::MouseAction::Release,
+                        },
+                        col: (cell.1 + 1) as u16,
+                        row: (cell.0 + 1) as u16,
+                        shift,
+                        alt: self.modifiers.alt_key(),
+                        ctrl: self.modifiers.control_key(),
+                    };
+                    if let Some(pty) = self.pty.as_mut() {
+                        pty.write(&term::encode_mouse(event, self.term.mouse_encoding));
+                    }
+                    return;
+                }
+                // Only the press triggers paste; ignore release in local
+                // mode (matches the original behavior).
+                if state != ElementState::Pressed {
+                    return;
+                }
                 // Middle-click pastes the primary selection — what most
                 // Linux apps do. Falls through to clipboard if there's no
                 // primary content.
@@ -616,10 +730,39 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let mode = self.term.mouse_mode;
+                let shift = self.modifiers.shift_key();
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_x, y) => (y * 3.0) as isize,
                     MouseScrollDelta::PixelDelta(p) => (p.y / 16.0) as isize,
                 };
+                if mode != term::MouseMode::None && !shift && lines != 0 {
+                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term);
+                    let button = if lines > 0 {
+                        term::MouseButton::WheelUp
+                    } else {
+                        term::MouseButton::WheelDown
+                    };
+                    let count = lines.unsigned_abs();
+                    if let Some(pty) = self.pty.as_mut() {
+                        // One event per line of scroll. Apps that
+                        // expect "tick events" map each one to their
+                        // own scroll amount.
+                        for _ in 0..count {
+                            let event = term::MouseEvent {
+                                button,
+                                action: term::MouseAction::Press,
+                                col: (cell.1 + 1) as u16,
+                                row: (cell.0 + 1) as u16,
+                                shift,
+                                alt: self.modifiers.alt_key(),
+                                ctrl: self.modifiers.control_key(),
+                            };
+                            pty.write(&term::encode_mouse(event, self.term.mouse_encoding));
+                        }
+                    }
+                    return;
+                }
                 if lines != 0 {
                     self.term.scroll_view(lines);
                     window.request_redraw();

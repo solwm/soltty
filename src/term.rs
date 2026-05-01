@@ -2,6 +2,131 @@ use vte::{Params, Parser, Perform};
 
 use crate::grid::{CellAttrs, Color, CursorShape, Grid, Row};
 
+/// What mouse events the application wants forwarded. `None` means the
+/// terminal handles mouse locally (selection). The variants correspond
+/// to xterm's DECSET modes:
+///   1000 = button press / release only
+///   1002 = button + drag (motion while a button is held)
+///   1003 = any motion, regardless of buttons
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum MouseMode {
+    #[default]
+    None,
+    ButtonEvent,
+    ButtonAndMotion,
+    AllMotion,
+}
+
+/// Wire format for forwarded mouse events. Apps pick this with another
+/// DECSET; SGR (1006) is the modern format and what every actively-
+/// maintained TUI prefers because it doesn't break past column 224.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum MouseEncoding {
+    /// Original X10/X11: `ESC [ M b+0x20 col+0x20 row+0x20`.
+    #[default]
+    Default,
+    /// DECSET 1006: `ESC [ < b ; col ; row M` (press) or `m` (release).
+    Sgr,
+}
+
+/// One mouse action ready to encode. Construct in main.rs from winit
+/// events; pass through `encode_mouse` to get the bytes for the PTY.
+#[derive(Copy, Clone, Debug)]
+pub struct MouseEvent {
+    pub button: MouseButton,
+    pub action: MouseAction,
+    /// 1-indexed column / row so it round-trips through the wire format
+    /// without further math.
+    pub col: u16,
+    pub row: u16,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    /// Scroll wheel up (button code 64).
+    WheelUp,
+    /// Scroll wheel down (button code 65).
+    WheelDown,
+    /// Used for motion events when no button is pressed.
+    None,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    /// Motion event (drag or any-motion, depending on mode). Encoded
+    /// with the motion bit set.
+    Motion,
+}
+
+/// Encode a `MouseEvent` for transmission to the PTY. Pure function so
+/// it's exhaustively unit-testable without setting up a Term.
+///
+/// Button code layout (xterm protocol): bit 0-1 = button, bit 2 =
+/// shift, bit 3 = alt, bit 4 = ctrl, bit 5 = motion, bit 6 = wheel.
+pub fn encode_mouse(event: MouseEvent, encoding: MouseEncoding) -> Vec<u8> {
+    // Base button bits.
+    let (mut b, is_release) = match (event.button, event.action) {
+        (MouseButton::Left, MouseAction::Press)
+        | (MouseButton::Left, MouseAction::Motion) => (0u8, false),
+        (MouseButton::Middle, MouseAction::Press)
+        | (MouseButton::Middle, MouseAction::Motion) => (1, false),
+        (MouseButton::Right, MouseAction::Press)
+        | (MouseButton::Right, MouseAction::Motion) => (2, false),
+        (MouseButton::None, MouseAction::Motion) => (3, false), // no-button motion
+        (MouseButton::Left, MouseAction::Release) => (0, true),
+        (MouseButton::Middle, MouseAction::Release) => (1, true),
+        (MouseButton::Right, MouseAction::Release) => (2, true),
+        (MouseButton::WheelUp, _) => (64, false),
+        (MouseButton::WheelDown, _) => (65, false),
+        (MouseButton::None, _) => (3, false),
+    };
+    if matches!(event.action, MouseAction::Motion) {
+        b |= 0x20; // motion bit
+    }
+    if event.shift {
+        b |= 0x04;
+    }
+    if event.alt {
+        b |= 0x08;
+    }
+    if event.ctrl {
+        b |= 0x10;
+    }
+
+    match encoding {
+        MouseEncoding::Sgr => {
+            let term = if is_release { 'm' } else { 'M' };
+            format!("\x1b[<{};{};{}{}", b, event.col, event.row, term).into_bytes()
+        }
+        MouseEncoding::Default => {
+            // Default form encodes release as button code 3 with the
+            // same modifier bits, regardless of which button. Convert
+            // here so the wire format matches what xterm sends.
+            let mut wire_b = if is_release {
+                // Strip the bottom two bits (the specific button) and
+                // OR in 3.
+                (b & !0x03) | 0x03
+            } else {
+                b
+            };
+            wire_b = wire_b.saturating_add(0x20);
+            // Default-form coords are clamped at 223 (because 0x20+223 = 0xff,
+            // the largest single-byte value before non-ASCII gets squirrely).
+            let cx = (event.col as u32 + 0x20).min(0xff) as u8;
+            let cy = (event.row as u32 + 0x20).min(0xff) as u8;
+            vec![0x1b, b'[', b'M', wire_b, cx, cy]
+        }
+    }
+}
+
 pub struct Term {
     primary: Grid,
     alt: Option<Grid>,
@@ -31,6 +156,13 @@ pub struct Term {
     pub default_fg: [u8; 3],
     pub default_bg: [u8; 3],
     pub cursor_color: [u8; 3],
+    /// What kind of mouse events the focused application wants
+    /// forwarded. None means soltty handles mouse locally (selection +
+    /// scroll). Set/cleared by DECSET 1000/1002/1003.
+    pub mouse_mode: MouseMode,
+    /// Wire format for forwarded events. Set by DECSET 1006 (SGR);
+    /// otherwise the original X10/X11 form.
+    pub mouse_encoding: MouseEncoding,
     /// Bytes the parser wants to send back to the application (e.g. DSR
     /// cursor-position reports). Drained by the host loop after each
     /// `feed` and written to the PTY master.
@@ -54,6 +186,8 @@ impl Term {
             default_fg: [0, 0, 0],
             default_bg: [0, 0, 0],
             cursor_color: [0, 0, 0],
+            mouse_mode: MouseMode::None,
+            mouse_encoding: MouseEncoding::Default,
             reply: Vec::new(),
         }
     }
@@ -420,6 +554,34 @@ impl<'a> Performer<'a> {
             match n {
                 1 => self.term.application_cursor_keys = on,
                 25 => self.grid().cursor.visible = on,
+                1000 => {
+                    self.term.mouse_mode = if on {
+                        MouseMode::ButtonEvent
+                    } else {
+                        MouseMode::None
+                    };
+                }
+                1002 => {
+                    self.term.mouse_mode = if on {
+                        MouseMode::ButtonAndMotion
+                    } else {
+                        MouseMode::None
+                    };
+                }
+                1003 => {
+                    self.term.mouse_mode = if on {
+                        MouseMode::AllMotion
+                    } else {
+                        MouseMode::None
+                    };
+                }
+                1006 => {
+                    self.term.mouse_encoding = if on {
+                        MouseEncoding::Sgr
+                    } else {
+                        MouseEncoding::Default
+                    };
+                }
                 47 | 1047 | 1049 => {
                     if on {
                         if n == 1049 {
@@ -700,6 +862,178 @@ mod tests {
         // No reply (it wasn't a query) and the cached bg didn't change.
         assert!(t.take_reply().is_empty());
         assert_eq!(t.default_bg, original_bg);
+    }
+
+    // ---------- Mouse reporting ----------
+
+    #[test]
+    fn decset_1000_enables_button_event_mode() {
+        let mut t = Term::new(2, 4);
+        assert_eq!(t.mouse_mode, MouseMode::None);
+        t.feed(b"\x1b[?1000h");
+        assert_eq!(t.mouse_mode, MouseMode::ButtonEvent);
+        t.feed(b"\x1b[?1000l");
+        assert_eq!(t.mouse_mode, MouseMode::None);
+    }
+
+    #[test]
+    fn decset_1002_and_1003_modes() {
+        let mut t = Term::new(2, 4);
+        t.feed(b"\x1b[?1002h");
+        assert_eq!(t.mouse_mode, MouseMode::ButtonAndMotion);
+        t.feed(b"\x1b[?1003h");
+        assert_eq!(t.mouse_mode, MouseMode::AllMotion);
+    }
+
+    #[test]
+    fn decset_1006_swaps_to_sgr_encoding() {
+        let mut t = Term::new(2, 4);
+        assert_eq!(t.mouse_encoding, MouseEncoding::Default);
+        t.feed(b"\x1b[?1006h");
+        assert_eq!(t.mouse_encoding, MouseEncoding::Sgr);
+        t.feed(b"\x1b[?1006l");
+        assert_eq!(t.mouse_encoding, MouseEncoding::Default);
+    }
+
+    #[test]
+    fn encode_mouse_sgr_press_left_at_origin() {
+        let event = MouseEvent {
+            button: MouseButton::Left,
+            action: MouseAction::Press,
+            col: 1,
+            row: 1,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        };
+        assert_eq!(
+            encode_mouse(event, MouseEncoding::Sgr),
+            b"\x1b[<0;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_mouse_sgr_release_uses_lowercase_m() {
+        let event = MouseEvent {
+            button: MouseButton::Right,
+            action: MouseAction::Release,
+            col: 6,
+            row: 11,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        };
+        // Right button = 2; lowercase m = release.
+        assert_eq!(
+            encode_mouse(event, MouseEncoding::Sgr),
+            b"\x1b[<2;6;11m".to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_mouse_sgr_motion_sets_motion_bit() {
+        let event = MouseEvent {
+            button: MouseButton::Left,
+            action: MouseAction::Motion,
+            col: 5,
+            row: 3,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        };
+        // 0 (left) | 0x20 (motion) = 32
+        assert_eq!(
+            encode_mouse(event, MouseEncoding::Sgr),
+            b"\x1b[<32;5;3M".to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_mouse_sgr_modifiers_add_bits() {
+        let event = MouseEvent {
+            button: MouseButton::Left,
+            action: MouseAction::Press,
+            col: 1,
+            row: 1,
+            shift: true,
+            alt: true,
+            ctrl: true,
+        };
+        // 0 | 4 (shift) | 8 (alt) | 16 (ctrl) = 28
+        assert_eq!(
+            encode_mouse(event, MouseEncoding::Sgr),
+            b"\x1b[<28;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_mouse_sgr_wheel_uses_64_65() {
+        let up = MouseEvent {
+            button: MouseButton::WheelUp,
+            action: MouseAction::Press,
+            col: 1,
+            row: 1,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        };
+        assert_eq!(
+            encode_mouse(up, MouseEncoding::Sgr),
+            b"\x1b[<64;1;1M".to_vec()
+        );
+        let down = MouseEvent {
+            button: MouseButton::WheelDown,
+            action: MouseAction::Press,
+            col: 1,
+            row: 1,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        };
+        assert_eq!(
+            encode_mouse(down, MouseEncoding::Sgr),
+            b"\x1b[<65;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_mouse_default_form_press_left() {
+        let event = MouseEvent {
+            button: MouseButton::Left,
+            action: MouseAction::Press,
+            col: 1,
+            row: 1,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        };
+        // Default form: ESC [ M b+0x20 col+0x20 row+0x20.
+        // b=0, so byte=0x20=32. col=1 → 0x21. row=1 → 0x21.
+        assert_eq!(
+            encode_mouse(event, MouseEncoding::Default),
+            vec![0x1b, b'[', b'M', 0x20, 0x21, 0x21]
+        );
+    }
+
+    #[test]
+    fn encode_mouse_default_form_release_collapses_to_button_3() {
+        // The default form encodes release as button code 3 regardless
+        // of which button was released — preserves modifier bits, drops
+        // the button-specific bits.
+        let event = MouseEvent {
+            button: MouseButton::Right,
+            action: MouseAction::Release,
+            col: 1,
+            row: 1,
+            shift: true,
+            alt: false,
+            ctrl: false,
+        };
+        // Right=2, but release → 3; shift=4. (3 | 4) + 0x20 = 7 + 32 = 39 = 0x27.
+        assert_eq!(
+            encode_mouse(event, MouseEncoding::Default),
+            vec![0x1b, b'[', b'M', 0x27, 0x21, 0x21]
+        );
     }
 
     #[test]
