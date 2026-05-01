@@ -730,7 +730,11 @@ Keys:
 | `v`                       | Char-wise visual; further motions extend the selection.      |
 | `V`                       | Line-wise visual; selection covers full rows from anchor.    |
 | `Ctrl-v`                  | Block-wise visual; selection is a rectangle from anchor to cursor. |
-| `y`                       | Yank selection to clipboard + primary, exit vi-mode.         |
+| `y` (in visual)           | Yank selection to clipboard + primary, exit vi-mode.         |
+| `y<motion>`               | Yank cursor → motion target (e.g. `yw`, `y$`, `yG`).         |
+| `yy` (or `Y`)             | Yank current line; counts work (`3yy`).                      |
+| `yiw` `yiW`               | Yank inner word / WORD (run of class around cursor).         |
+| `yaw` `yaW`               | Yank around word / WORD (object + adjacent whitespace).      |
 | `<count>` (e.g. `5j`)     | Count prefix — repeats the next motion N times.              |
 | `/<query>` `?<query>`     | Forward / backward live search. Matches highlight as you type, cursor jumps live to the best one. |
 | `Enter` (in search)       | Commit search; matches stay highlighted, `n`/`N` navigates.  |

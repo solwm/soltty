@@ -25,11 +25,25 @@ pub enum VisualMode {
     Block,
 }
 
-/// Two-key sequences in vim wait for the second key — `gg` is the only
-/// one we use today, so this is a single-variant enum we'll grow later.
+/// Multi-key sequences in vim wait for one or more follow-up keys. We
+/// stash that in-between state here; each variant carries whatever it
+/// needs to finish once the user types the next key.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PendingOp {
-    Goto, // saw 'g', waiting for the second 'g' to mean DocStart
+    /// Saw `g`, waiting for the second `g` to mean DocStart.
+    Goto,
+    /// Saw `y`, waiting for a motion / text-object / second `y` (yy)
+    /// to determine the yank range. `start_abs` is the cursor's
+    /// absolute (scrollback ++ live) position when `y` was pressed —
+    /// using absolute coords means motions that scroll the viewport
+    /// (`G`, `gg`, page motions) still produce correct ranges.
+    Yank { start_abs: (usize, usize) },
+    /// Saw `yi`, waiting for a text-object char (`w`, `W`, …) to
+    /// yank the inner range.
+    YankInner,
+    /// Saw `ya`, waiting for a text-object char (`w`, `W`, …) to
+    /// yank the surrounding range (object plus adjacent whitespace).
+    YankAround,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -667,6 +681,132 @@ pub fn viewport_to_absolute(term: &Term, vrow: usize, viewport_offset: usize) ->
     top + vrow
 }
 
+/// Same as `viewport_to_absolute` but for a (row, col) pair using the
+/// term's *current* viewport_offset. Convenient for the operator-yank
+/// path, which captures the cursor's absolute position at `y` so the
+/// post-motion endpoint stays consistent even if the motion scrolls.
+pub fn cursor_to_absolute(term: &Term, cursor: (usize, usize)) -> (usize, usize) {
+    (
+        viewport_to_absolute(term, cursor.0, term.viewport_offset),
+        cursor.1,
+    )
+}
+
+/// Pull the text inside `[start, end]` (inclusive both ends) as a
+/// String, with line breaks at row boundaries. Both endpoints are in
+/// absolute (scrollback ++ live) coords so this works across viewport
+/// scrolls. Trailing whitespace on each row is trimmed — same policy
+/// as `selection::extract_text` for `Char` mode.
+pub fn extract_absolute_range(
+    term: &Term,
+    start: (usize, usize),
+    end: (usize, usize),
+) -> String {
+    let (s, e) = if start <= end { (start, end) } else { (end, start) };
+    let g = term.grid();
+    let sb_len = g.scrollback.len();
+    let live_len = g.lines.len();
+    let total = sb_len + live_len;
+    let cols = g.cols;
+    let mut out = String::new();
+    for abs_row in s.0..=e.0 {
+        if abs_row >= total {
+            break;
+        }
+        let row = if abs_row < sb_len {
+            &g.scrollback[abs_row]
+        } else {
+            &g.lines[abs_row - sb_len]
+        };
+        let start_col = if abs_row == s.0 { s.1 } else { 0 };
+        let end_col = if abs_row == e.0 {
+            (e.1 + 1).min(cols)
+        } else {
+            cols
+        };
+        if start_col >= row.cells.len() {
+            // Row truncated to fewer cells than the range expected; emit
+            // nothing for this row.
+        } else {
+            let end_clamped = end_col.min(row.cells.len());
+            let line: String = row.cells[start_col..end_clamped]
+                .iter()
+                .map(|c| c.ch)
+                .collect();
+            out.push_str(line.trim_end());
+        }
+        if abs_row < e.0 {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Inner-word text object: the run of same-class characters around the
+/// cursor's column on its current viewport row. `big` toggles word vs
+/// WORD semantics (alphanumerics + underscore vs any non-whitespace).
+/// Returns viewport-coord endpoints; both have the same row since vim's
+/// iw doesn't cross line boundaries.
+pub fn inner_word_bounds(
+    term: &Term,
+    cursor: (usize, usize),
+    big: bool,
+) -> ((usize, usize), (usize, usize)) {
+    let (row, col) = cursor;
+    let cells = &term.viewport_row(row).cells;
+    if cells.is_empty() {
+        return ((row, col), (row, col));
+    }
+    let col = col.min(cells.len() - 1);
+    let cur = classify(cells[col].ch, big);
+    let mut start = col;
+    while start > 0 && classify(cells[start - 1].ch, big) == cur {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cells.len() && classify(cells[end + 1].ch, big) == cur {
+        end += 1;
+    }
+    ((row, start), (row, end))
+}
+
+/// Around-word text object: the inner-word range plus adjacent
+/// whitespace on one side. Vim prefers the run *after* the word; if
+/// there's none (word at line end), it falls back to whitespace
+/// *before* the word. Returns viewport-coord endpoints.
+pub fn around_word_bounds(
+    term: &Term,
+    cursor: (usize, usize),
+    big: bool,
+) -> ((usize, usize), (usize, usize)) {
+    let ((row, mut start), (_, mut end)) = inner_word_bounds(term, cursor, big);
+    let cells = &term.viewport_row(row).cells;
+    if cells.is_empty() {
+        return ((row, start), (row, end));
+    }
+    let cur_class = classify(cells[start].ch, big);
+    if cur_class == WordClass::Whitespace {
+        // Cursor is on whitespace already → just give back the run.
+        return ((row, start), (row, end));
+    }
+    // Try to extend into trailing whitespace.
+    let mut extended = end;
+    while extended + 1 < cells.len()
+        && classify(cells[extended + 1].ch, big) == WordClass::Whitespace
+    {
+        extended += 1;
+    }
+    if extended > end {
+        end = extended;
+    } else {
+        // No trailing whitespace; absorb leading instead.
+        while start > 0 && classify(cells[start - 1].ch, big) == WordClass::Whitespace {
+            start -= 1;
+        }
+    }
+    ((row, start), (row, end))
+}
+
 /// Scroll the viewport (if needed) so that `match_row` (absolute) is
 /// visible. Returns the viewport row the match ended up on. We center
 /// when the match was off-screen; if it's already in view, we leave
@@ -879,6 +1019,63 @@ mod tests {
             pick_current_match(&ms, 0, 0, SearchDirection::Backward),
             Some(2)
         );
+    }
+
+    #[test]
+    fn inner_word_finds_run_around_cursor() {
+        let mut t = Term::new(2, 30);
+        t.feed(b"hello world,foo");
+        // Cursor on 'l' (col 3) — inner word is "hello" (cols 0..=4).
+        let ((r1, c1), (r2, c2)) = inner_word_bounds(&t, (0, 3), false);
+        assert_eq!((r1, c1), (0, 0));
+        assert_eq!((r2, c2), (0, 4));
+
+        // Cursor on space (col 5) — inner whitespace is just that one cell.
+        let ((_, c1), (_, c2)) = inner_word_bounds(&t, (0, 5), false);
+        assert_eq!(c1, 5);
+        assert_eq!(c2, 5);
+
+        // Cursor on ',' (col 11) — punctuation is its own class in word
+        // (small) mode; just the comma.
+        let ((_, c1), (_, c2)) = inner_word_bounds(&t, (0, 11), false);
+        assert_eq!((c1, c2), (11, 11));
+
+        // Big-word mode: punctuation collapses with letters, so the
+        // entire "world,foo" run from col 6 to 14 is one WORD.
+        let ((_, c1), (_, c2)) = inner_word_bounds(&t, (0, 11), true);
+        assert_eq!((c1, c2), (6, 14));
+    }
+
+    #[test]
+    fn around_word_extends_into_trailing_ws() {
+        let mut t = Term::new(2, 30);
+        t.feed(b"foo  bar  baz");
+        // Cursor on 'f' (col 0) → around is "foo  " (cols 0..=4).
+        let ((_, c1), (_, c2)) = around_word_bounds(&t, (0, 1), false);
+        assert_eq!((c1, c2), (0, 4));
+
+        // Cursor on 'b' of "bar" (col 5) → around is "bar  " (cols 5..=9).
+        let ((_, c1), (_, c2)) = around_word_bounds(&t, (0, 5), false);
+        assert_eq!((c1, c2), (5, 9));
+    }
+
+    #[test]
+    fn extract_absolute_range_crosses_rows() {
+        let mut t = Term::new(3, 10);
+        t.feed(b"hello\r\nworld\r\nfoo");
+        // Live grid only (no scrollback) — absolute row indices 0..=2.
+        let s = extract_absolute_range(&t, (0, 2), (1, 1));
+        assert_eq!(s, "llo\nwo");
+    }
+
+    #[test]
+    fn extract_absolute_range_normalises_swapped_endpoints() {
+        let mut t = Term::new(2, 20);
+        t.feed(b"abcdefghij");
+        let forward = extract_absolute_range(&t, (0, 1), (0, 4));
+        let backward = extract_absolute_range(&t, (0, 4), (0, 1));
+        assert_eq!(forward, backward);
+        assert_eq!(forward, "bcde");
     }
 
     #[test]

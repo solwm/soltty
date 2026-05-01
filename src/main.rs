@@ -807,9 +807,115 @@ impl ApplicationHandler<UserEvent> for App {
                                 None
                             };
 
+                            // Operator-pending takes priority over normal
+                            // dispatch. After `y`, the next key is
+                            // interpreted as a yank target (motion, `yy`,
+                            // `yi<obj>`, `ya<obj>`, count digit, or
+                            // cancel). Same shape for the text-object
+                            // sub-states.
+                            let yank_pending = matches!(
+                                self.vi.pending_op,
+                                Some(vi::PendingOp::Yank { .. })
+                            );
+                            let inner_pending =
+                                self.vi.pending_op == Some(vi::PendingOp::YankInner);
+                            let around_pending =
+                                self.vi.pending_op == Some(vi::PendingOp::YankAround);
+
                             if ctrl_handled {
                                 // Block-visual already activated; nothing
                                 // else to dispatch this keystroke.
+                            } else if yank_pending {
+                                // Pull start_abs out of the variant; clear
+                                // pending_op now and re-set it only for
+                                // states that should persist (count digit
+                                // or `i`/`a` text-object prefix).
+                                let start_abs = match self.vi.pending_op {
+                                    Some(vi::PendingOp::Yank { start_abs }) => start_abs,
+                                    _ => unreachable!(),
+                                };
+                                self.vi.pending_op = None;
+
+                                if ch.is_ascii_digit()
+                                    && (ch != '0' || self.vi.pending_count.is_some())
+                                {
+                                    self.vi.push_digit(ch.to_digit(10).unwrap());
+                                    self.vi.pending_op =
+                                        Some(vi::PendingOp::Yank { start_abs });
+                                } else if (ch == 'y' && !shift) || (ch == 'y' && shift) {
+                                    // yy or Y: yank N current/next lines.
+                                    let count = self.vi.take_count();
+                                    let line_start = (start_abs.0, 0);
+                                    let line_end = (
+                                        start_abs.0.saturating_add(
+                                            count.saturating_sub(1) as usize,
+                                        ),
+                                        cols.saturating_sub(1),
+                                    );
+                                    yank_range_to_clipboard(
+                                        &mut self.clipboard,
+                                        &self.term,
+                                        line_start,
+                                        line_end,
+                                    );
+                                    self.vi.exit();
+                                    self.selection = None;
+                                } else if ch == 'i' && !shift {
+                                    self.vi.pending_op = Some(vi::PendingOp::YankInner);
+                                } else if ch == 'a' && !shift {
+                                    self.vi.pending_op = Some(vi::PendingOp::YankAround);
+                                } else if let Some(m) = key_to_motion(ch, shift, ctrl) {
+                                    let n = self.vi.take_count();
+                                    vi::apply_motion(
+                                        &mut self.vi,
+                                        &mut self.term,
+                                        m,
+                                        n,
+                                    );
+                                    let end_abs = vi::cursor_to_absolute(
+                                        &self.term,
+                                        self.vi.cursor,
+                                    );
+                                    yank_range_to_clipboard(
+                                        &mut self.clipboard,
+                                        &self.term,
+                                        start_abs,
+                                        end_abs,
+                                    );
+                                    self.vi.exit();
+                                    self.selection = None;
+                                }
+                                // else: invalid follow-up, silently
+                                // cancelled by the pending_op = None above.
+                            } else if inner_pending || around_pending {
+                                self.vi.pending_op = None;
+                                if ch == 'w' {
+                                    let big = shift;
+                                    let bounds = if inner_pending {
+                                        vi::inner_word_bounds(
+                                            &self.term,
+                                            self.vi.cursor,
+                                            big,
+                                        )
+                                    } else {
+                                        vi::around_word_bounds(
+                                            &self.term,
+                                            self.vi.cursor,
+                                            big,
+                                        )
+                                    };
+                                    let s_abs = vi::cursor_to_absolute(&self.term, bounds.0);
+                                    let e_abs = vi::cursor_to_absolute(&self.term, bounds.1);
+                                    yank_range_to_clipboard(
+                                        &mut self.clipboard,
+                                        &self.term,
+                                        s_abs,
+                                        e_abs,
+                                    );
+                                    self.vi.exit();
+                                    self.selection = None;
+                                }
+                                // else: cancel (already cleared above)
                             } else if let Some(m) = page_motion {
                                 motion = Some(m);
                             } else if ch.is_ascii_digit()
@@ -874,18 +980,35 @@ impl ApplicationHandler<UserEvent> for App {
                                     // Visual mode entries.
                                     ('v', false) => self.vi.start_visual_char(),
                                     ('v', true) => self.vi.start_visual_line(),
-                                    // Yank + exit.
+                                    // Yank. In visual mode: copy the
+                                    // selection and exit (alacritty
+                                    // semantics). In normal mode: set
+                                    // operator-pending; the next key
+                                    // (motion / yy / yi<obj> / ya<obj>)
+                                    // determines the range.
                                     ('y', _) => {
-                                        if let Some(sel) = self.selection.as_ref() {
-                                            let text =
-                                                selection::extract_text(&self.term, sel);
-                                            if !text.is_empty() {
-                                                self.clipboard.set_primary(text.clone());
-                                                self.clipboard.set_text(text);
+                                        if self.vi.visual != vi::VisualMode::None {
+                                            if let Some(sel) = self.selection.as_ref() {
+                                                let text = selection::extract_text(
+                                                    &self.term,
+                                                    sel,
+                                                );
+                                                if !text.is_empty() {
+                                                    self.clipboard
+                                                        .set_primary(text.clone());
+                                                    self.clipboard.set_text(text);
+                                                }
                                             }
+                                            self.vi.exit();
+                                            self.selection = None;
+                                        } else {
+                                            let start_abs = vi::cursor_to_absolute(
+                                                &self.term,
+                                                self.vi.cursor,
+                                            );
+                                            self.vi.pending_op =
+                                                Some(vi::PendingOp::Yank { start_abs });
                                         }
-                                        self.vi.exit();
-                                        self.selection = None;
                                     }
                                     // Search.
                                     ('/', _) => start_search(
@@ -1066,6 +1189,60 @@ fn font_zoom_target(key: &Key, mods: ModifiersState, current_px: f32) -> Option<
         "-" => Some(current_px / 1.1),
         "0" => Some(DEFAULT_FONT_SIZE_PX),
         _ => None,
+    }
+}
+
+/// Map a key (lowered char + shift + ctrl) to a `vi::Motion`, or `None`
+/// if it isn't a motion. Shared between the regular vi dispatch (when a
+/// motion key is pressed in vi-normal) and the operator-pending dispatch
+/// (when a motion key follows `y` to define a yank range).
+fn key_to_motion(ch: char, shift: bool, ctrl: bool) -> Option<vi::Motion> {
+    if ctrl {
+        return match ch {
+            'd' => Some(vi::Motion::HalfPageDown),
+            'u' => Some(vi::Motion::HalfPageUp),
+            'f' => Some(vi::Motion::FullPageDown),
+            'b' => Some(vi::Motion::FullPageUp),
+            _ => None,
+        };
+    }
+    match (ch, shift) {
+        ('h', false) => Some(vi::Motion::Char(0, -1)),
+        ('j', false) => Some(vi::Motion::Char(1, 0)),
+        ('k', false) => Some(vi::Motion::Char(-1, 0)),
+        ('l', false) => Some(vi::Motion::Char(0, 1)),
+        ('h', true) => Some(vi::Motion::ScreenTop),
+        ('m', true) => Some(vi::Motion::ScreenMiddle),
+        ('l', true) => Some(vi::Motion::ScreenBottom),
+        ('g', true) => Some(vi::Motion::DocEnd),
+        ('w', false) => Some(vi::Motion::WordNext { big: false }),
+        ('w', true) => Some(vi::Motion::WordNext { big: true }),
+        ('e', false) => Some(vi::Motion::WordEnd { big: false }),
+        ('e', true) => Some(vi::Motion::WordEnd { big: true }),
+        ('b', false) => Some(vi::Motion::WordPrev { big: false }),
+        ('b', true) => Some(vi::Motion::WordPrev { big: true }),
+        ('0', _) => Some(vi::Motion::LineStart),
+        ('^', _) => Some(vi::Motion::LineFirstNonBlank),
+        ('$', _) => Some(vi::Motion::LineEnd),
+        // 'g' lowercase starts a Goto pending op rather than being a
+        // motion in itself; the caller resolves it via pending_op state.
+        _ => None,
+    }
+}
+
+/// Yank an absolute (scrollback ++ live) range to clipboard + primary.
+/// Empty extracts are skipped to avoid wiping existing clipboard contents
+/// on a stray operator press with nothing to copy.
+fn yank_range_to_clipboard(
+    clip: &mut clipboard::Clipboard,
+    term: &Term,
+    start_abs: (usize, usize),
+    end_abs: (usize, usize),
+) {
+    let text = vi::extract_absolute_range(term, start_abs, end_abs);
+    if !text.is_empty() {
+        clip.set_primary(text.clone());
+        clip.set_text(text);
     }
 }
 
