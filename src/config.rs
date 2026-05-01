@@ -18,7 +18,14 @@
 //! Unknown keys are silently ignored so users with a config from a
 //! newer build can downgrade without the terminal refusing to start.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Sample config shipped alongside the binary. On first run we copy
+/// this to `~/.config/soltty/soltty.conf` so the user has something to
+/// edit instead of having to read the docs to know the keys exist.
+/// Every key is commented out, so seeding doesn't change any
+/// behavior — it's just a discoverability aid.
+const DEFAULT_TEMPLATE: &str = include_str!("../docs/soltty.conf.example");
 
 #[derive(Default, Debug, Clone)]
 pub struct Config {
@@ -33,10 +40,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load `~/.config/soltty/soltty.conf` if it exists. Missing file
-    /// → default-empty Config (every field None). Parse errors log a
-    /// warning and also fall back to default — a bad config shouldn't
-    /// keep the terminal from starting.
+    /// Load `~/.config/soltty/soltty.conf`. Behavior:
+    ///
+    ///   - Missing file → seed the path from the bundled template
+    ///     (`docs/soltty.conf.example`, every key commented out) and
+    ///     return default Config. The file then exists for the user
+    ///     to edit, but no behavior changes.
+    ///   - Parse error → log a warning and return default. A bad
+    ///     config shouldn't keep the terminal from starting.
+    ///   - Seed failure (read-only home, etc.) → also just default.
+    ///     The user can still create the file manually if they care.
     pub fn load() -> Self {
         let Some(path) = config_path() else {
             return Self::default();
@@ -44,6 +57,14 @@ impl Config {
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(e) = seed_default(&path) {
+                    log::warn!(
+                        "config: could not seed {}: {e}",
+                        path.display()
+                    );
+                } else {
+                    log::info!("config: seeded {}", path.display());
+                }
                 return Self::default();
             }
             Err(e) => {
@@ -62,6 +83,19 @@ impl Config {
             }
         }
     }
+}
+
+/// Write the bundled template to `path`, creating parent directories
+/// as needed. Refuses to overwrite an existing file (shouldn't happen
+/// since `load` only calls this on NotFound, but defensive).
+fn seed_default(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, DEFAULT_TEMPLATE)
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -265,6 +299,43 @@ mod tests {
         let src = "[behavior]\nframe_hz = 240\n";
         let c = parse(src).unwrap();
         assert_eq!(c.frame_hz, Some(240));
+    }
+
+    #[test]
+    fn seed_default_writes_template_when_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "soltty-seed-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("soltty.conf");
+        seed_default(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("[appearance]"),
+            "seeded file should include the [appearance] section header"
+        );
+        assert!(
+            written.contains("# theme = "),
+            "seeded keys should be commented out — first-run shouldn't change behavior"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_default_does_not_overwrite_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "soltty-seed-noclobber-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("soltty.conf");
+        std::fs::write(&path, "user content").unwrap();
+        seed_default(&path).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "user content", "seed must not clobber");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
