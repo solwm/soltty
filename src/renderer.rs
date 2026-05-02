@@ -830,13 +830,28 @@ fn resolve_color(c: Color, palette: &[[f32; 4]; 256], default: [f32; 4]) -> [f32
     }
 }
 
-fn srgb_to_linear(c: u8) -> f32 {
-    let s = c as f32 / 255.0;
-    if s <= 0.04045 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
+/// sRGB→linear conversion. The math is `if s <= 0.04045 { s/12.92 }
+/// else { ((s+0.055)/1.055).powf(2.4) }` over `s = c / 255`. `powf`
+/// is ~150 cycles per call, and we hit this four times per truecolor
+/// cell in a hot render loop (gol-c full-screen at 100 Hz = 30k+
+/// calls per frame). Precompute the 256 outputs once at process
+/// startup so the per-cell cost collapses to a bounds-checked array
+/// load.
+static SRGB_LUT: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
+    let mut t = [0.0f32; 256];
+    for (i, slot) in t.iter_mut().enumerate() {
+        let s = i as f32 / 255.0;
+        *slot = if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        };
     }
+    t
+});
+
+fn srgb_to_linear(c: u8) -> f32 {
+    SRGB_LUT[c as usize]
 }
 
 fn srgb_to_linear_rgba([r, g, b, a]: [u8; 4]) -> [f32; 4] {
@@ -875,4 +890,29 @@ fn build_palette(theme: &Theme) -> [[f32; 4]; 256] {
         out[232 + i] = srgb_to_linear_rgba([v, v, v, 255]);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn srgb_lut_matches_formula() {
+        // The LUT replaces a per-call powf in the per-cell render
+        // hot path. Verify every entry agrees with the original
+        // formula to within a tolerance that matches single-precision
+        // float roundoff — a regression here would silently shift
+        // truecolor rendering.
+        for c in 0u8..=255 {
+            let s = c as f32 / 255.0;
+            let expected = if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            };
+            let lut = super::srgb_to_linear(c);
+            assert!(
+                (lut - expected).abs() < 1e-6,
+                "c={c} expected={expected} lut={lut}"
+            );
+        }
+    }
 }
