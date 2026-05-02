@@ -4,6 +4,9 @@ A GPU-accelerated terminal emulator for Linux and macOS, written in Rust.
 Built on `winit` + `glutin` + `glow` (OpenGL), with a custom inline
 ANSI parser and a single-instanced-draw-call rendering pipeline.
 
+Part of the **[solwm](https://github.com/solwm)** project — the terminal
+to pair with the compositor.
+
 ## Why
 
 A terminal's layout is trivial — a fixed grid of fixed-width cells —
