@@ -1,6 +1,6 @@
 use vte::{Params, Parser, Perform};
 
-use crate::grid::{CellAttrs, Color, CursorShape, Grid, Row};
+use crate::grid::{CellAttrs, Color, CursorShape, Grid, Pen, Row};
 
 /// What mouse events the application wants forwarded. `None` means the
 /// terminal handles mouse locally (selection). The variants correspond
@@ -267,6 +267,75 @@ impl Term {
                 }
                 // We never left Ground — stay there.
                 continue;
+            }
+            // SGR fast path. ESC `[` <digits/`;`> ... `m` is the
+            // single hottest CSI in colorful workloads (gol-c writes
+            // `\x1B[48;2;R;G;Bm ` per cell). vte processes these
+            // byte-by-byte with full-state-machine + Perform-trait
+            // dispatch overhead — ~22% of CPU at 10px gol-c. Detect
+            // and parse the digit-only `;`-separated form ourselves,
+            // dispatching straight to `apply_sgr_simple`. Anything
+            // weird (subparams via `:`, intermediates, wrong final)
+            // just falls through to vte for correctness.
+            if performer.in_ground
+                && b == 0x1B
+                && i + 1 < n
+                && bytes[i + 1] == b'['
+            {
+                // Fixed-size param array — SGR params are always
+                // small ints, 16 slots covers `38;2;R;G;B` chained
+                // with attrs.
+                let mut params: [u16; 16] = [0; 16];
+                let mut np = 0usize;
+                let mut cur: u32 = 0;
+                let mut overflow = false;
+                let mut j = i + 2;
+                let mut found_m = false;
+                let mut bail = false;
+                while j < n {
+                    let bj = bytes[j];
+                    if bj == b'm' {
+                        if np < params.len() {
+                            params[np] = cur.min(u16::MAX as u32) as u16;
+                            np += 1;
+                        }
+                        j += 1;
+                        found_m = true;
+                        break;
+                    }
+                    if bj == b';' {
+                        if np < params.len() {
+                            params[np] = cur.min(u16::MAX as u32) as u16;
+                            np += 1;
+                        }
+                        cur = 0;
+                        j += 1;
+                        continue;
+                    }
+                    if (b'0'..=b'9').contains(&bj) {
+                        cur = cur * 10 + (bj - b'0') as u32;
+                        if cur > u16::MAX as u32 {
+                            overflow = true;
+                        }
+                        j += 1;
+                        continue;
+                    }
+                    // Anything else — `:` subparams, intermediates,
+                    // a non-`m` final, control bytes — means vte's
+                    // path is the safe choice.
+                    bail = true;
+                    break;
+                }
+                if found_m && !overflow && !bail {
+                    apply_sgr_simple(performer.term.grid_mut(), &params[..np]);
+                    i = j;
+                    // SGR completed — back in Ground.
+                    performer.in_ground = true;
+                    continue;
+                }
+                // Otherwise fall through. The CSI may not be SGR,
+                // may have subparams, or may straddle the chunk
+                // boundary; vte handles all three.
             }
             // Hand to vte. Every dispatching callback flips
             // `in_ground` back to true; bytes that just accumulate
@@ -679,6 +748,79 @@ fn arg(params: &Params, idx: usize, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
+/// SGR application against a flat `&[u16]` of params. Same semantics
+/// as `apply_sgr` for the `;`-separated form (the only form our
+/// inline-CSI fast path produces); subparam-style SGRs (`38:5:n`)
+/// still go through vte and `apply_sgr` proper.
+fn apply_sgr_simple(grid: &mut Grid, params: &[u16]) {
+    if params.is_empty() {
+        // Lone `CSI m` is the same as `CSI 0 m`.
+        grid.pen = Pen::default();
+        return;
+    }
+    let mut idx = 0;
+    while idx < params.len() {
+        let code = params[idx];
+        match code {
+            0 => grid.pen = Pen::default(),
+            1 => grid.pen.attrs.set(CellAttrs::BOLD, true),
+            2 => grid.pen.attrs.set(CellAttrs::DIM, true),
+            3 => grid.pen.attrs.set(CellAttrs::ITALIC, true),
+            4 => grid.pen.attrs.set(CellAttrs::UNDERLINE, true),
+            5 => grid.pen.attrs.set(CellAttrs::BLINK, true),
+            7 => grid.pen.attrs.set(CellAttrs::INVERSE, true),
+            9 => grid.pen.attrs.set(CellAttrs::STRIKE, true),
+            22 => {
+                grid.pen.attrs.set(CellAttrs::BOLD, false);
+                grid.pen.attrs.set(CellAttrs::DIM, false);
+            }
+            23 => grid.pen.attrs.set(CellAttrs::ITALIC, false),
+            24 => grid.pen.attrs.set(CellAttrs::UNDERLINE, false),
+            25 => grid.pen.attrs.set(CellAttrs::BLINK, false),
+            27 => grid.pen.attrs.set(CellAttrs::INVERSE, false),
+            29 => grid.pen.attrs.set(CellAttrs::STRIKE, false),
+            30..=37 => grid.pen.fg = Color::Indexed((code - 30) as u8),
+            39 => grid.pen.fg = Color::Default,
+            40..=47 => grid.pen.bg = Color::Indexed((code - 40) as u8),
+            49 => grid.pen.bg = Color::Default,
+            90..=97 => grid.pen.fg = Color::Indexed((code - 90 + 8) as u8),
+            100..=107 => grid.pen.bg = Color::Indexed((code - 100 + 8) as u8),
+            38 | 48 => {
+                if idx + 1 >= params.len() {
+                    break;
+                }
+                let mode = params[idx + 1];
+                let color = match mode {
+                    5 if idx + 2 < params.len() => {
+                        let c = Some(Color::Indexed(params[idx + 2] as u8));
+                        idx += 2;
+                        c
+                    }
+                    2 if idx + 4 < params.len() => {
+                        let c = Some(Color::Rgb(
+                            params[idx + 2] as u8,
+                            params[idx + 3] as u8,
+                            params[idx + 4] as u8,
+                        ));
+                        idx += 4;
+                        c
+                    }
+                    _ => None,
+                };
+                if let Some(color) = color {
+                    if code == 38 {
+                        grid.pen.fg = color;
+                    } else {
+                        grid.pen.bg = color;
+                    }
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+}
+
 fn apply_sgr(grid: &mut Grid, params: &Params) {
     if params.is_empty() {
         grid.pen = Default::default();
@@ -849,6 +991,65 @@ mod tests {
         assert!(line(t.grid(), 0).starts_with("abc"));
         assert!(line(t.grid(), 1).starts_with("def"));
         assert!(line(t.grid(), 2).starts_with("ghi"));
+    }
+
+    #[test]
+    fn inline_sgr_bypasses_vte_with_same_result() {
+        // Inline SGR fast path should produce a pen identical to what
+        // vte would produce. Compare across the SGR cases this path
+        // covers: empty, simple attr, indexed color, truecolor, 256.
+        let cases: &[&[u8]] = &[
+            b"\x1b[m",
+            b"\x1b[0m",
+            b"\x1b[1;31m",
+            b"\x1b[38;5;202m",
+            b"\x1b[38;2;200;30;30m",
+            b"\x1b[48;2;1;2;3;38;2;4;5;6m",
+        ];
+        for bytes in cases {
+            let mut a = Term::new(2, 8);
+            a.feed(bytes);
+            let mut b = Term::new(2, 8);
+            // Force the slow path by feeding byte-by-byte: the
+            // inline detector requires the whole CSI in one chunk.
+            for &c in *bytes {
+                b.feed(&[c]);
+            }
+            assert_eq!(
+                a.grid().pen.fg,
+                b.grid().pen.fg,
+                "fg mismatch on {:?}",
+                bytes
+            );
+            assert_eq!(
+                a.grid().pen.bg,
+                b.grid().pen.bg,
+                "bg mismatch on {:?}",
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn inline_sgr_falls_back_for_subparams() {
+        // The `:`-separated subparam form (`38:2:R:G:B`) is handled
+        // by vte's apply_sgr. The inline path must NOT mishandle it
+        // as a `;` form.
+        let mut t = Term::new(2, 8);
+        t.feed(b"\x1b[38:2::200:30:30m");
+        assert_eq!(t.grid().pen.fg, Color::Rgb(200, 30, 30));
+    }
+
+    #[test]
+    fn inline_sgr_handles_straddled_chunks() {
+        // CSI starts in one feed call, ends in the next. Inline path
+        // requires the whole CSI in one chunk; second feed carries
+        // the rest, slow path handles it. End result: pen reflects
+        // the SGR.
+        let mut t = Term::new(2, 8);
+        t.feed(b"\x1b[38;2;");
+        t.feed(b"10;20;30m");
+        assert_eq!(t.grid().pen.fg, Color::Rgb(10, 20, 30));
     }
 
     #[test]
