@@ -248,35 +248,65 @@ impl Term {
         let mut i = 0;
         while i < n {
             let b = bytes[i];
-            // Hot path. When vte's already in Ground state, a printable
-            // ASCII byte (0x20..=0x7E) just maps to a single
-            // `print(c)` callback that puts one cell and stays in
-            // Ground. Detect a contiguous run of those and write them
-            // straight into the grid, skipping vte's per-byte state
-            // machine and trait-dispatch overhead. ~32% of CPU on
-            // ASCII-heavy workloads lives in vte; this is the lever
-            // that takes most of it back.
-            if performer.in_ground && (0x20..=0x7E).contains(&b) {
-                let start = i;
-                while i < n && (0x20..=0x7E).contains(&bytes[i]) {
-                    i += 1;
+            // All of the per-byte fast paths require Ground state.
+            // Branch once on it so the printable / control / ESC
+            // sub-paths share the same predicted check, instead of
+            // repeating it three times and confusing the predictor.
+            if performer.in_ground {
+                // Printable ASCII run. The bulk of any text-heavy
+                // workload lives here; gol-c's per-cell space hits
+                // it too. Each byte is a vte `print(c)` that lands
+                // one cell and returns to Ground — coalesce a run
+                // and write straight into the grid.
+                if (0x20..=0x7E).contains(&b) {
+                    let start = i;
+                    while i < n && (0x20..=0x7E).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    let g = performer.term.grid_mut();
+                    for &c in &bytes[start..i] {
+                        g.put_char(c as char);
+                    }
+                    continue;
                 }
-                let g = performer.term.grid_mut();
-                for &c in &bytes[start..i] {
-                    g.put_char(c as char);
+                // C0 controls. Each maps to exactly one Performer::
+                // execute → Grid method. scroll_storm's `\n` flood
+                // and tab/backspace in shell echo all go through
+                // here.
+                match b {
+                    0x07 => { i += 1; continue; }     // BEL: no-op
+                    0x08 => {
+                        performer.term.grid_mut().backspace();
+                        i += 1;
+                        continue;
+                    }
+                    0x09 => {
+                        performer.term.grid_mut().tab();
+                        i += 1;
+                        continue;
+                    }
+                    0x0A | 0x0B | 0x0C => {
+                        performer.term.grid_mut().line_feed();
+                        i += 1;
+                        continue;
+                    }
+                    0x0D => {
+                        performer.term.grid_mut().carriage_return();
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
                 }
-                // We never left Ground — stay there.
-                continue;
             }
-            // SGR fast path. ESC `[` <digits/`;`> ... `m` is the
-            // single hottest CSI in colorful workloads (gol-c writes
-            // `\x1B[48;2;R;G;Bm ` per cell). vte processes these
-            // byte-by-byte with full-state-machine + Perform-trait
-            // dispatch overhead — ~22% of CPU at 10px gol-c. Detect
-            // and parse the digit-only `;`-separated form ourselves,
-            // dispatching straight to `apply_sgr_simple`. Anything
-            // weird (subparams via `:`, intermediates, wrong final)
-            // just falls through to vte for correctness.
+            // SGR / CUP fast path. ESC `[` <digits/`;`> ... <`m`|`H`|`f`>
+            // is the hot CSI in colorful workloads (gol-c writes
+            // `\x1B[48;2;R;G;Bm ` per cell) and in cursor_jumps
+            // (`\x1B[r;cH`). vte processes these byte-by-byte with
+            // full-state-machine + Perform-trait dispatch overhead.
+            // Parse the digit-only `;`-separated form ourselves and
+            // dispatch straight to `apply_sgr_simple` / `grid.goto`.
+            // Anything weird (subparams via `:`, intermediates,
+            // unknown final) falls through to vte for correctness.
             if performer.in_ground
                 && b == 0x1B
                 && i + 1 < n
@@ -1068,6 +1098,52 @@ mod tests {
         t.feed(b"\x1b[38;2;");
         t.feed(b"10;20;30m");
         assert_eq!(t.grid().pen.fg, Color::Rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn control_byte_fast_path_matches_vte() {
+        // C0 controls in Ground state must produce identical grid
+        // state via the inline fast path and via vte's dispatch.
+        // Mix BS / HT / LF / CR with surrounding text so the cursor
+        // positioning has something to interact with.
+        let cases: &[&[u8]] = &[
+            b"abc\ndef",          // LF
+            b"abc\r\ndef",        // CRLF
+            b"a\tb\tc",           // HT
+            b"abc\x08X",          // BS — overwrite last cell
+            b"\n\n\n",            // run of LFs
+            b"hello\rworld",      // CR mid-line
+        ];
+        for bytes in cases {
+            let mut a = Term::new(4, 16);
+            a.feed(bytes);
+            let mut b = Term::new(4, 16);
+            for &c in *bytes {
+                b.feed(&[c]);
+            }
+            let dump = |g: &Grid| -> String {
+                let mut s = String::new();
+                for row in &g.lines {
+                    for cell in &row.cells {
+                        s.push(cell.ch);
+                    }
+                    s.push('|');
+                }
+                s
+            };
+            assert_eq!(
+                dump(a.grid()),
+                dump(b.grid()),
+                "grid mismatch on {:?}",
+                bytes
+            );
+            assert_eq!(
+                (a.grid().cursor.row, a.grid().cursor.col),
+                (b.grid().cursor.row, b.grid().cursor.col),
+                "cursor mismatch on {:?}",
+                bytes
+            );
+        }
     }
 
     #[test]
