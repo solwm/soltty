@@ -167,6 +167,14 @@ pub struct Term {
     /// cursor-position reports). Drained by the host loop after each
     /// `feed` and written to the PTY master.
     reply: Vec<u8>,
+    /// Mirrors vte's "Ground" state — true when the parser is idle and
+    /// the next printable-ASCII byte will go straight through to
+    /// `print()`. Lets `feed` short-circuit long runs of printable
+    /// ASCII (the bulk of any text-heavy workload, ~32% of CPU at 10px
+    /// before this) by writing directly into the grid without paying
+    /// vte's per-byte state-machine + trait-dispatch cost. Persisted
+    /// across `feed` calls because the parser state is.
+    parser_in_ground: bool,
 }
 
 impl Term {
@@ -189,6 +197,7 @@ impl Term {
             mouse_mode: MouseMode::None,
             mouse_encoding: MouseEncoding::Default,
             reply: Vec::new(),
+            parser_in_ground: true,
         }
     }
 
@@ -229,10 +238,45 @@ impl Term {
         let sb_before = self.primary.scrollback.len();
 
         let mut parser = std::mem::take(&mut self.parser);
-        let mut performer = Performer { term: self };
-        for &b in bytes {
+        let mut performer = Performer {
+            term: self,
+            in_ground: true, // overwritten below before any read
+        };
+        performer.in_ground = performer.term.parser_in_ground;
+
+        let n = bytes.len();
+        let mut i = 0;
+        while i < n {
+            let b = bytes[i];
+            // Hot path. When vte's already in Ground state, a printable
+            // ASCII byte (0x20..=0x7E) just maps to a single
+            // `print(c)` callback that puts one cell and stays in
+            // Ground. Detect a contiguous run of those and write them
+            // straight into the grid, skipping vte's per-byte state
+            // machine and trait-dispatch overhead. ~32% of CPU on
+            // ASCII-heavy workloads lives in vte; this is the lever
+            // that takes most of it back.
+            if performer.in_ground && (0x20..=0x7E).contains(&b) {
+                let start = i;
+                while i < n && (0x20..=0x7E).contains(&bytes[i]) {
+                    i += 1;
+                }
+                let g = performer.term.grid_mut();
+                for &c in &bytes[start..i] {
+                    g.put_char(c as char);
+                }
+                // We never left Ground — stay there.
+                continue;
+            }
+            // Hand to vte. Every dispatching callback flips
+            // `in_ground` back to true; bytes that just accumulate
+            // mid-state (CSI params, OSC body, UTF-8 continuation)
+            // leave it false so we don't fast-path the next byte.
+            performer.in_ground = false;
             parser.advance(&mut performer, b);
+            i += 1;
         }
+        self.parser_in_ground = performer.in_ground;
         self.parser = parser;
 
         if self.viewport_offset > 0 {
@@ -335,6 +379,10 @@ impl Term {
 
 struct Performer<'a> {
     term: &'a mut Term,
+    /// Mirror of vte's parser state, written by every dispatching
+    /// callback. `feed` reads it after each `parser.advance` to decide
+    /// whether the next byte qualifies for the ASCII fast path.
+    in_ground: bool,
 }
 
 impl<'a> Performer<'a> {
@@ -345,10 +393,12 @@ impl<'a> Performer<'a> {
 
 impl<'a> Perform for Performer<'a> {
     fn print(&mut self, c: char) {
+        self.in_ground = true;
         self.grid().put_char(c);
     }
 
     fn execute(&mut self, byte: u8) {
+        self.in_ground = true;
         let g = self.grid();
         match byte {
             0x07 => {} // BEL
@@ -367,6 +417,7 @@ impl<'a> Perform for Performer<'a> {
         _ignore: bool,
         action: char,
     ) {
+        self.in_ground = true;
         // DECSCUSR (`CSI Ps SP q`): cursor shape. The space intermediate
         // distinguishes it from any plain `CSI Ps q` (which we don't
         // implement). Apps like vim and zsh-vi-mode emit this to signal
@@ -448,6 +499,7 @@ impl<'a> Perform for Performer<'a> {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.in_ground = true;
         if !intermediates.is_empty() {
             return;
         }
@@ -470,6 +522,7 @@ impl<'a> Perform for Performer<'a> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.in_ground = true;
         let Some(code) = params.first().copied() else {
             return;
         };
@@ -511,9 +564,19 @@ impl<'a> Perform for Performer<'a> {
         }
     }
 
-    fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
-    fn put(&mut self, _: u8) {}
-    fn unhook(&mut self) {}
+    fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {
+        // DCS start — we're now mid-string, NOT in Ground. Stays
+        // false until `unhook` returns control.
+        self.in_ground = false;
+    }
+    fn put(&mut self, _: u8) {
+        // DCS body byte. Still mid-string.
+        self.in_ground = false;
+    }
+    fn unhook(&mut self) {
+        // DCS terminator — back to Ground.
+        self.in_ground = true;
+    }
 }
 
 impl<'a> Performer<'a> {
@@ -737,6 +800,67 @@ mod tests {
         assert_eq!(t.grid().scrollback.len(), 1);
         assert!(line(t.grid(), 0).starts_with("b"));
         assert!(line(t.grid(), 1).starts_with("c"));
+    }
+
+    #[test]
+    fn ascii_fast_path_preserves_pen_after_csi() {
+        // Regression: the printable-ASCII fast path must run AFTER a
+        // CSI sequence has fully resolved. If we mistakenly fast-path
+        // bytes mid-CSI we'd skip the SGR and the pen would be wrong.
+        let mut t = Term::new(2, 16);
+        // truecolor red, then "RED", then reset, then "X"
+        t.feed(b"\x1b[38;2;200;30;30mRED\x1b[0mX");
+        let l0 = &t.grid().lines[0].cells;
+        assert_eq!(l0[0].ch, 'R');
+        assert_eq!(l0[0].fg, Color::Rgb(200, 30, 30));
+        assert_eq!(l0[1].ch, 'E');
+        assert_eq!(l0[1].fg, Color::Rgb(200, 30, 30));
+        assert_eq!(l0[2].ch, 'D');
+        assert_eq!(l0[2].fg, Color::Rgb(200, 30, 30));
+        assert_eq!(l0[3].ch, 'X');
+        assert_eq!(l0[3].fg, Color::Default);
+    }
+
+    #[test]
+    fn ascii_fast_path_excludes_del_and_falls_back() {
+        // 0x7F (DEL) sits just outside our 0x20..=0x7E fast-path
+        // range, so it falls through to vte. The fast path must not
+        // accidentally include it.
+        let mut t1 = Term::new(2, 16);
+        t1.feed(b"AB\x7FCD");
+        let mut t2 = Term::new(2, 16);
+        // Reference: feed each byte separately so vte sees them
+        // exactly as it would without our fast path. Both grids
+        // should match cell-for-cell.
+        for &b in b"AB\x7FCD" {
+            t2.feed(&[b]);
+        }
+        let r1: String = t1.grid().lines[0].cells.iter().map(|c| c.ch).collect();
+        let r2: String = t2.grid().lines[0].cells.iter().map(|c| c.ch).collect();
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn ascii_fast_path_handles_cr_lf_inside_run() {
+        // Control bytes inside an "ASCII run" should kick us out of
+        // the fast path and execute correctly.
+        let mut t = Term::new(3, 8);
+        t.feed(b"abc\r\ndef\r\nghi");
+        assert!(line(t.grid(), 0).starts_with("abc"));
+        assert!(line(t.grid(), 1).starts_with("def"));
+        assert!(line(t.grid(), 2).starts_with("ghi"));
+    }
+
+    #[test]
+    fn ascii_fast_path_split_across_feeds_keeps_state() {
+        // A CSI may straddle two feed calls (PTY chunk boundary).
+        // We must remember `in_ground = false` between calls.
+        let mut t = Term::new(2, 16);
+        t.feed(b"\x1b[38;2;10;");           // mid-CSI
+        t.feed(b"20;30mX");                 // finish + print
+        let cell = &t.grid().lines[0].cells[0];
+        assert_eq!(cell.ch, 'X');
+        assert_eq!(cell.fg, Color::Rgb(10, 20, 30));
     }
 
     #[test]
