@@ -343,6 +343,14 @@ impl ApplicationHandler<UserEvent> for App {
         if !self.dirty && !blinking {
             return;
         }
+        // Second early-out: dirty data already has a redraw on the
+        // way and no blink animation needs scheduling. The body below
+        // would only walk through the match arms and bail anyway,
+        // but it'd cost a clock_gettime first. During a heavy PTY
+        // drain (gol-c, cat'ing a big file) this case dominates.
+        if self.redraw_pending && !blinking {
+            return;
+        }
 
         let now = Instant::now();
 
