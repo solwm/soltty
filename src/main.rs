@@ -123,6 +123,7 @@ fn main() {
         vi_keybind: vi::ViKeyBind::resolve(cfg.vi_keybind.as_deref()),
         held_buttons: 0,
         last_reported_cell: None,
+        burst_holdoff: 0,
         config: cfg,
     };
     event_loop.run_app(&mut app).expect("run event loop");
@@ -223,6 +224,15 @@ struct App {
     /// pixel-granular but the protocol is cell-granular; without dedup
     /// a single drag floods the PTY with redundant events.
     last_reported_cell: Option<(usize, usize)>,
+    /// Counts down each render. When > 0, the redraw deadline is
+    /// stretched so a continuous PTY burst (gol-c, `cat`-of-large-
+    /// file, log dumps) renders the *result* of the burst instead of
+    /// every intermediate frame. Set when a single drain returns more
+    /// than `BURST_BYTES_THRESHOLD` bytes; decays one step per render
+    /// so the moment the burst stops we're back to full refresh rate
+    /// for typing/echo. Typing produces tiny drains (one keypress
+    /// echo) and never triggers this path.
+    burst_holdoff: u32,
     /// Loaded user config. Consulted in `resumed` for font / frame
     /// settings that we don't know how to apply until the window
     /// exists. Other settings (theme, vi keybind) are already resolved
@@ -249,6 +259,24 @@ const DEFAULT_FRAME_HZ: u32 = 120;
 /// Underline do, which corresponds to insert/replace mode in vim and the
 /// active prompt cursor in zsh-vi-mode.
 const BLINK_HALF_PERIOD: Duration = Duration::from_millis(500);
+
+/// A single PTY drain larger than this many bytes is taken as evidence
+/// that the child is producing a sustained burst (gol-c, `cat` of a
+/// large file, build-tool log dump). Small drains — single keystroke
+/// echo, shell prompt repaint — sit well below this threshold and
+/// stay on the fast-refresh path.
+const BURST_BYTES_THRESHOLD: usize = 4096;
+/// During a burst we stretch the redraw deadline by this much per
+/// render until the burst ends. 1 ≈ keep current cap; 2 ≈ render at
+/// half rate. The bench shows the gol-c gap to alacritty is per-frame
+/// cost; halving render frequency during the burst converges on the
+/// 60-Hz numbers (where we're at ~0.89x parity) while typing keeps
+/// the full refresh rate.
+const BURST_FRAME_MULTIPLIER: u32 = 2;
+/// How many renders we stay in burst mode for, after the last big
+/// drain. Keeps us coasting through the burst without thrashing back
+/// and forth on a single momentarily-empty drain.
+const BURST_HOLDOFF_FRAMES: u32 = 6;
 
 /// Pick the redraw cap. Precedence: `SOLTTY_FRAME_HZ` env var > config
 /// `frame_hz` > monitor refresh rate from winit > 120 Hz default.
@@ -378,16 +406,25 @@ impl ApplicationHandler<UserEvent> for App {
             }
             return;
         }
+        // Same burst-aware deadline as `maybe_request_redraw`. The
+        // two paths must agree; otherwise about_to_wait could trip a
+        // redraw `maybe_request_redraw` had postponed (or vice
+        // versa), and the burst throttle would leak frames.
+        let interval = if self.burst_holdoff > 0 {
+            self.frame_interval * BURST_FRAME_MULTIPLIER
+        } else {
+            self.frame_interval
+        };
         match self.last_render {
             None => {
                 self.do_request_redraw();
             }
             Some(t) => {
                 let elapsed = now.duration_since(t);
-                if elapsed >= self.frame_interval || elapsed >= IDLE_THRESHOLD {
+                if elapsed >= interval || elapsed >= IDLE_THRESHOLD {
                     self.do_request_redraw();
                 } else {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(t + self.frame_interval));
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(t + interval));
                 }
             }
         }
@@ -410,6 +447,15 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(pty) = self.pty.as_mut() {
                     let bytes = pty.drain();
                     if !bytes.is_empty() {
+                        // A drain larger than the threshold means the
+                        // child is in burst mode — stretch the next
+                        // few render deadlines so we don't paint every
+                        // intermediate state. Typing produces tiny
+                        // drains (single-key echo) and never trips
+                        // this; gol-c/`cat`-of-large-file always do.
+                        if bytes.len() >= BURST_BYTES_THRESHOLD {
+                            self.burst_holdoff = BURST_HOLDOFF_FRAMES;
+                        }
                         self.term.feed(&bytes);
                         // Parser may have produced reply bytes (DSR
                         // cursor-position reports etc.) — write them
@@ -530,6 +576,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.redraw_pending = false;
                 self.dirty = false;
                 self.last_render = Some(now);
+                // Decay burst-mode one step per render. Once it hits
+                // 0 we're back to full refresh; another big drain
+                // re-arms it.
+                self.burst_holdoff = self.burst_holdoff.saturating_sub(1);
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -1315,11 +1365,21 @@ impl App {
         if self.redraw_pending {
             return;
         }
+        // During a sustained burst (set in user_event PtyData) we
+        // stretch the deadline so the burst's intermediate frames
+        // don't all hit the GPU. IDLE_THRESHOLD still wins as a
+        // ceiling so the user never waits more than 100 ms to see
+        // the latest state.
+        let interval = if self.burst_holdoff > 0 {
+            self.frame_interval * BURST_FRAME_MULTIPLIER
+        } else {
+            self.frame_interval
+        };
         let due = match self.last_render {
             None => true,
             Some(t) => {
                 let elapsed = Instant::now().duration_since(t);
-                elapsed >= self.frame_interval || elapsed >= IDLE_THRESHOLD
+                elapsed >= interval || elapsed >= IDLE_THRESHOLD
             }
         };
         if due {
