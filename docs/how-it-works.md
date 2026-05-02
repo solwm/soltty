@@ -18,7 +18,7 @@ Almost everything soltty does is some combination of four crates:
 | Window + input| `winit`        | The OS window, keyboard/mouse/scale events               |
 | GL context    | `glutin`       | OpenGL context + surface creation per platform           |
 | GL bindings   | `glow`         | Thin Rust binding to the OpenGL function pointers        |
-| ANSI parser   | `vte`          | The byte-by-byte CSI/OSC/ESC state machine               |
+| ANSI parser   | `vte`          | Slow-path CSI/OSC/ESC state machine; the hot bytes are intercepted before vte sees them — see "parser fast paths" below |
 | Rasterizer    | `swash`        | Outline → 8-bit alpha bitmap for one glyph at one size   |
 | CLI           | `clap`         | `--theme`, `--list-themes`, `-e`, `--help`, `--version`  |
 
@@ -108,10 +108,14 @@ swap stalls byte processing.
 Measured under a synthetic ANSI-flood benchmark (full-screen truecolor
 SGR repaints, gol-c-style):
 
-| | Throughput | vs alacritty |
-|---|---:|---:|
-| `Wait(1)` (vsync on)  | ~110 MB/s | ~55% |
-| `DontWait` (vsync off)| ~178 MB/s | ~85% |
+| | Throughput |
+|---|---:|
+| `Wait(1)` (vsync on)  | ~110 MB/s |
+| `DontWait` (vsync off)| ~178 MB/s |
+
+Combined with the per-burst frame-rate throttle (see `docs/performance.md`),
+this is what gets us into the truecolor-grid 2.0× and gol-c parity range
+against alacritty.
 
 Won't this tear? On Wayland, no — the compositor enforces tearing
 prevention regardless of our app's swap interval. On X11, full-screen
@@ -202,8 +206,8 @@ If you read these in order, you'll have a complete mental model:
 
 1. `src/main.rs` — entry point, event loop, key encoding, CLI parsing
 2. `src/pty.rs` — spawn shell, reader thread, bounded channel
-3. `src/term.rs` — `vte::Perform` impl, viewport into scrollback
-4. `src/renderer.rs` + `src/shader.wgsl` — the GPU side
+3. `src/term.rs` — `Term::feed` (parser fast paths + `vte::Perform` fallback), viewport into scrollback
+4. `src/renderer.rs` + `src/shader.{vert,frag}` — the GPU side (GLSL 330)
 
 The rest (`grid.rs`, `font.rs`, `gpu.rs`) are exactly what their names
 suggest, and you can read them as needed.
@@ -363,31 +367,83 @@ Back on the main thread, when `UserEvent::PtyData` fires:
 ```rust
 let bytes = pty.drain();
 self.term.feed(&bytes);
-window.request_redraw();
+self.dirty = true;
+self.maybe_request_redraw();
 ```
 
-`Term::feed` (`src/term.rs`) is where the byte enters the parser:
+`maybe_request_redraw` consults the frame throttle (see
+`docs/performance.md`) before actually calling `window.request_redraw()` —
+during a sustained burst we deliberately render less often so we paint
+the *result* of the burst instead of every intermediate state.
+
+`Term::feed` (`src/term.rs`) is where the byte enters our parser. It
+has two layers: an **inline fast path** for the bytes we know how to
+dispatch directly, and **vte as the slow-path fallback** for everything
+else.
 
 ```rust
 pub fn feed(&mut self, bytes: &[u8]) {
-    let sb_before = self.primary.scrollback.len();
     let mut parser = std::mem::take(&mut self.parser);
-    let mut performer = Performer { term: self };
-    for &b in bytes {
+    let mut performer = Performer { term: self, in_ground: self.parser_in_ground };
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if performer.in_ground {
+            // Printable-ASCII run, C0 controls (BS/HT/LF/CR), and
+            // ESC[…m / ESC[…H sequences are dispatched directly to
+            // Grid methods here, skipping vte entirely.
+            // ...
+        }
+        // Slow path: hand off to vte for anything else.
+        performer.in_ground = false;
         parser.advance(&mut performer, b);
+        i += 1;
     }
+    self.parser_in_ground = performer.in_ground;
     self.parser = parser;
     // ...viewport anchoring, see below
 }
 ```
 
-There's a small Rust borrow-checker dance here: `vte::Parser::advance`
-needs `&mut Performer`, and `Performer` needs `&mut Term` to mutate the
-grid. But the parser *also* lives inside `Term`. So we `mem::take` the
-parser out for the duration of the call, which leaves a default
-`Parser::default()` sitting in `self.parser` temporarily. After
-`advance` returns, we put the real parser back. This is cleaner than
-splitting `Term` into separate "parser" and "state" structs.
+There are four inline fast paths, all gated on the parser being in its
+"Ground" state (vte's idle state, where the next printable byte is just
+a `print(c)` callback):
+
+1. **Printable-ASCII runs** (`0x20..=0x7E`) — coalesced into a single
+   loop that calls `Grid::put_char` per byte. Skips vte's per-byte
+   state-machine overhead for the ~95% of any text-heavy workload that
+   is plain ASCII.
+2. **C0 controls** (BS/HT/LF/VT/FF/CR, plus BEL as a no-op) — match
+   directly on the byte and call the Grid method. Skips the
+   `Performer::execute` callback dispatch.
+3. **Inline SGR** (`ESC [ <digits>;<digits>… m`) — scan the params
+   into a fixed-size `[u16; 16]` and dispatch to `apply_sgr_simple`,
+   a flat-slice variant of `apply_sgr`. Skips vte's `Params` allocation
+   and per-byte advance.
+4. **Inline CUP** (`ESC [ <row>;<col> H` or `f`) — same parse machinery
+   as SGR, dispatches to `Grid::goto`.
+
+Anything that doesn't match (subparam SGRs `38:2:R:G:B`, intermediate
+bytes, unknown CSI finals, OSC, ESC sequences other than CSI, UTF-8
+multi-byte) falls through to `parser.advance(&mut performer, b)` —
+the vte path with `Performer` callbacks unchanged. Correctness is
+preserved by construction; the fast paths only handle cases we've
+proven equivalent to vte's dispatch (regression tests in
+`term::tests::inline_sgr_*`, `inline_cup_*`, `control_byte_fast_path_*`).
+
+`performer.in_ground` mirrors vte's parser state. We set it `false`
+before every `parser.advance` and the dispatching `Performer` callbacks
+(`print`, `execute`, `csi_dispatch`, etc.) flip it back `true` when
+they fire — bytes that just accumulate mid-state (CSI params before
+the final, OSC body, UTF-8 continuation) leave it `false`, so the
+next byte stays on the slow path until vte returns to Ground.
+
+The `mem::take` dance: `vte::Parser::advance` needs `&mut Performer`,
+and `Performer` needs `&mut Term`. But the parser also lives inside
+`Term`. So we move the parser out for the duration of the call and
+put it back afterwards. Cleaner than splitting `Term` into separate
+"parser" and "state" structs.
 
 ### What `Performer` actually does
 
@@ -405,10 +461,16 @@ fn osc_dispatch(&mut self, params: &[&[u8]], _bell: bool)          // OSC (windo
 ```
 
 Each of these mutates a `Grid` (`src/grid.rs`). `Grid` owns a
-`Vec<Row>` (visible lines) and a `VecDeque<Row>` (scrollback, capped at
-10,000 lines). When the cursor LFs past `scroll_bot` and the scroll
-region is the full screen, the top row gets pushed into scrollback —
-that's the only path by which lines enter scrollback.
+`VecDeque<Row>` for the visible lines and another `VecDeque<Row>` for
+scrollback (capped at 10,000 lines). Both are deques because the hot
+operation — full-screen scroll — is `pop_front` on the top row +
+`push_back` of a fresh blank, both O(1). Region scrolls inside a
+custom scroll region stay O(n) via hand-rolled swap pairs since
+`VecDeque` has no slice rotate. When the cursor LFs past `scroll_bot`
+and the scroll region is the full screen, the popped row gets pushed
+into scrollback — that's the only path by which lines enter
+scrollback. We also recycle the oldest scrollback row when scrollback
+is full to save an alloc/free per scroll.
 
 The cursor itself has a quirk worth knowing about: **xterm-style sticky
 wrap.** Writing the last column does *not* immediately wrap; we set
@@ -493,7 +555,7 @@ Open `src/renderer.rs` and look at `CellInstance`:
 
 ```rust
 #[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable, Default)]
+#[derive(Copy, Clone, Default)]
 struct CellInstance {
     cell_xy: [u32; 2],         // grid coords (col, row)
     glyph_origin: [u32; 2],    // glyph position in the atlas, in pixels
@@ -504,43 +566,44 @@ struct CellInstance {
 }
 ```
 
-That's 64 bytes per cell. For an 80×24 grid, the entire instance buffer
-is 120 KB; for a maximized 200×60 it's 768 KB. We upload the whole thing
-every frame. That sounds wasteful and is, in fact, the wrong choice in
-the long run, but at this scale `Queue::write_buffer` is a sub-millisecond
-operation on any modern GPU and there's no point optimizing it yet.
+That's 64 bytes per cell. For an 80×24 grid the entire instance buffer
+is 120 KB; for a maximized 200×60 it's 768 KB. We upload the whole
+thing every frame via `glBufferSubData`. At this scale the upload is a
+sub-millisecond operation; packing tighter (u8 colors, u16 geometry)
+is on the table but isn't currently the bottleneck — see
+`docs/performance.md`.
 
-There's no vertex buffer. The shader uses `vertex_index` (0..6) to pick
-which corner of a triangle pair to emit:
+There's no vertex buffer. The vertex shader uses `gl_VertexID` (0..6) to
+pick which corner of a triangle pair to emit:
 
-```wgsl
-var corners = array<vec2<f32>, 6>(
-    vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-    vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+```glsl
+const vec2 corners[6] = vec2[6](
+    vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
+    vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0)
 );
 ```
 
-So one instanced draw call (`pass.draw(0..6, 0..instance_count)`) draws
-the entire screen.
+So one instanced draw call (`glDrawArraysInstanced(GL_TRIANGLES, 0, 6, instance_count)`)
+draws the entire screen.
 
 ### The folded shader
 
 The trick that lets us render the whole grid in a single pass is in
-`src/shader.wgsl`. Each cell quad covers the full cell rectangle. The
-fragment shader figures out, *for each pixel*, whether that pixel is
-inside the glyph's bounding box. If yes, it samples the alpha mask. If
-no, it returns zero alpha:
+`src/shader.frag` (GLSL 330). Each cell quad covers the full cell
+rectangle. The fragment shader figures out, *for each pixel*, whether
+that pixel is inside the glyph's bounding box. If yes, it samples the
+alpha mask. If no, it returns zero alpha:
 
-```wgsl
-let glyph_local = in.cell_local - in.glyph_offset_px;
-var alpha: f32 = 0.0;
-if (in.glyph_size_px.x > 0.0
-    && glyph_local.x >= 0.0 && glyph_local.x < in.glyph_size_px.x
-    && glyph_local.y >= 0.0 && glyph_local.y < in.glyph_size_px.y) {
-    let uv = (in.glyph_origin_px + glyph_local) / u.atlas_size;
-    alpha = textureSample(atlas_tex, atlas_samp, uv).r;
+```glsl
+vec2 glyph_local = v_cell_local - v_glyph_offset_px;
+float alpha = 0.0;
+if (v_glyph_size_px.x > 0.0
+    && glyph_local.x >= 0.0 && glyph_local.x < v_glyph_size_px.x
+    && glyph_local.y >= 0.0 && glyph_local.y < v_glyph_size_px.y) {
+    vec2 uv = (v_glyph_origin_px + glyph_local) / u_atlas_size;
+    alpha = texture(u_atlas, uv).r;
 }
-return in.bg * (1.0 - alpha) + in.fg * alpha;
+out_color = mix(v_bg, v_fg, alpha);
 ```
 
 The output is a manual mix — no GPU blend state. Cells don't overlap, so
@@ -627,22 +690,29 @@ gutter is cheap defense in depth.
 
 ### sRGB and gamma
 
-The wgpu surface format we pick is `Bgra8UnormSrgb`. This means the
-swap chain texture is in sRGB color space, and wgpu *automatically*
-gamma-encodes our linear-light shader output when writing to it. So
-the shader does its mixing in linear space and the screen sees correct
-sRGB.
+We enable `GL_FRAMEBUFFER_SRGB` on the default framebuffer. That means
+GL automatically gamma-encodes our linear-light shader output when
+writing to the screen. So the shader does its mixing in linear space
+and the screen sees correct sRGB.
 
 We linearize the palette and any truecolor RGB values *once on the CPU*
-when packing instances:
+when packing instances. The math is:
 
 ```rust
-fn srgb_to_linear(c: u8) -> f32 {
+fn srgb_to_linear_formula(c: u8) -> f32 {
     let s = c as f32 / 255.0;
     if s <= 0.04045 { s / 12.92 }
     else { ((s + 0.055) / 1.055).powf(2.4) }
 }
 ```
+
+But the per-call `powf` ran in the per-cell render hot path —
+truecolor cells in a full-screen workload (gol-c, log-color tools)
+hit it tens of thousands of times per frame. We replaced the call
+with a precomputed 256-entry lookup (`SRGB_LUT` in `renderer.rs`),
+populated once at process start. Each `srgb_to_linear(c: u8)` is now
+one bounds-checked array load. Bitwise-tested against the original
+formula across all 256 inputs.
 
 The shader never knows about gamma; it just blends.
 
@@ -840,7 +910,8 @@ char with full-row columns). Vi `Ctrl-v` is the only producer of
 
 Three things have to happen in lockstep when the user resizes:
 
-1. The wgpu surface is reconfigured to the new dimensions.
+1. The GL surface is reconfigured to the new dimensions
+   (`Surface::resize` from glutin + `glViewport`).
 2. The `Term`'s internal grid resizes (rows/cols change). Lines are
    added or truncated; the cursor is clamped.
 3. The PTY's winsize is updated via `ioctl(TIOCSWINSZ)` — wrapped by
@@ -854,8 +925,10 @@ gpu.resize(size.width, size.height);
 let (rows, cols) = grid_dims_for_window(gpu.cell_size(), size.width, size.height);
 self.term.resize(rows as usize, cols as usize);
 if let Some(pty) = self.pty.as_ref() { pty.resize(rows, cols); }
-window.request_redraw();
 ```
+
+(No explicit `request_redraw` — the resize itself sets `dirty` via the
+event-handling chain and the throttle path picks it up.)
 
 `grid_dims_for_window` is just integer division: `cols = width / cell_w`,
 `rows = height / cell_h`. We don't reflow scrollback when columns
@@ -882,26 +955,18 @@ if let Some(target) = font_zoom_target(&logical_key, self.modifiers, gpu.font_si
 `Gpu::set_font_size` rebuilds the entire `FontAtlas` at the new pixel
 size and calls `Renderer::reload_font` (which re-uploads the texture
 data and updates the cell-size uniform). The atlas dimensions stay at
-1024×1024, so the wgpu texture, view, and bind group don't need to be
-recreated — only the contents change. After that we recompute grid
-dims, `Term::resize`, `pty.resize`, and trigger a redraw.
+1024×1024, so the GL texture object doesn't need to be recreated —
+only the contents change via `glTexSubImage2D`. After that we
+recompute grid dims, `Term::resize`, `pty.resize`, and trigger a
+redraw.
 
 Each step is on the order of a millisecond. There's no visible hitch.
 
 ## What's deliberately not here
 
-Roughly in order of "you might miss it":
-
-- **Application cursor keys (DECCKM).** In some modes vim and tmux
-  expect arrow keys to send `SS3 A/B/C/D` instead of `CSI A/B/C/D`. We
-  always send `CSI`. Most things still work; specific edge cases in vim
-  insert mode might not.
-- **Bracketed paste (`?2004h`).** When set, pasted content should be
-  wrapped in `ESC [ 200~ ... ESC [ 201~`. We ignore the mode toggle.
-- **Mouse reporting.** Wheel scrolls scrollback locally; we don't
-  forward clicks/drags as VT mouse sequences.
-- **Selection and clipboard.** Drag-to-select isn't implemented.
-- **OSC 52 / OSC 8.** Programmatic clipboard writes and hyperlinks.
+- **OSC 52 / OSC 8.** Programmatic clipboard writes and terminal
+  hyperlinks. Both are reasonable additions in `src/term.rs::osc_dispatch`
+  if someone needs them.
 - **Color emoji.** swash gives us color glyphs (COLR/CBDT) when the font
   has them, but we collapse them to luminance for the alpha-mask atlas.
   A real emoji path needs an RGBA atlas (separate texture or array
@@ -909,9 +974,10 @@ Roughly in order of "you might miss it":
 - **Ligatures.** Would need `rustybuzz` shaping for runs that contain
   ligature-eligible sequences, and a corresponding break in the
   one-cell-one-instance invariant.
-- **Frame pacing.** We redraw on every PTY data event. For chatty
-  programs we already coalesce via `request_redraw`, but a smarter
-  budget (e.g. cap at 120 Hz) would cut GPU work.
+- **Tab/window management.** No tabs, no split panes — soltty is
+  one terminal per window. Pair with tmux/zellij/screen if you want
+  that layer.
+- **Sixel / image protocols** (Kitty, iTerm2). We don't render images.
 
 If you want a feature in that list, the right place to start is
 usually `src/term.rs` (parser side) or `src/renderer.rs` (visual side).
@@ -921,9 +987,11 @@ Most of them are small additions — the architecture has room for them.
 
 A few choices that aren't obvious from looking at `Cargo.toml`:
 
-- **`vte` (Alacritty's parser)** instead of writing our own. The state
+- **`vte` (Alacritty's parser)** as the slow-path parser. The state
   machine is small but pedantically correct; reimplementing it is a
-  classic "looks easy, isn't" exercise.
+  classic "looks easy, isn't" exercise. We bypass it for the hot
+  bytes (printable ASCII, C0 controls, SGR, CUP) but keep it as the
+  fallback for everything else.
 - **`swash`** instead of `fontdue`/`ab_glyph`. Fontdue is fine but
   swash is what cosmic-text uses internally — it handles color emoji
   (COLR/CBDT), is fast, and is actively maintained. We don't use most
@@ -933,9 +1001,10 @@ A few choices that aren't obvious from looking at `Cargo.toml`:
   has nothing to do with the interesting problem.
 - **`etagere`** because shelf packing is a small, well-solved problem
   and doing it inline would be 100 lines of distraction.
-- **`bytemuck`** for the `Pod`/`Zeroable` derives on instance/uniform
-  structs — it's the standard way to safely cast a `&[CellInstance]`
-  into the `&[u8]` that `wgpu::Queue::write_buffer` wants.
+- **No `bytemuck`.** `CellInstance` is `#[repr(C)]` and we pass it to
+  `glBufferSubData` via a manually-constructed `&[u8]` from
+  `slice::from_raw_parts(ptr as *const u8, len * size_of::<CellInstance>())`.
+  One `unsafe` block, no extra crate.
 - **No font discovery crate** (e.g. `font-kit`). We hand-probe a list of
   common system paths and accept a `SOLTTY_FONT` env override. That's
   uglier but adds zero dependencies and is enough.
@@ -945,14 +1014,15 @@ A few choices that aren't obvious from looking at `Cargo.toml`:
 A small triage cheat sheet:
 
 - **Window opens black, no text.** Shader compile failure. Look for
-  `validating fragment stage` in stderr.
+  `glCompileShader` errors in stderr.
 - **Text renders but at the wrong size or with wrong baseline.** Check
   `cell:` log line at startup (printed by `FontAtlas::new`). The
   numbers come from `compute_cell_metrics` in `font.rs`.
-- **Colors look washed out or weirdly saturated.** Gamma. Check that
-  the surface is sRGB (`format=Bgra8UnormSrgb` in startup log). If we
-  pick a non-sRGB format, our linear-light shader output would display
-  raw, looking too dark.
+- **Colors look washed out or weirdly saturated.** Gamma. We rely on
+  `GL_FRAMEBUFFER_SRGB` being enabled and on the framebuffer being
+  sRGB-encoded. Check `gl:` log line at startup for the renderer
+  string and confirm `glEnable(GL_FRAMEBUFFER_SRGB)` is called in
+  `Gpu::new`.
 - **Cursor invisible.** Check `Term::viewport_cursor` first — it
   returns `None` if `?25l` (DECTCEM hide) is in effect on either
   screen, or if the cursor scrolled out of view. If a program hid the
@@ -974,7 +1044,7 @@ A small triage cheat sheet:
 
 ---
 
-That's the whole picture. ~2,600 lines of Rust + 72 lines of WGSL,
-backed by 25 unit tests. The architecture is small enough that the
+That's the whole picture. ~9,000 lines of Rust + ~160 lines of GLSL,
+backed by 110 unit tests. The architecture is small enough that the
 explanation fits in one document — which is, in a way, the entire
 point of building it.
