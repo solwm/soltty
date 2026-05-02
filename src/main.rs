@@ -124,6 +124,10 @@ fn main() {
         held_buttons: 0,
         last_reported_cell: None,
         burst_holdoff: 0,
+        // Assume focused at startup; the compositor sends a Focused
+        // event shortly after window creation that will correct this
+        // if we came up unfocused.
+        focused: true,
         config: cfg,
     };
     event_loop.run_app(&mut app).expect("run event loop");
@@ -214,6 +218,13 @@ struct App {
     /// Activation key for vi mode. Read from `SOLTTY_VI_KEY` at startup,
     /// defaults to Ctrl+Shift+Space.
     vi_keybind: vi::ViKeyBind,
+    /// Window focus state, mirrored from `WindowEvent::Focused`. When
+    /// false we suppress cursor blinking — the user isn't looking, no
+    /// reason to keep waking the event loop every 500 ms to flip the
+    /// cursor on/off. The cursor still draws (just steady) so when
+    /// focus comes back it's visible without needing to "catch" a
+    /// blink.
+    focused: bool,
     /// Bit field of currently-held mouse buttons (bit 0 = left, 1 =
     /// middle, 2 = right). Tracked here because winit only tells us
     /// individual press/release events, but mouse-reporting modes
@@ -490,6 +501,21 @@ impl ApplicationHandler<UserEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => {
+                // Suppress cursor blink while unfocused; on regaining
+                // focus reset the blink phase so the cursor lights up
+                // "on" immediately rather than catching mid-off. Mark
+                // dirty either way so the next paint reflects the new
+                // visibility.
+                if self.focused != focused {
+                    self.focused = focused;
+                    if focused {
+                        self.blink_epoch = Instant::now();
+                    }
+                    self.dirty = true;
+                    self.maybe_request_redraw();
+                }
+            }
             WindowEvent::Resized(size) => {
                 gpu.resize(size.width, size.height);
                 let (rows, cols) = grid_dims_for_window(gpu.cell_size(), size.width, size.height);
@@ -1405,6 +1431,12 @@ impl App {
     /// while reading in normal/visual mode); Bar and Underline blink at
     /// `BLINK_HALF_PERIOD * 2`.
     fn cursor_blinks(&self) -> bool {
+        // Unfocused windows don't blink — there's nobody watching the
+        // strobe, and stopping it lets the event loop sleep instead
+        // of waking every 500 ms to flip phase.
+        if !self.focused {
+            return false;
+        }
         match self.term.cursor_shape() {
             // HollowBlock is internal (vi-mode); apps can't request it,
             // and we don't blink it for the same reason as Block — vi
