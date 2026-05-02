@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="soltty" width="240">
+</p>
+
 # soltty
 
 A GPU-accelerated terminal emulator for Linux and macOS, written in Rust.
