@@ -282,25 +282,28 @@ impl Term {
                 && i + 1 < n
                 && bytes[i + 1] == b'['
             {
-                // Fixed-size param array — SGR params are always
-                // small ints, 16 slots covers `38;2;R;G;B` chained
-                // with attrs.
+                // Fixed-size param array — both SGR and CUP params
+                // are always small ints; 16 slots covers any realistic
+                // `38;2;R;G;B` chained with attrs.
                 let mut params: [u16; 16] = [0; 16];
                 let mut np = 0usize;
                 let mut cur: u32 = 0;
                 let mut overflow = false;
                 let mut j = i + 2;
-                let mut found_m = false;
+                let mut final_byte: u8 = 0;
                 let mut bail = false;
                 while j < n {
                     let bj = bytes[j];
-                    if bj == b'm' {
+                    // Final bytes we know how to dispatch inline:
+                    // `m` (SGR), `H`/`f` (CUP). Anything else falls
+                    // back to vte for correctness.
+                    if bj == b'm' || bj == b'H' || bj == b'f' {
                         if np < params.len() {
                             params[np] = cur.min(u16::MAX as u32) as u16;
                             np += 1;
                         }
                         j += 1;
-                        found_m = true;
+                        final_byte = bj;
                         break;
                     }
                     if bj == b';' {
@@ -321,21 +324,36 @@ impl Term {
                         continue;
                     }
                     // Anything else — `:` subparams, intermediates,
-                    // a non-`m` final, control bytes — means vte's
-                    // path is the safe choice.
+                    // an unknown final, control bytes — vte handles.
                     bail = true;
                     break;
                 }
-                if found_m && !overflow && !bail {
-                    apply_sgr_simple(performer.term.grid_mut(), &params[..np]);
+                if final_byte != 0 && !overflow && !bail {
+                    let grid = performer.term.grid_mut();
+                    match final_byte {
+                        b'm' => apply_sgr_simple(grid, &params[..np]),
+                        b'H' | b'f' => {
+                            // CUP: 1-based row;col, both default to 1.
+                            // Empty params (`CSI H`) → (1, 1) → (0, 0).
+                            let row = params.first().copied().unwrap_or(0);
+                            let col = params.get(1).copied().unwrap_or(0);
+                            // np tells us which params were actually
+                            // present. `arg`-style fallback: treat
+                            // missing-or-zero as 1.
+                            let r = if np >= 1 && row > 0 { row as usize - 1 } else { 0 };
+                            let c = if np >= 2 && col > 0 { col as usize - 1 } else { 0 };
+                            grid.goto(r, c);
+                        }
+                        _ => unreachable!(),
+                    }
                     i = j;
-                    // SGR completed — back in Ground.
+                    // CSI completed — back in Ground.
                     performer.in_ground = true;
                     continue;
                 }
-                // Otherwise fall through. The CSI may not be SGR,
-                // may have subparams, or may straddle the chunk
-                // boundary; vte handles all three.
+                // Otherwise fall through. The CSI may not be one we
+                // inline, may have subparams, or may straddle the
+                // chunk boundary; vte handles all three.
             }
             // Hand to vte. Every dispatching callback flips
             // `in_ground` back to true; bytes that just accumulate
@@ -1050,6 +1068,34 @@ mod tests {
         t.feed(b"\x1b[38;2;");
         t.feed(b"10;20;30m");
         assert_eq!(t.grid().pen.fg, Color::Rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn inline_cup_matches_vte_dispatch() {
+        // CUP cases: empty (defaults to 1;1), full row+col, alternate
+        // `f` final, missing-leading-param. Each must land the cursor
+        // where vte would, exactly.
+        let cases: &[&[u8]] = &[
+            b"\x1b[H",
+            b"\x1b[3;5H",
+            b"\x1b[3;5f",
+            b"\x1b[;5H",  // row default = 1 → row 0
+            b"\x1b[7H",   // col default = 1 → col 0
+        ];
+        for bytes in cases {
+            let mut a = Term::new(10, 20);
+            a.feed(bytes);
+            let mut b = Term::new(10, 20);
+            for &c in *bytes {
+                b.feed(&[c]);
+            }
+            assert_eq!(
+                (a.grid().cursor.row, a.grid().cursor.col),
+                (b.grid().cursor.row, b.grid().cursor.col),
+                "cursor mismatch on {:?}",
+                bytes
+            );
+        }
     }
 
     #[test]
