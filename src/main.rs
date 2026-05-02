@@ -272,7 +272,7 @@ const BURST_BYTES_THRESHOLD: usize = 4096;
 /// cost; halving render frequency during the burst converges on the
 /// 60-Hz numbers (where we're at ~0.89x parity) while typing keeps
 /// the full refresh rate.
-const BURST_FRAME_MULTIPLIER: u32 = 2;
+const BURST_FRAME_MULTIPLIER: u32 = 3;
 /// How many renders we stay in burst mode for, after the last big
 /// drain. Keeps us coasting through the burst without thrashing back
 /// and forth on a single momentarily-empty drain.
@@ -862,6 +862,12 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                 ..
             } => {
+                // Cancel any burst-mode render hold-off the moment the
+                // user touches the keyboard. The shell's echo of this
+                // keystroke needs to paint at full refresh rate, even
+                // if a `cat large.log` had us in slow-render mode an
+                // instant earlier.
+                self.burst_holdoff = 0;
                 log::debug!(
                     "key: logical={logical_key:?} physical={physical_key:?} text={text:?} ctrl={} shift={} alt={}",
                     self.modifiers.control_key(),
