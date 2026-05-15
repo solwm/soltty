@@ -138,6 +138,14 @@ not-blinking + redraw-already-pending state, the body would
 compute `Instant::now()` and walk to the same `return`. Bail up
 front. Saved ~1.5% on gol-c, more under heavy event traffic.
 
+The early-outs must reset `ControlFlow` to `Wait` first.
+winit's ControlFlow persists across iterations, so once a prior
+pass has set `WaitUntil(t)` and that deadline elapses, an early-out
+that doesn't touch ControlFlow leaves the loop with a deadline in
+the past — every iteration wakes immediately and the main thread
+pins a CPU at 100%. The two branches below that genuinely need a
+timer (blink phase, burst-throttled redraw) override the reset.
+
 ### Renderer micro-opts
 
 | commit     | change                                                   |

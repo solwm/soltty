@@ -373,6 +373,14 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // winit's ControlFlow persists across iterations. If a prior
+        // pass set `WaitUntil(t)` and we now have nothing to schedule,
+        // we must restore `Wait` — otherwise once `t` elapses the loop
+        // spins at 100% CPU, since every iteration sees a deadline in
+        // the past and re-wakes immediately. The two branches below
+        // that genuinely need a timer override this back to WaitUntil.
+        event_loop.set_control_flow(ControlFlow::Wait);
+
         let blinking = self.cursor_blinks();
         // Pre-screen: if there's nothing dirty and we're not blinking,
         // there's no work to schedule. Skip the clock_gettime entirely
