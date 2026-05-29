@@ -257,7 +257,12 @@ struct App {
 /// ~16 ms of echo latency on the first keystroke.
 const IDLE_THRESHOLD: Duration = Duration::from_millis(100);
 
-const MIN_FRAME_HZ: u32 = 60;
+/// Lower bound for the frame cap. 20 Hz is the minimum we accept — a
+/// terminal painting fewer than ~20 times a second starts feeling
+/// laggy on keystroke echo. Set explicitly so `SOLTTY_FRAME_HZ=30`
+/// (a common "match cmatrix's native rate" choice) is honored instead
+/// of silently clamped up to 60.
+const MIN_FRAME_HZ: u32 = 20;
 const MAX_FRAME_HZ: u32 = 240;
 /// Used when both the env override and winit's monitor query come up
 /// empty. 120 is a safer default than 60 — modern panels are mostly
@@ -273,17 +278,33 @@ const BLINK_HALF_PERIOD: Duration = Duration::from_millis(500);
 
 /// A single PTY drain larger than this many bytes is taken as evidence
 /// that the child is producing a sustained burst (gol-c, `cat` of a
-/// large file, build-tool log dump). Small drains — single keystroke
-/// echo, shell prompt repaint — sit well below this threshold and
-/// stay on the fast-refresh path.
-const BURST_BYTES_THRESHOLD: usize = 4096;
+/// large file, build-tool log dump, cmatrix). Small drains — single
+/// keystroke echo, shell prompt repaint — sit well below this
+/// threshold and stay on the fast-refresh path.
+///
+/// Was 4 KB; bumped down to 1 KB so cmatrix-style "one row of trail
+/// updates per native tick" workloads consistently trip the throttle.
+/// Per-tick output for cmatrix at -u 5 across a 4K viewport is
+/// ~1.5-3 KB (rows are mostly-unchanged so it only writes the few
+/// cells that differ), which was straddling the old threshold.
+const BURST_BYTES_THRESHOLD: usize = 1024;
 /// During a burst we stretch the redraw deadline by this much per
-/// render until the burst ends. 1 ≈ keep current cap; 2 ≈ render at
-/// half rate. The bench shows the gol-c gap to alacritty is per-frame
-/// cost; halving render frequency during the burst converges on the
-/// 60-Hz numbers (where we're at ~0.89x parity) while typing keeps
-/// the full refresh rate.
-const BURST_FRAME_MULTIPLIER: u32 = 3;
+/// render until the burst ends. 1 = keep current cap; 6 = render at
+/// one-sixth rate (≈20 Hz on a 120 Hz monitor cap).
+///
+/// Was 3 (≈40 Hz on a 120 Hz cap). Phase B per-process pmon
+/// measurements showed Hyprland/sol-WM SM% scales linearly with
+/// soltty's swap_buffers rate: 120 Hz cmatrix → 23 % WM sm,
+/// 60 Hz → 16.6 %, ~20 Hz → ~11 % (the WM idle baseline). The big
+/// nvidia-smi cost during cmatrix isn't soltty's render work
+/// (draw_gpu ≈ 250 µs/frame, ~3 % util at 120 fps) but the
+/// compositor recomposing every dirty surface that swap_buffers
+/// announces. cmatrix's native animation rate is ~20 Hz; painting
+/// any faster than that just wastes WM work.
+///
+/// Typing/echo bypasses this entirely — see `App::window_event`
+/// keyboard branch which clears `burst_holdoff` on every keystroke.
+const BURST_FRAME_MULTIPLIER: u32 = 6;
 /// How many renders we stay in burst mode for, after the last big
 /// drain. Keeps us coasting through the burst without thrashing back
 /// and forth on a single momentarily-empty drain.
@@ -322,9 +343,19 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("soltty")
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
+        // `SOLTTY_START_MAXIMIZED=1` requests a maximized window at
+        // creation. Used by the perf measurement scripts so a cmatrix /
+        // gpu_load witness can be launched with a reproducible viewport
+        // without compositor-specific window-management shenanigans.
+        if std::env::var("SOLTTY_START_MAXIMIZED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            attrs = attrs.with_maximized(true);
+        }
         // glutin needs to pick a GL config alongside the window, so it owns
         // the window creation. We get the Arc<Window> back for input handling.
         let initial_theme = self

@@ -1,0 +1,74 @@
+# Phase B baseline. timestamp=2026-05-29T04:29:34Z
+#
+# Two metric layers: total util.gpu (legacy) and per-process sm% (new).
+# Total util.gpu is dominated by the user's WM `sol` (steady ~11-25% sm)
+# regardless of soltty load; per-process SM% via `nvidia-smi pmon -s u`
+# is the only number that isolates soltty's actual contribution.
+#
+# Per-frame breakdown via SOLTTY_GPU_TIMING during cmatrix maximized:
+#   prepare ~310µs CPU (cell walk + buffer pack)
+#   draw_cpu ~45µs CPU (GL submit)
+#   draw_gpu ~250µs GPU (fragment shader)
+#   swap ~0.9ms CPU (driver/compositor block)
+# At ~120 fps the *draw* portion accounts for only ~3% util.gpu — the
+# observed 25% lives in the swap/present pipeline (WM compositing).
+#
+# ============================================================
+# A. Total util.gpu (compare.sh --gpu-sample equivalent)
+# ============================================================
+label	hz	cols	rows	secs	gpu_mean	gpu_p95
+gpu_load_default	monitor	145	74	6.001045	4.66	9.00
+gpu_load_60hz	60	145	74	6.001269	4.34	6.00
+gpu_load_240hz	240	145	74	6.001805	7.09	14.00
+gpu_load_max	monitor	295	75	6.002764	3.89	7.00
+gpu_load_max_60hz	60	295	75	6.002830	4.66	7.00
+cmatrix_max	monitor	-	-	10	25.66	34.00
+cmatrix_max_60hz	60	-	-	10	23.31	34.00
+#
+# ============================================================
+# B. Per-process SM% (nvidia-smi pmon -s u) — the real signal
+# ============================================================
+# scenario	frame_hz	sol_sm_mean	soltty_sm_mean	soltty_sm_max
+idle_host_only	n/a	11.25	7.50	35
+cmatrix_max	monitor(~120)	23.20	0.40	4
+cmatrix_max	60	16.60	0.20	2
+cmatrix_max	30	11.10	1.20	24
+cmatrix_max	20	16.20	1.10	20
+#
+# Key takeaways:
+# 1. soltty's own SM% is noise floor (0-2% mean during cmatrix).
+# 2. WM `sol` scales ~linearly with soltty's swap_buffers rate:
+#    120Hz→23%, 60Hz→16.6%, 30Hz→11.1% — halving Hz roughly halves WM.
+# 3. Damage tracking *inside* soltty won't help: each swap_buffers
+#    signals "surface dirty" to the compositor regardless of which
+#    cells changed. The big lever is fewer swaps, not less per-swap.
+# 4. 30Hz seems to be a sweet spot: matches cmatrix native (~20Hz) and
+#    drops WM to its idle baseline.
+#
+# Revised C ordering:
+#   C2 first — drop default frame cap + tune burst throttle so the WM
+#             sees ~30Hz of damage during cmatrix-like workloads.
+#   C1 next — damage tracking still saves soltty CPU (prepare 310µs→
+#             ~50µs estimated) but moves nvidia-smi <2% absolute.
+#   C3 skip — packing helps neither WM nor a 4090's GPU; defer.
+
+# ============================================================
+# C2 results (BURST_FRAME_MULTIPLIER 3→6, BURST_BYTES_THRESHOLD 4096→1024, MIN_FRAME_HZ 60→20)
+# Measured: 2026-05-29T04:58:47Z
+# ============================================================
+# Alternating-runs A/B (3 each), cmatrix maximized, sol sm% mean:
+#   pre-C2: 22.62%
+#   post-C2: 13.92%
+#   reduction: 38.5%
+#
+# truecolor_grid wallclock (3 alternating runs each):
+#   pre-C2: 0.1422s
+#   post-C2: 0.1394s
+#   delta: 1.9% faster (negative regression)
+#
+# SOLTTY_GPU_TIMING during cmatrix maximized, post-C2:
+#   prepare mean=384µs (was 311µs; per-frame work larger because fewer frames absorb more data)
+#   draw_cpu mean=61µs (was 45µs)
+#   draw_gpu mean=358µs (was 250µs)
+#   swap mean=1.22ms (was 0.9ms)
+# Per-frame is larger but per-second total is similar; WM compositor savings come from fewer swap_buffers calls.

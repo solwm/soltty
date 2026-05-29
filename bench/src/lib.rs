@@ -66,6 +66,20 @@ impl Bench {
     /// pipe even backpressures, and we just measure how fast we can
     /// `write(2)` — not how fast the terminal actually consumes.
     pub fn finish(&self, bytes: u64) {
+        self.emit(self.iters, bytes);
+    }
+
+    /// Like `finish`, but for wallclock-bounded benches: the caller
+    /// counts how many ticks it executed inside its time budget, and
+    /// that count lands in the result file's iters column. Used by
+    /// `gpu_load`, which can't be iteration-bounded because nvidia-smi
+    /// sampling needs a known minimum duration to gather a
+    /// statistically meaningful average.
+    pub fn finish_after(&self, ticks: u64, bytes: u64) {
+        self.emit(ticks, bytes);
+    }
+
+    fn emit(&self, iters: u64, bytes: u64) {
         let drain = ping_terminal(&mut std::io::stdout().lock());
         let secs = self.started.elapsed().as_secs_f64();
         if let Err(e) = drain {
@@ -73,7 +87,7 @@ impl Bench {
         }
         let line = format!(
             "{} {:.6} {} {} {} {}\n",
-            self.name, secs, self.iters, self.cols, self.rows, bytes
+            self.name, secs, iters, self.cols, self.rows, bytes
         );
         if let Err(e) = std::fs::write(&self.out_path, &line) {
             eprintln!("bench: write {}: {e}", self.out_path);

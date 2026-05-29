@@ -1,6 +1,8 @@
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use glow::HasContext;
 use glutin::config::{ConfigTemplateBuilder, GlConfig};
@@ -50,6 +52,8 @@ pub struct Gpu {
     /// the user's font paths without us threading the config through
     /// every winit event handler.
     config: Config,
+    /// Only populated when `SOLTTY_GPU_TIMING=1`. See `FrameTimings`.
+    timings: Option<FrameTimings>,
 }
 
 impl Gpu {
@@ -151,6 +155,24 @@ impl Gpu {
         let inner = window.inner_size();
         let renderer = Renderer::new(&gl, (inner.width, inner.height), &mut atlas, theme);
 
+        let timings = if gpu_timing_enabled() {
+            // Pre-create the GL timer queries used for GPU draw timing.
+            // glQueryCounter results from frame N aren't typically ready
+            // until frame N+2/3, so we ring-buffer FRAME_SLOTS frames'
+            // worth of query objects and only read the oldest one.
+            let queries = unsafe {
+                std::array::from_fn(|_| {
+                    [
+                        gl.create_query().expect("create draw_start query"),
+                        gl.create_query().expect("create draw_end query"),
+                    ]
+                })
+            };
+            Some(FrameTimings::new(queries))
+        } else {
+            None
+        };
+
         let gpu = Self {
             gl,
             surface,
@@ -159,6 +181,7 @@ impl Gpu {
             atlas,
             font_px: initial_font_px,
             config: config.clone(),
+            timings,
         };
 
         // Suppress the "unused" check for fields that aren't read yet.
@@ -225,6 +248,11 @@ impl Gpu {
         vi_active: bool,
         search: Option<&SearchOverlay<'_>>,
     ) {
+        // Fast path: when timing is off, skip every Instant::now() and
+        // every query_counter call — `timings` is None and the matches
+        // collapse.
+        let t0 = self.timings.as_ref().map(|_| Instant::now());
+
         self.renderer.prepare(
             &self.gl,
             term,
@@ -235,14 +263,214 @@ impl Gpu {
             vi_cursor,
             search,
         );
+
+        let t1 = self.timings.as_ref().map(|_| Instant::now());
+
+        // Bracket the draw call(s) with GL_TIMESTAMP queries on the
+        // current frame's ring slot. We read the *previous* (FRAME_SLOTS
+        // ago) slot's results below — by then the GPU has finished those
+        // queries so the read is non-blocking.
+        if let Some(t) = self.timings.as_mut() {
+            let slot = t.next_slot;
+            unsafe {
+                self.gl
+                    .query_counter(t.draw_queries[slot][0], glow::TIMESTAMP);
+            }
+        }
         self.renderer.draw(&self.gl);
         if vi_active {
             self.renderer.draw_tint(&self.gl, VI_TINT_COLOR);
         }
+        if let Some(t) = self.timings.as_mut() {
+            let slot = t.next_slot;
+            unsafe {
+                self.gl
+                    .query_counter(t.draw_queries[slot][1], glow::TIMESTAMP);
+            }
+        }
+
+        let t_swap_start = self.timings.as_ref().map(|_| Instant::now());
         if let Err(e) = self.surface.swap_buffers(&self.context) {
             log::warn!("swap_buffers: {e}");
         }
+
+        if let Some(t) = self.timings.as_mut() {
+            let t2 = t_swap_start.unwrap();
+            let now = Instant::now();
+            t.record_cpu(
+                (t1.unwrap() - t0.unwrap()).as_secs_f64() * 1e6, // prepare µs
+                (t2 - t1.unwrap()).as_secs_f64() * 1e6,           // draw-submit µs
+                (now - t2).as_secs_f64() * 1e3,                   // swap ms
+            );
+            t.poll_and_advance(&self.gl);
+            t.maybe_report(now);
+        }
     }
+}
+
+/// `SOLTTY_GPU_TIMING=1` — enable per-frame draw/prepare/swap timing
+/// printed to stderr each second. Off by default; intended for the
+/// perf-investigation loop.
+fn gpu_timing_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("SOLTTY_GPU_TIMING")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Ring buffer of GL timer queries plus rolling CPU-side stats for
+/// `prepare` and `swap_buffers`. Lives on `Gpu` only when
+/// `SOLTTY_GPU_TIMING=1` was set at process start.
+///
+/// GL timer-query results from frame N typically aren't ready until
+/// frame N+2 — the GPU pipeline is deep. We use a ring of FRAME_SLOTS
+/// query pairs so the slot we read each frame is the one the GPU
+/// finished with several frames ago. `glGetQueryObjectuiv(...,
+/// QUERY_RESULT_AVAILABLE, …)` is the guard.
+struct FrameTimings {
+    draw_queries: [[glow::NativeQuery; 2]; FRAME_SLOTS],
+    /// The slot we fill on this frame. Reads happen on the *next* slot
+    /// over (the oldest one) — see `poll_and_advance`.
+    next_slot: usize,
+    /// True once `next_slot` has cycled all the way around; before that
+    /// the slot we're about to read was never written and would return
+    /// garbage.
+    primed: bool,
+    /// Latest sampled GPU draw time (microseconds), rolling. We keep a
+    /// short window so the printed mean tracks the last ~1 s of frames.
+    draw_gpu_us: VecDeque<f64>,
+    prepare_cpu_us: VecDeque<f64>,
+    draw_cpu_us: VecDeque<f64>,
+    swap_cpu_ms: VecDeque<f64>,
+    last_report: Instant,
+}
+
+const FRAME_SLOTS: usize = 4;
+const HISTORY: usize = 256;
+const REPORT_INTERVAL_MS: u128 = 1_000;
+
+impl FrameTimings {
+    fn new(draw_queries: [[glow::NativeQuery; 2]; FRAME_SLOTS]) -> Self {
+        Self {
+            draw_queries,
+            next_slot: 0,
+            primed: false,
+            draw_gpu_us: VecDeque::with_capacity(HISTORY),
+            prepare_cpu_us: VecDeque::with_capacity(HISTORY),
+            draw_cpu_us: VecDeque::with_capacity(HISTORY),
+            swap_cpu_ms: VecDeque::with_capacity(HISTORY),
+            last_report: Instant::now(),
+        }
+    }
+
+    fn record_cpu(&mut self, prepare_us: f64, draw_submit_us: f64, swap_ms: f64) {
+        push_bounded(&mut self.prepare_cpu_us, prepare_us);
+        push_bounded(&mut self.draw_cpu_us, draw_submit_us);
+        push_bounded(&mut self.swap_cpu_ms, swap_ms);
+    }
+
+    /// After issuing this frame's queries: if the ring has cycled at
+    /// least once, read the slot we're about to overwrite next frame.
+    /// Its queries are stale enough that `QUERY_RESULT_AVAILABLE` is
+    /// almost certainly true; if not (driver hiccup) we skip rather
+    /// than block.
+    fn poll_and_advance(&mut self, gl: &glow::Context) {
+        // Move next_slot forward; this is the slot we'll write next
+        // frame, so reading it now retrieves the *oldest* outstanding
+        // query pair (written FRAME_SLOTS frames ago).
+        self.next_slot = (self.next_slot + 1) % FRAME_SLOTS;
+        if !self.primed {
+            if self.next_slot == 0 {
+                self.primed = true;
+            }
+            return;
+        }
+        let slot = self.next_slot;
+        let [start_q, end_q] = self.draw_queries[slot];
+        unsafe {
+            let avail = gl.get_query_parameter_u32(end_q, glow::QUERY_RESULT_AVAILABLE);
+            if avail == 0 {
+                return; // Driver still working on it; skip this sample.
+            }
+            // GL_TIMESTAMP results are u64 nanoseconds since some
+            // implementation-defined reference. Modern NVIDIA values
+            // sit in the trillions, so reading with the u32 getter
+            // returns GL_MAX_UINT for *both* timestamps and the delta
+            // becomes 0 — silent and useless.
+            //
+            // glow 0.14's `get_query_parameter_u64_with_offset` has a
+            // confusingly named `offset: usize` which is actually used
+            // as the destination pointer for the u64 result. Pass the
+            // address of a stack u64 cast to usize. Verified against
+            // glow native.rs at `gl.GetQueryObjectui64v(..., offset
+            // as *mut _)`.
+            let mut start_ns: u64 = 0;
+            let mut end_ns: u64 = 0;
+            gl.get_query_parameter_u64_with_offset(
+                start_q,
+                glow::QUERY_RESULT,
+                &mut start_ns as *mut u64 as usize,
+            );
+            gl.get_query_parameter_u64_with_offset(
+                end_q,
+                glow::QUERY_RESULT,
+                &mut end_ns as *mut u64 as usize,
+            );
+            let delta_ns = end_ns.saturating_sub(start_ns) as f64;
+            push_bounded(&mut self.draw_gpu_us, delta_ns / 1000.0);
+        }
+    }
+
+    fn maybe_report(&mut self, now: Instant) {
+        if (now - self.last_report).as_millis() < REPORT_INTERVAL_MS {
+            return;
+        }
+        self.last_report = now;
+        eprintln!(
+            "gpu_timing: prepare {} draw_cpu {} draw_gpu {} swap {}",
+            fmt_us(&self.prepare_cpu_us),
+            fmt_us(&self.draw_cpu_us),
+            fmt_us(&self.draw_gpu_us),
+            fmt_ms(&self.swap_cpu_ms),
+        );
+        // Don't clear — let the next interval recompute over a rolling
+        // window. `push_bounded` already caps history at HISTORY frames.
+    }
+}
+
+fn push_bounded(buf: &mut VecDeque<f64>, v: f64) {
+    if buf.len() == HISTORY {
+        buf.pop_front();
+    }
+    buf.push_back(v);
+}
+
+fn fmt_us(buf: &VecDeque<f64>) -> String {
+    if buf.is_empty() {
+        return "n=0".into();
+    }
+    let n = buf.len();
+    let sum: f64 = buf.iter().sum();
+    let mean = sum / n as f64;
+    let mut sorted: Vec<f64> = buf.iter().copied().collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p95 = sorted[((n as f64) * 0.95).floor() as usize];
+    format!("mean={:.0}µs p95={:.0}µs n={}", mean, p95, n)
+}
+
+fn fmt_ms(buf: &VecDeque<f64>) -> String {
+    if buf.is_empty() {
+        return "n=0".into();
+    }
+    let n = buf.len();
+    let sum: f64 = buf.iter().sum();
+    let mean = sum / n as f64;
+    let mut sorted: Vec<f64> = buf.iter().copied().collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p95 = sorted[((n as f64) * 0.95).floor() as usize];
+    format!("mean={:.2}ms p95={:.2}ms n={}", mean, p95, n)
 }
 
 /// Light-green wash painted over the whole window when vi-mode is active.
