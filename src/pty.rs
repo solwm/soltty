@@ -18,6 +18,10 @@ pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     output_rx: Receiver<Vec<u8>>,
+    /// Reusable scratch buffer for `drain` so we don't allocate a fresh
+    /// `Vec<u8>` per call. Under gol-c bench we drain ~1000+ times/sec;
+    /// the per-call malloc/free shows up in profiles.
+    drain_buf: Vec<u8>,
     /// Coalesced-wakeup flag. Reader sets to true after a read; main
     /// clears it at the start of every drain. `on_data` fires winit's
     /// user event only when the flag was previously false — i.e., when
@@ -103,6 +107,7 @@ impl Pty {
             master: pair.master,
             writer,
             output_rx: rx,
+            drain_buf: Vec::with_capacity(256 * 1024),
             wakeup_pending,
             _child: child,
         })
@@ -114,7 +119,11 @@ impl Pty {
         }
     }
 
-    pub fn drain(&self) -> Vec<u8> {
+    /// Drain everything currently pending on the channel. Returns a
+    /// reusable slice borrowed from `self.drain_buf` — caller must
+    /// copy/parse before the next call to `drain` (which truncates the
+    /// buffer back to empty).
+    pub fn drain(&mut self) -> &[u8] {
         // Reset the coalesce flag *first*. Any read that lands between
         // here and the next drain will set it again and re-wake us.
         // Resetting last would race: a read that landed mid-drain could
@@ -123,14 +132,14 @@ impl Pty {
         // first → at most one missed wake per drain, and the channel
         // try_recv loop below catches anything that arrived since.
         self.wakeup_pending.store(false, Ordering::Release);
-        let mut out = Vec::new();
+        self.drain_buf.clear();
         loop {
             match self.output_rx.try_recv() {
-                Ok(chunk) => out.extend_from_slice(&chunk),
+                Ok(chunk) => self.drain_buf.extend_from_slice(&chunk),
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
-        out
+        &self.drain_buf
     }
 
     #[allow(dead_code)] // wired up in milestone 5
