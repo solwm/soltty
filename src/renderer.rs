@@ -83,6 +83,49 @@ fn push_row_damage(
     out.push(Rect::new(x, y, width, ch));
 }
 
+/// `SOLTTY_DAMAGE_DEBUG=1` — every 60 frames, print rolling stats about
+/// the damage list we passed to swap_buffers_with_damage. Used to figure
+/// out why per-swap WM cost stays high during cmatrix.
+fn debug_damage_stats(rects: &[Rect], screen_w: i32, screen_h: i32) {
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    if !*FLAG.get_or_init(|| {
+        std::env::var("SOLTTY_DAMAGE_DEBUG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }) {
+        return;
+    }
+    thread_local! {
+        // (frames, total_rects, total_pct_x100, full_frames, max_rects_in_frame)
+        static STATS: Cell<(u64, u64, u64, u64, u64)> = const { Cell::new((0, 0, 0, 0, 0)) };
+    }
+    let area_full = screen_w as u64 * screen_h as u64;
+    let area: u64 = rects.iter().map(|r| r.width.max(0) as u64 * r.height.max(0) as u64).sum();
+    let pct_x100 = if area_full > 0 { (area * 10000) / area_full } else { 0 };
+    let is_full = pct_x100 >= 9000;
+    STATS.with(|s| {
+        let (n, sum_rects, sum_pct, full_n, max_rects) = s.get();
+        let new_n = n + 1;
+        let new_rects = sum_rects + rects.len() as u64;
+        let new_pct = sum_pct + pct_x100;
+        let new_full = full_n + if is_full { 1 } else { 0 };
+        let new_max = max_rects.max(rects.len() as u64);
+        s.set((new_n, new_rects, new_pct, new_full, new_max));
+        if new_n % 60 == 0 {
+            eprintln!(
+                "damage: {} frames, avg {} rects (max {}), avg {:.2}% surface, {}% frames ≥90% full",
+                new_n,
+                new_rects / new_n,
+                new_max,
+                (new_pct as f64) / (new_n as f64 * 100.0),
+                new_full * 100 / new_n,
+            );
+        }
+    });
+}
+
 const INSTANCE_STRIDE: i32 = std::mem::size_of::<CellInstance>() as i32;
 
 pub struct Renderer {
@@ -547,44 +590,50 @@ impl Renderer {
             return;
         }
 
-        // Walk the grid in row-major order, accumulating min/max col
-        // that differs from the previous frame within each row. The
-        // grid is emitted row-by-row so consecutive instances share
-        // the same `cell_xy[1]` (row) value — a linear scan suffices.
-        let mut i = 0;
-        while i < grid.len() {
-            let row = grid[i].cell_xy[1];
-            let row_start = i;
-            // Advance past all instances on this row.
-            while i < grid.len() && grid[i].cell_xy[1] == row {
-                i += 1;
+        // Emit ONE bounding-box rect covering every cell that differs.
+        //
+        // Engineering note — we cycled through three damage granularities
+        // before landing on this:
+        //
+        //   1. Per-contiguous-run within each row → 200-300 rects/frame.
+        //      Smallest total area but each rect is a separate
+        //      `wl_surface.damage_buffer` call, and Hyprland (Wayland in
+        //      general) has nontrivial per-call overhead. Net WM cost
+        //      went *up*.
+        //
+        //   2. Per-row bounding box → 30 rects/frame. Better, ~3 k
+        //      damage_buffer calls per 6 s test.
+        //
+        //   3. Single bounding box of all dirty cells → 1 rect/frame.
+        //      ~120 calls per 6 s, matching alacritty's pattern. Each
+        //      swap is one damage hint; the WM does one large
+        //      recomposite block.
+        //
+        // For cmatrix-style "many rows touched, sparsely each" the
+        // bounding box is close to full-surface anyway, but the cost
+        // dominator on Hyprland is the swap count × per-call constant,
+        // not the per-pixel blend cost. Spending the call budget once
+        // per frame wins.
+        let mut min_col = i32::MAX;
+        let mut max_col = i32::MIN;
+        let mut min_row = i32::MAX;
+        let mut max_row = i32::MIN;
+        for (k, inst) in grid.iter().enumerate() {
+            if *inst != prev[k] {
+                let col = inst.cell_xy[0] as i32;
+                let row = inst.cell_xy[1] as i32;
+                if col < min_col { min_col = col; }
+                if col > max_col { max_col = col; }
+                if row < min_row { min_row = row; }
+                if row > max_row { max_row = row; }
             }
-            let row_end = i;
-
-            let mut min_col: i64 = -1;
-            let mut max_col: i64 = -1;
-            for k in row_start..row_end {
-                if grid[k] != prev[k] {
-                    let col = grid[k].cell_xy[0] as i64;
-                    if min_col < 0 || col < min_col {
-                        min_col = col;
-                    }
-                    if col > max_col {
-                        max_col = col;
-                    }
-                }
-            }
-            if min_col >= 0 {
-                push_row_damage(
-                    &mut self.damage_rects,
-                    row as i32,
-                    min_col as i32,
-                    max_col as i32,
-                    cw,
-                    ch,
-                    sh,
-                );
-            }
+        }
+        if min_col <= max_col {
+            let x = min_col * cw;
+            let width = (max_col - min_col + 1) * cw;
+            let y = sh - (max_row + 1) * ch;
+            let height = (max_row - min_row + 1) * ch;
+            self.damage_rects.push(Rect::new(x, y, width, height));
         }
 
         // Cursor: drawn via uniforms, not instances, so its movement
@@ -613,6 +662,8 @@ impl Renderer {
         if self.damage_rects.is_empty() {
             self.damage_rects.push(Rect::new(0, 0, 1, 1));
         }
+
+        debug_damage_stats(&self.damage_rects, sw, sh);
 
         self.snapshot_for_next_frame(rows, cols);
     }
