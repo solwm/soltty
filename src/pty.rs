@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
+use std::sync::Arc;
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
@@ -16,6 +18,12 @@ pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     output_rx: Receiver<Vec<u8>>,
+    /// Coalesced-wakeup flag. Reader sets to true after a read; main
+    /// clears it at the start of every drain. `on_data` fires winit's
+    /// user event only when the flag was previously false — i.e., when
+    /// the main thread might be idle. Saves redundant winit dispatches
+    /// during chatty bursts where multiple reads queue between drains.
+    wakeup_pending: Arc<AtomicBool>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -56,15 +64,14 @@ impl Pty {
         let writer = pair.master.take_writer().map_err(io_other)?;
 
         let (tx, rx) = sync_channel::<Vec<u8>>(PTY_CHANNEL_CAP);
+        let wakeup_pending = Arc::new(AtomicBool::new(false));
+        let wakeup_clone = wakeup_pending.clone();
         std::thread::Builder::new()
             .name("soltty-pty-reader".into())
             .spawn(move || {
                 // 64 KB read buffer — matches Linux's default PTY pipe
                 // buffer size, so a chatty producer that fills the kernel
                 // pipe gets drained in a single syscall instead of 8.
-                // Was 8 KB; profiling under gol-c (~460 fps, ~465 KB per
-                // frame) showed the reader hitting ~27 k read() calls per
-                // second. With 64 KB we're down to ~3.5 k.
                 let mut buf = [0u8; 65536];
                 loop {
                     match reader.read(&mut buf) {
@@ -73,7 +80,15 @@ impl Pty {
                             if tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
-                            on_data();
+                            // Coalesced wakeup: only fire `on_data` if a
+                            // previous wakeup hasn't already been signaled
+                            // but not yet consumed by the main thread.
+                            // Under heavy bursts (gol-c writes ~7 chunks
+                            // per frame) this collapses 7 winit dispatches
+                            // into 1.
+                            if !wakeup_clone.swap(true, Ordering::AcqRel) {
+                                on_data();
+                            }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -88,6 +103,7 @@ impl Pty {
             master: pair.master,
             writer,
             output_rx: rx,
+            wakeup_pending,
             _child: child,
         })
     }
@@ -99,6 +115,14 @@ impl Pty {
     }
 
     pub fn drain(&self) -> Vec<u8> {
+        // Reset the coalesce flag *first*. Any read that lands between
+        // here and the next drain will set it again and re-wake us.
+        // Resetting last would race: a read that landed mid-drain could
+        // set the flag, then we'd clear it, and a subsequent read
+        // wouldn't re-wake because the flag was already true. Reset
+        // first → at most one missed wake per drain, and the channel
+        // try_recv loop below catches anything that arrived since.
+        self.wakeup_pending.store(false, Ordering::Release);
         let mut out = Vec::new();
         loop {
             match self.output_rx.try_recv() {
