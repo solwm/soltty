@@ -59,7 +59,13 @@ impl Pty {
         std::thread::Builder::new()
             .name("soltty-pty-reader".into())
             .spawn(move || {
-                let mut buf = [0u8; 8192];
+                // 64 KB read buffer — matches Linux's default PTY pipe
+                // buffer size, so a chatty producer that fills the kernel
+                // pipe gets drained in a single syscall instead of 8.
+                // Was 8 KB; profiling under gol-c (~460 fps, ~465 KB per
+                // frame) showed the reader hitting ~27 k read() calls per
+                // second. With 64 KB we're down to ~3.5 k.
+                let mut buf = [0u8; 65536];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
