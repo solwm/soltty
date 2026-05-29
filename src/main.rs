@@ -289,22 +289,22 @@ const BLINK_HALF_PERIOD: Duration = Duration::from_millis(500);
 /// cells that differ), which was straddling the old threshold.
 const BURST_BYTES_THRESHOLD: usize = 1024;
 /// During a burst we stretch the redraw deadline by this much per
-/// render until the burst ends. 1 = keep current cap; 6 = render at
-/// one-sixth rate (≈20 Hz on a 120 Hz monitor cap).
+/// render until the burst ends. 1 = keep current cap; 3 = render at
+/// one-third rate (≈40 Hz on a 120 Hz monitor cap).
 ///
-/// Was 3 (≈40 Hz on a 120 Hz cap). Phase B per-process pmon
-/// measurements showed Hyprland/sol-WM SM% scales linearly with
-/// soltty's swap_buffers rate: 120 Hz cmatrix → 23 % WM sm,
-/// 60 Hz → 16.6 %, ~20 Hz → ~11 % (the WM idle baseline). The big
-/// nvidia-smi cost during cmatrix isn't soltty's render work
-/// (draw_gpu ≈ 250 µs/frame, ~3 % util at 120 fps) but the
-/// compositor recomposing every dirty surface that swap_buffers
-/// announces. cmatrix's native animation rate is ~20 Hz; painting
-/// any faster than that just wastes WM work.
+/// Went 3 → 6 → 3. The 6× landed when WM compositor cost was the
+/// dominant per-swap overhead (driven by 4× MSAA on the back buffer
+/// — the EGL config picker was scoring "more samples → better");
+/// halving FPS halved compositor work, but the 50 ms swap cadence
+/// read as jerky against cmatrix's ~50 ms native tick. After
+/// switching to an XRGB + no-MSAA EGL config (b994af7) the per-swap
+/// cost dropped enough that 40 Hz now measures *equal or lower* than
+/// 20 Hz on `sol_sm`. 40 Hz is smoother visually and at parity with
+/// alacritty WM-wise; no reason to coast at 20 Hz any more.
 ///
 /// Typing/echo bypasses this entirely — see `App::window_event`
 /// keyboard branch which clears `burst_holdoff` on every keystroke.
-const BURST_FRAME_MULTIPLIER: u32 = 6;
+const BURST_FRAME_MULTIPLIER: u32 = 3;
 /// How many renders we stay in burst mode for, after the last big
 /// drain. Keeps us coasting through the burst without thrashing back
 /// and forth on a single momentarily-empty drain.
