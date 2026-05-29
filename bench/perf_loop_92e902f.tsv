@@ -1,0 +1,9 @@
+# perf_loop run timestamp=2026-05-29T21:01:23Z sha=92e902f
+# runs=5 sample_seconds=6 capture_commits=1
+scenario	terminal	sol_sm	term_sm	term_sm_max	util_mean	util_p95	util_max	util_min	commits_per_s
+cmatrix	soltty	5.00	0.35	6	17.7	36.2	36	5	20.9
+cmatrix	alacritty	6.93	1.66	9	18.1	43.6	43	6	36.3
+idle	soltty	0.27	0.81	9	8.9	21.4	22	2	0.4
+idle	alacritty	0.53	0.00	0	9.1	20.6	20	1	0.4
+gpu_load	soltty	0.10	0.86	6	8.8	21.8	23	1	0.5
+gpu_load	alacritty	5.67	14.30	22	24.3	30.2	30	18	236.4

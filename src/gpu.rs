@@ -69,20 +69,56 @@ impl Gpu {
         theme: &Theme,
         config: &Config,
     ) -> (Arc<Window>, Self) {
+        // Trim the EGL config to the minimum a terminal actually needs:
+        //
+        //   - alpha_size(0): we composite manually in the fragment
+        //     shader, opaque region is set to the full surface — there
+        //     is nothing useful the alpha channel can do. With XRGB
+        //     instead of ARGB the compositor knows the surface is fully
+        //     opaque at the format level (in addition to the explicit
+        //     opaque region hint), so it can skip per-pixel blending.
+        //   - num_samples manually picked at 1 (no MSAA): the text
+        //     atlas is already anti-aliased per-glyph; MSAA on top
+        //     multiplies fragment work + back-buffer bandwidth by the
+        //     sample count for zero visible benefit.
+        //   - depth_size(0) / stencil_size(0): we draw one instanced
+        //     pass and overlay tints with explicit blending state;
+        //     neither buffer is read or written. Allocating them only
+        //     burns memory bandwidth on every swap.
+        //
+        // The picker then favors hardware-accelerated configs with
+        // exactly these properties.
         let template = ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(Some(true))
-            .with_alpha_size(8);
+            .with_alpha_size(0)
+            .with_depth_size(0)
+            .with_stencil_size(0);
 
         let (window, gl_config) = DisplayBuilder::new()
             .with_window_attributes(Some(window_attrs))
             .build(event_loop, template, |configs| {
-                // Pick a config with the most samples we can get; ties broken
-                // by accepting the first.
+                // Score each config: we want samples=1 (no MSAA) AND
+                // alpha_size=0 (opaque). Lower score is better.
+                let score = |c: &glutin::config::Config| -> u32 {
+                    let samples_penalty = c.num_samples() as u32;
+                    let alpha_penalty = if c.alpha_size() == 0 { 0 } else { 100 };
+                    let depth_penalty = if c.depth_size() == 0 { 0 } else { 1 };
+                    let stencil_penalty = if c.stencil_size() == 0 { 0 } else { 1 };
+                    samples_penalty + alpha_penalty + depth_penalty + stencil_penalty
+                };
                 configs
-                    .reduce(|acc, c| if c.num_samples() > acc.num_samples() { c } else { acc })
+                    .reduce(|acc, c| if score(&c) < score(&acc) { c } else { acc })
                     .expect("no GL configs")
             })
             .expect("build display");
+        log::info!(
+            "gl config: samples={} alpha={} buf={:?} depth={} stencil={}",
+            gl_config.num_samples(),
+            gl_config.alpha_size(),
+            gl_config.color_buffer_type(),
+            gl_config.depth_size(),
+            gl_config.stencil_size(),
+        );
         let window = Arc::new(window.expect("DisplayBuilder yielded no window"));
 
         let raw_window_handle = window
