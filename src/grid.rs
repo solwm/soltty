@@ -127,6 +127,14 @@ impl Default for Cell {
 #[derive(Clone, Debug)]
 pub struct Row {
     pub cells: Vec<Cell>,
+    /// Set true on any mutation since the last render. The renderer
+    /// reads this in `compute_damage_rects` to skip the per-cell diff
+    /// for rows that obviously haven't changed (very common during
+    /// gol-c and similar workloads that paint a subgrid of the
+    /// viewport — half the rows are quiescent and shouldn't pay diff
+    /// cost every frame). Renderer's `snapshot_for_next_frame` clears
+    /// the bits via `Term::mark_clean`.
+    pub dirty: bool,
 }
 
 impl Row {
@@ -134,6 +142,11 @@ impl Row {
         let cell = pen.blank_cell();
         Self {
             cells: vec![cell; cols],
+            // Brand-new rows must be drawn on their first frame; the
+            // renderer's snapshot logic also forces a full-damage frame
+            // on the first prepare, but this matches the invariant
+            // that any non-yet-rendered row carries dirty=true.
+            dirty: true,
         }
     }
 
@@ -142,6 +155,7 @@ impl Row {
         for c in &mut self.cells {
             *c = cell;
         }
+        self.dirty = true;
     }
 }
 
@@ -277,7 +291,9 @@ impl Grid {
         let r = self.cursor.row;
         let c = self.cursor.col;
         if r < self.rows && c < self.cols {
-            let cell = &mut self.lines[r].cells[c];
+            let row = &mut self.lines[r];
+            row.dirty = true;
+            let cell = &mut row.cells[c];
             cell.ch = ch;
             cell.fg = self.pen.fg;
             cell.bg = self.pen.bg;
@@ -289,7 +305,7 @@ impl Grid {
             // ' ' — the leading's glyph is what actually gets drawn,
             // spanning both cells in the renderer.
             if width == 2 && c + 1 < self.cols {
-                let spacer = &mut self.lines[r].cells[c + 1];
+                let spacer = &mut row.cells[c + 1];
                 spacer.ch = ' ';
                 spacer.fg = self.pen.fg;
                 spacer.bg = self.pen.bg;
@@ -406,6 +422,11 @@ impl Grid {
             self.scrollback.push_back(old);
             self.lines.push_back(blank);
         }
+        // Every row in the scroll region shifted up: even the rows
+        // whose Row struct didn't change have new viewport positions,
+        // so the renderer's positional CellInstance diff would miss
+        // the shift. Mark them dirty explicitly.
+        self.mark_region_dirty(self.scroll_top, self.scroll_bot);
     }
 
     pub fn scroll_down_in_region(&mut self, n: usize) {
@@ -418,6 +439,18 @@ impl Grid {
             }
             self.lines[self.scroll_top] = Row::blank(self.cols, self.pen);
         }
+        self.mark_region_dirty(self.scroll_top, self.scroll_bot);
+    }
+
+    /// Mark all rows in `[top..=bot]` dirty. Used after scroll/insert/
+    /// delete-line operations, where each row's viewport position
+    /// changed even if its cell contents look unchanged from the
+    /// previous frame.
+    fn mark_region_dirty(&mut self, top: usize, bot: usize) {
+        let end = bot.min(self.rows.saturating_sub(1));
+        for r in top..=end {
+            self.lines[r].dirty = true;
+        }
     }
 
     pub fn erase_line(&mut self, mode: u16) {
@@ -429,11 +462,13 @@ impl Grid {
                 for cc in c..self.cols {
                     self.lines[r].cells[cc] = cell;
                 }
+                self.lines[r].dirty = true;
             }
             1 => {
                 for cc in 0..=c.min(self.cols - 1) {
                     self.lines[r].cells[cc] = cell;
                 }
+                self.lines[r].dirty = true;
             }
             2 => self.lines[r].clear_with(self.pen),
             _ => {}
@@ -471,17 +506,22 @@ impl Grid {
         for c in self.cursor.col..end {
             self.lines[r].cells[c] = cell;
         }
+        if end > self.cursor.col {
+            self.lines[r].dirty = true;
+        }
     }
 
     pub fn delete_chars(&mut self, n: usize) {
         let r = self.cursor.row;
         let c = self.cursor.col;
         let n = n.min(self.cols - c);
-        let row = &mut self.lines[r].cells;
-        row[c..].rotate_left(n);
+        let row = &mut self.lines[r];
+        row.dirty = true;
+        let cells = &mut row.cells;
+        cells[c..].rotate_left(n);
         let blank = self.pen.blank_cell();
         for cc in (self.cols - n)..self.cols {
-            row[cc] = blank;
+            cells[cc] = blank;
         }
     }
 
@@ -489,11 +529,13 @@ impl Grid {
         let r = self.cursor.row;
         let c = self.cursor.col;
         let n = n.min(self.cols - c);
-        let row = &mut self.lines[r].cells;
-        row[c..].rotate_right(n);
+        let row = &mut self.lines[r];
+        row.dirty = true;
+        let cells = &mut row.cells;
+        cells[c..].rotate_right(n);
         let blank = self.pen.blank_cell();
         for cc in c..(c + n) {
-            row[cc] = blank;
+            cells[cc] = blank;
         }
     }
 
@@ -508,6 +550,7 @@ impl Grid {
             }
             self.lines[self.cursor.row] = Row::blank(self.cols, self.pen);
         }
+        self.mark_region_dirty(self.cursor.row, self.scroll_bot);
     }
 
     pub fn delete_lines(&mut self, n: usize) {
@@ -521,6 +564,7 @@ impl Grid {
             }
             self.lines[self.scroll_bot] = Row::blank(self.cols, self.pen);
         }
+        self.mark_region_dirty(self.cursor.row, self.scroll_bot);
     }
 
     pub fn set_scroll_region(&mut self, top: usize, bot: usize) {

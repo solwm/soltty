@@ -201,6 +201,18 @@ pub struct Renderer {
     /// per the EGL spec). Cleared and refilled each `prepare`. `Gpu::render`
     /// reads this and forwards it to `swap_buffers_with_damage`.
     pub damage_rects: Vec<Rect>,
+    /// `row_starts[r]` = index in `instances_scratch` where row r's
+    /// instances begin. `row_starts[rows]` = end-of-grid sentinel.
+    /// Used in two places: (a) the dirty-row fast path in `prepare`
+    /// copies an unchanged row's old instances from `last_grid_instances`
+    /// instead of re-walking its cells; (b) `compute_damage_rects`
+    /// short-circuits per-row diff for rows that the parser flagged
+    /// clean since the last render.
+    row_starts: Vec<u32>,
+    /// Snapshot of `row_starts` from the previous prepare. Lets us
+    /// translate between this frame's per-row indices and last frame's.
+    /// Stays in sync with `last_grid_instances`.
+    last_row_starts: Vec<u32>,
 }
 
 impl Renderer {
@@ -282,6 +294,8 @@ impl Renderer {
             grid_instance_end: 0,
             last_grid_dims: (0, 0),
             damage_rects: Vec::new(),
+            row_starts: Vec::new(),
+            last_row_starts: Vec::new(),
         };
         unsafe { renderer.upload_uniforms(gl) };
         renderer
@@ -391,10 +405,54 @@ impl Renderer {
         }
 
         // Single pass: ensure each cell's glyph in the atlas, then pack the
-        // instance immediately. Same shape as the wgpu version was.
+        // instance immediately.
+        //
+        // Per-row dirty fast path: when the parser hasn't touched a row
+        // since the previous render (its `dirty` bit is false) AND the
+        // grid layout is unchanged (same row/col count + no resize +
+        // no overlays this frame and last) AND last frame's instance
+        // ranges are still trustworthy, we skip the cell walk entirely
+        // and memcpy the row's instances out of `last_grid_instances`.
+        // On gol-c-style workloads that paint a subgrid (gol writes a
+        // 295×75 region into a 426×102 viewport at matched font sizes),
+        // ~26 % of rows are quiescent and were paying full prepare cost
+        // every frame before this.
         self.instances_scratch.clear();
+        self.row_starts.clear();
+        self.row_starts.reserve(rows + 1);
+        // The fast path is only safe when last frame's per-row index
+        // table matches *this* frame's row count and the previous
+        // instances buffer is still positionally valid. compute_damage_rects
+        // does an additional full-damage fallback for the cases where
+        // those preconditions are violated — but the prepare-side reuse
+        // needs its own guard.
+        let row_reuse_ok = self.last_row_starts.len() == rows + 1
+            && self.last_grid_dims == (rows, cols)
+            // The renderer has no direct knowledge of overlay state
+            // *last* frame; we approximate with "the previous frame
+            // also full-damaged the grid via this path's normal exit"
+            // by tracking last_grid_instances.is_empty()-or-not. An
+            // overlay frame leaves last_grid_instances as the grid
+            // portion only (we snapshot from instances_scratch[..
+            // grid_instance_end]) so the lengths still match —
+            // provided dims didn't change.
+            && !self.last_grid_instances.is_empty();
         for vrow in 0..rows {
+            self.row_starts.push(self.instances_scratch.len() as u32);
             let row = term.viewport_row(vrow);
+            if row_reuse_ok && !row.dirty {
+                // Fast path: copy last frame's instances for this row.
+                let start = self.last_row_starts[vrow] as usize;
+                let end = self.last_row_starts[vrow + 1] as usize;
+                if end <= self.last_grid_instances.len() && start <= end {
+                    self.instances_scratch
+                        .extend_from_slice(&self.last_grid_instances[start..end]);
+                    continue;
+                }
+                // last frame's indices look inconsistent — fall through
+                // to the slow path. compute_damage_rects will full-damage
+                // on the layout mismatch.
+            }
             for (col_idx, cell) in row.cells.iter().take(cols).enumerate() {
                 // Spacer cells (the right half of a wide character)
                 // don't get their own instance — the leading cell's
@@ -486,12 +544,17 @@ impl Renderer {
         // get full-window damage (their layout isn't a positional match
         // against last frame so per-row diff doesn't apply).
         self.grid_instance_end = self.instances_scratch.len();
+        // Sentinel: row_starts[rows] is the end-of-grid index. Lets
+        // `compute_damage_rects` derive any row's length as
+        // row_starts[r+1] - row_starts[r] without a special case for
+        // the last row.
+        self.row_starts.push(self.grid_instance_end as u32);
 
         // Compute per-row damage rectangles for this frame's swap.
         // Always do this BEFORE the overlay appends — the diff only
         // considers grid cells, and we want to preserve the diff state
         // (last_grid_instances) across overlay activity.
-        self.compute_damage_rects(rows, cols, search.is_some(), picker.is_some());
+        self.compute_damage_rects(term, rows, cols, search.is_some(), picker.is_some());
 
         // Search bar at the bottom row. After the cell loop so it
         // overwrites whatever's there. Before picker so an open picker
@@ -562,7 +625,7 @@ impl Renderer {
     /// Output is in EGL surface coordinates: origin bottom-left, X right,
     /// Y up. Caller passes the row/col grid dims so we can detect a
     /// resize-induced positional mismatch.
-    fn compute_damage_rects(&mut self, rows: usize, cols: usize, search_active: bool, picker_active: bool) {
+    fn compute_damage_rects(&mut self, term: &Term, rows: usize, cols: usize, search_active: bool, picker_active: bool) {
         self.damage_rects.clear();
 
         let cw = self.cell_size.0 as i32;
@@ -614,18 +677,34 @@ impl Renderer {
         // dominator on Hyprland is the swap count × per-call constant,
         // not the per-pixel blend cost. Spending the call budget once
         // per frame wins.
+        //
+        // Skip per-cell diff for rows the parser flagged clean — they
+        // either came from the dirty-row fast path in `prepare` (literal
+        // memcpy of last frame's instances) or are guaranteed
+        // unchanged. Either way no damage can come from them.
         let mut min_col = i32::MAX;
         let mut max_col = i32::MIN;
         let mut min_row = i32::MAX;
         let mut max_row = i32::MIN;
-        for (k, inst) in grid.iter().enumerate() {
-            if *inst != prev[k] {
-                let col = inst.cell_xy[0] as i32;
-                let row = inst.cell_xy[1] as i32;
-                if col < min_col { min_col = col; }
-                if col > max_col { max_col = col; }
-                if row < min_row { min_row = row; }
-                if row > max_row { max_row = row; }
+        let row_starts = self.row_starts.as_slice();
+        let g = term.grid();
+        for vrow in 0..rows {
+            let row = &g.lines[vrow];
+            if !row.dirty {
+                continue;
+            }
+            let start = row_starts[vrow] as usize;
+            let end = row_starts[vrow + 1] as usize;
+            for k in start..end {
+                if grid[k] != prev[k] {
+                    let inst = &grid[k];
+                    let col = inst.cell_xy[0] as i32;
+                    let row_i = inst.cell_xy[1] as i32;
+                    if col < min_col { min_col = col; }
+                    if col > max_col { max_col = col; }
+                    if row_i < min_row { min_row = row_i; }
+                    if row_i > max_row { max_row = row_i; }
+                }
             }
         }
         if min_col <= max_col {
@@ -672,6 +751,8 @@ impl Renderer {
         self.last_grid_instances.clear();
         self.last_grid_instances
             .extend_from_slice(&self.instances_scratch[..self.grid_instance_end]);
+        self.last_row_starts.clear();
+        self.last_row_starts.extend_from_slice(&self.row_starts);
         self.last_grid_dims = (rows, cols);
         self.prev_cursor_cell = self.cursor_cell;
     }

@@ -82,17 +82,25 @@ spawn_term() {
     fi
     local wl_env=""
     [ "$capture_commits" = "1" ] && wl_env="WAYLAND_DEBUG=client"
+    # Force matched font + size across terminals so the cell-pixel
+    # workload is identical. JetBrains Mono is the default for both on
+    # this host; FONT_PX defaults to 15 px (matching the user's
+    # interactive alacritty.toml).
+    local font_px="${FONT_PX:-15}"
     case "$term" in
         soltty)
             timeout --foreground --kill-after=2 "${hard_kill_s}s" \
-                env $wl_env SOLTTY_START_MAXIMIZED=1 \
+                env $wl_env SOLTTY_START_MAXIMIZED=1 SOLTTY_FONT_PX="$font_px" \
                 "$bin_dir/soltty" -e bash -c "$cmd_str" >/dev/null 2>"$stderr_dst" &
             ;;
         alacritty)
             command -v alacritty >/dev/null || return 1
             timeout --foreground --kill-after=2 "${hard_kill_s}s" \
-                env $wl_env alacritty -o 'window.startup_mode="Maximized"' \
-                -e bash -c "$cmd_str" >/dev/null 2>"$stderr_dst" &
+                env $wl_env alacritty \
+                    -o 'window.startup_mode="Maximized"' \
+                    -o "font.size=$font_px" \
+                    -o 'font.normal.family="JetBrains Mono"' \
+                    -e bash -c "$cmd_str" >/dev/null 2>"$stderr_dst" &
             ;;
         *) echo "unknown terminal: $term" >&2; return 1 ;;
     esac

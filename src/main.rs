@@ -630,7 +630,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 });
                 gpu.render(
-                    &self.term,
+                    &mut self.term,
                     self.picker.as_mut(),
                     self.selection.as_ref(),
                     cursor_visible,

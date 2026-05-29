@@ -280,7 +280,7 @@ impl Gpu {
 
     pub fn render(
         &mut self,
-        term: &Term,
+        term: &mut Term,
         picker: Option<&mut Picker>,
         selection: Option<&Selection>,
         cursor_visible_now: bool,
@@ -303,6 +303,12 @@ impl Gpu {
             vi_cursor,
             search,
         );
+
+        // Reset Row::dirty bits now that prepare has consumed them.
+        // Anything the parser mutates between now and the next prepare
+        // will flip them back on; the snapshot inside compute_damage_rects
+        // already captured this frame's state for the diff.
+        term.mark_clean();
 
         let t1 = self.timings.as_ref().map(|_| Instant::now());
 
