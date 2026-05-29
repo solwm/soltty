@@ -158,9 +158,12 @@ agg_util() {
 }
 
 # Run one scenario × one terminal × one trial, return one row.
-# Columns: sol_sm tg_sm tg_sm_max util_mean util_p95 util_max util_min commits_per_s
+# Columns: sol_sm tg_sm tg_sm_max util_mean util_p95 util_max util_min commits_per_s wallclock
+#
+# wallclock is the gol_c bench's reported secs (read from GOL_BENCH_OUT)
+# when the scenario name starts with "gol_"; "-" otherwise.
 run_trial() {
-    local term="$1" scenario_cmd="$2" run_secs="$3"
+    local term="$1" scenario_name="$2" run_secs="$3"
     local pmon_log util_log
     pmon_log=$(mktemp -t pmon.XXXXXX)
     util_log=$(mktemp -t util.XXXXXX)
@@ -168,6 +171,18 @@ run_trial() {
     if [ "$capture_commits" = "1" ]; then
         trial_wl_log=$(mktemp -t wl.XXXXXX)
     fi
+
+    # gol_c writes its self-timed wallclock to a file inside the PTY;
+    # we allocate it here so scenario_cmd can substitute the path into
+    # its template. Other scenarios leave it empty.
+    gol_bench_out=""
+    case "$scenario_name" in
+        gol_*) gol_bench_out=$(mktemp -t gol_b.XXXXXX); rm -f "$gol_bench_out" ;;
+    esac
+    local scenario_cmd; scenario_cmd=$(scenario_cmd "$scenario_name") || {
+        echo "0 0 0 0 0 0 0 0 -"
+        return 1
+    }
 
     local hard=$((run_secs + 5))
     local job_pid; job_pid=$(spawn_term "$term" "$hard" "$scenario_cmd")
@@ -178,16 +193,18 @@ run_trial() {
     stop_samplers "$sampler_pids"
     wait "$job_pid" 2>/dev/null || true
 
-    local pmon_part util_part commits_part="0"
+    local pmon_part util_part commits_part="0" wallclock="-"
     pmon_part=$(agg_pmon "$pmon_log" "$term")
     util_part=$(agg_util "$util_log")
     if [ -n "$trial_wl_log" ] && [ -s "$trial_wl_log" ]; then
         local total; total=$(grep -c "wl_surface.*\.commit" "$trial_wl_log" || true)
-        # The window covers settle+sample; commits/sec = total / (run_secs+2).
         commits_part=$(awk -v t="$total" -v s="$run_secs" 'BEGIN{printf "%.1f", t/(s+2)}')
     fi
-    rm -f "$pmon_log" "$util_log" "$trial_wl_log"
-    echo "$pmon_part $util_part $commits_part"
+    if [ -n "$gol_bench_out" ] && [ -s "$gol_bench_out" ]; then
+        wallclock=$(awk '{printf "%.4f", $1}' "$gol_bench_out")
+    fi
+    rm -f "$pmon_log" "$util_log" "$trial_wl_log" "$gol_bench_out"
+    echo "$pmon_part $util_part $commits_part $wallclock"
 }
 
 # -------- scenarios -------------------------------------------------------
@@ -203,6 +220,15 @@ scenario_cmd() {
         idle)           echo "sleep $((sample_seconds + 4))" ;;
         scroll_burst)   echo "yes 'the quick brown fox jumps over the lazy dog 0123456789' | head -n 500000 | sed -n '1,500000p'; sleep 3" ;;
         typing_echo)    echo "for i in \$(seq 1 200); do echo \"line \$i echo me echo me\"; sleep 0.02; done; sleep 1" ;;
+        # gol-c: deterministic + finite Conway's Game of Life bench (fixed
+        # seed 42, fixed iters, DSR-pinned wallclock). Path is absolute
+        # because bash -c (non-login shell) may not have the repo dir on
+        # its CWD. ${gol_bench_out} is allocated by run_trial before this
+        # function is called.
+        gol_c)
+            local gol="${GOL_BIN:-/home/magniff/workspace/gol-c/gol}"
+            echo "GOL_BENCH_ITERS=2000 GOL_FORCE_COLS=295 GOL_FORCE_ROWS=75 GOL_BENCH_OUT=${gol_bench_out:-/tmp/gol_b.unset} $gol; sleep 0.5"
+            ;;
         *) return 1 ;;
     esac
 }
@@ -212,11 +238,18 @@ scenario_cmd() {
 {
     echo "# perf_loop run timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ) sha=${sha:-unknown}"
     echo "# runs=$runs sample_seconds=$sample_seconds capture_commits=$capture_commits"
-    printf "scenario\tterminal\tsol_sm\tterm_sm\tterm_sm_max\tutil_mean\tutil_p95\tutil_max\tutil_min\tcommits_per_s\n"
+    printf "scenario\tterminal\tsol_sm\tterm_sm\tterm_sm_max\tutil_mean\tutil_p95\tutil_max\tutil_min\tcommits_per_s\twallclock_s\n"
 } > "$out_file"
 
 for scenario in "${selected_scenarios[@]}"; do
-    cmd=$(scenario_cmd "$scenario") || { echo "unknown scenario: $scenario" >&2; continue; }
+    # Validate the scenario is known. scenario_cmd is called again
+    # inside run_trial because some scenarios (gol_*) need to substitute
+    # a per-trial output path into their command, and that path doesn't
+    # exist until run_trial has allocated it.
+    if ! scenario_cmd "$scenario" >/dev/null 2>&1 && [ "${scenario:0:4}" != "gol_" ]; then
+        echo "unknown scenario: $scenario" >&2
+        continue
+    fi
     echo
     echo "=== $scenario ==="
     for term in "${selected_terms[@]}"; do
@@ -229,9 +262,11 @@ for scenario in "${selected_scenarios[@]}"; do
         local_sum_max=0
         local_sum_min=0
         local_sum_commits=0
+        local_sum_wc=0
+        wc_n=0
         ok_runs=0
         for ((r=1; r<=runs; r++)); do
-            read -r sol tg tg_max um p95 mx mn commits < <(run_trial "$term" "$cmd" "$sample_seconds") || {
+            read -r sol tg tg_max um p95 mx mn commits wallclock < <(run_trial "$term" "$scenario" "$sample_seconds") || {
                 echo "  $term run $r: failed" >&2
                 continue
             }
@@ -243,6 +278,10 @@ for scenario in "${selected_scenarios[@]}"; do
             local_sum_max=$((local_sum_max + mx))
             local_sum_min=$((local_sum_min + mn))
             local_sum_commits=$(awk -v a="$local_sum_commits" -v b="$commits" 'BEGIN{print a+b}')
+            if [ "$wallclock" != "-" ]; then
+                local_sum_wc=$(awk -v a="$local_sum_wc" -v b="$wallclock" 'BEGIN{print a+b}')
+                wc_n=$((wc_n + 1))
+            fi
             ok_runs=$((ok_runs + 1))
             sleep 1.5
         done
@@ -258,12 +297,16 @@ for scenario in "${selected_scenarios[@]}"; do
         avg_max=$((local_sum_max / ok_runs))
         avg_min=$((local_sum_min / ok_runs))
         avg_commits=$(awk -v s="$local_sum_commits" -v n="$ok_runs" 'BEGIN{printf "%.1f", s/n}')
+        avg_wc="-"
+        [ "$wc_n" -gt 0 ] && avg_wc=$(awk -v s="$local_sum_wc" -v n="$wc_n" 'BEGIN{printf "%.4f", s/n}')
         commits_field=""
         [ "$capture_commits" = "1" ] && commits_field="  commits=$avg_commits/s"
-        printf "  %-12s sol=%-5s  %s_sm=%-5s(max %d) util=%4s(min %d, max %d, p95 %s)%s\n" \
-            "$term" "$avg_sol" "$term" "$avg_tg" "$avg_tg_max" "$avg_um" "$avg_min" "$avg_max" "$avg_p95" "$commits_field"
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "$scenario" "$term" "$avg_sol" "$avg_tg" "$avg_tg_max" "$avg_um" "$avg_p95" "$avg_max" "$avg_min" "$avg_commits" \
+        wc_field=""
+        [ "$avg_wc" != "-" ] && wc_field="  wallclock=${avg_wc}s"
+        printf "  %-12s sol=%-5s  %s_sm=%-5s(max %d) util=%4s(min %d, max %d, p95 %s)%s%s\n" \
+            "$term" "$avg_sol" "$term" "$avg_tg" "$avg_tg_max" "$avg_um" "$avg_min" "$avg_max" "$avg_p95" "$commits_field" "$wc_field"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$scenario" "$term" "$avg_sol" "$avg_tg" "$avg_tg_max" "$avg_um" "$avg_p95" "$avg_max" "$avg_min" "$avg_commits" "$avg_wc" \
             >> "$out_file"
     done
 done
