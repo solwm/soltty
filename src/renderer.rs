@@ -1,4 +1,5 @@
 use glow::HasContext;
+use glutin::surface::Rect;
 
 use crate::font::{FontAtlas, FontStyle};
 use crate::grid::{CellAttrs, Color, CursorShape};
@@ -40,6 +41,46 @@ struct CellInstance {
     glyph_offset: [i32; 2],    // 24..32
     fg: [f32; 4],              // 32..48
     bg: [f32; 4],              // 48..64
+}
+
+impl PartialEq for CellInstance {
+    fn eq(&self, other: &Self) -> bool {
+        // Bytewise comparison — repr(C), no padding, deterministic.
+        // Sidesteps f32's NaN != NaN rule (we never store NaN colors,
+        // but explicit is better here than relying on absence).
+        let a = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
+        let b = unsafe {
+            std::slice::from_raw_parts(
+                other as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
+        a == b
+    }
+}
+
+/// Convert a `[col_start..=col_end]` slice of viewport row `row` into an
+/// EGL-space damage rect and push it onto `out`. EGL surface coordinates
+/// place the origin at the bottom-left, so we invert the row index.
+/// Caller is responsible for ensuring the row/col indices are in range.
+fn push_row_damage(
+    out: &mut Vec<Rect>,
+    row: i32,
+    col_start: i32,
+    col_end: i32,
+    cw: i32,
+    ch: i32,
+    screen_h: i32,
+) {
+    let x = col_start * cw;
+    let width = (col_end - col_start + 1) * cw;
+    let y = screen_h - (row + 1) * ch;
+    out.push(Rect::new(x, y, width, ch));
 }
 
 const INSTANCE_STRIDE: i32 = std::mem::size_of::<CellInstance>() as i32;
@@ -87,6 +128,36 @@ pub struct Renderer {
     /// Encoded shape: 0 = none, 1 = block, 2 = underline, 3 = bar,
     /// 4 = hollow block (vi-mode). Mirrors the fragment shader constants.
     cursor_shape_id: i32,
+    /// Cursor cell from the previous frame, so the per-row damage diff
+    /// can mark the *old* cursor cell dirty even when the underlying
+    /// CellInstances haven't changed.
+    prev_cursor_cell: (i32, i32),
+
+    // ====== Per-frame damage tracking for eglSwapBuffersWithDamageKHR ======
+    //
+    // The Wayland compositor's GPU cost during cmatrix-style workloads is
+    // dominated by recomposing the whole surface every swap. By hinting the
+    // changed regions per-frame (via glutin → EGL_KHR_swap_buffers_with_damage)
+    // the compositor only re-blends those rectangles. NVIDIA 595 EGL on
+    // Wayland honors the hint; if the driver doesn't, glutin silently falls
+    // back to a full-surface swap so this is correctness-safe.
+    //
+    /// Last frame's grid instances — the *grid* portion only, not the
+    /// search-bar or picker overlay. Indexed positionally; entry `i`
+    /// corresponds to `instances_scratch[i]` from the previous prepare.
+    last_grid_instances: Vec<CellInstance>,
+    /// End-of-grid index in `instances_scratch` (exclusive). Overlays
+    /// (search bar, picker) append after this point. Lets the damage
+    /// diff stop before the overlay range, which we always full-damage.
+    grid_instance_end: usize,
+    /// Grid dimensions from the last successful damage computation. A
+    /// row- or column-count change invalidates positional comparison
+    /// against `last_grid_instances`, so we full-damage that frame.
+    last_grid_dims: (usize, usize),
+    /// Output damage list in EGL surface coordinates (origin bottom-left,
+    /// per the EGL spec). Cleared and refilled each `prepare`. `Gpu::render`
+    /// reads this and forwards it to `swap_buffers_with_damage`.
+    pub damage_rects: Vec<Rect>,
 }
 
 impl Renderer {
@@ -163,6 +234,11 @@ impl Renderer {
             atlas_size: (atlas.atlas_w, atlas.atlas_h),
             cursor_cell: (-1, -1),
             cursor_shape_id: 0,
+            prev_cursor_cell: (-1, -1),
+            last_grid_instances: Vec::new(),
+            grid_instance_end: 0,
+            last_grid_dims: (0, 0),
+            damage_rects: Vec::new(),
         };
         unsafe { renderer.upload_uniforms(gl) };
         renderer
@@ -363,6 +439,17 @@ impl Renderer {
             }
         }
 
+        // Mark the end of grid instances. Overlays go after this and
+        // get full-window damage (their layout isn't a positional match
+        // against last frame so per-row diff doesn't apply).
+        self.grid_instance_end = self.instances_scratch.len();
+
+        // Compute per-row damage rectangles for this frame's swap.
+        // Always do this BEFORE the overlay appends — the diff only
+        // considers grid cells, and we want to preserve the diff state
+        // (last_grid_instances) across overlay activity.
+        self.compute_damage_rects(rows, cols, search.is_some(), picker.is_some());
+
         // Search bar at the bottom row. After the cell loop so it
         // overwrites whatever's there. Before picker so an open picker
         // (which is centered) can still draw on top.
@@ -423,6 +510,119 @@ impl Renderer {
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
         }
         self.instance_count = needed as i32;
+    }
+
+    /// Build `self.damage_rects` for this frame's swap, then snapshot the
+    /// current grid instances into `self.last_grid_instances` for next
+    /// frame's comparison.
+    ///
+    /// Output is in EGL surface coordinates: origin bottom-left, X right,
+    /// Y up. Caller passes the row/col grid dims so we can detect a
+    /// resize-induced positional mismatch.
+    fn compute_damage_rects(&mut self, rows: usize, cols: usize, search_active: bool, picker_active: bool) {
+        self.damage_rects.clear();
+
+        let cw = self.cell_size.0 as i32;
+        let ch = self.cell_size.1 as i32;
+        let sw = self.screen_size.0 as i32;
+        let sh = self.screen_size.1 as i32;
+
+        let grid = &self.instances_scratch[..self.grid_instance_end];
+        let prev = self.last_grid_instances.as_slice();
+        let dims_changed = self.last_grid_dims != (rows, cols);
+        let layout_changed = grid.len() != prev.len();
+        let overlay_active = search_active || picker_active;
+        let cursor_moved = self.cursor_cell != self.prev_cursor_cell;
+
+        // Full-window damage for any case we can't diff cleanly. Overlays
+        // (picker/search bar) are drawn over arbitrary parts of the
+        // surface and we don't track their extent here; vi-tint isn't
+        // a parameter to this fn but the App's path force-redraws on
+        // every vi state change so the worst case is one full-damaged
+        // frame, not visual breakage. First-frame or resize: prev buffer
+        // is empty or stale.
+        if prev.is_empty() || dims_changed || layout_changed || overlay_active {
+            self.damage_rects.push(Rect::new(0, 0, sw, sh));
+            self.snapshot_for_next_frame(rows, cols);
+            return;
+        }
+
+        // Walk the grid in row-major order, accumulating min/max col
+        // that differs from the previous frame within each row. The
+        // grid is emitted row-by-row so consecutive instances share
+        // the same `cell_xy[1]` (row) value — a linear scan suffices.
+        let mut i = 0;
+        while i < grid.len() {
+            let row = grid[i].cell_xy[1];
+            let row_start = i;
+            // Advance past all instances on this row.
+            while i < grid.len() && grid[i].cell_xy[1] == row {
+                i += 1;
+            }
+            let row_end = i;
+
+            let mut min_col: i64 = -1;
+            let mut max_col: i64 = -1;
+            for k in row_start..row_end {
+                if grid[k] != prev[k] {
+                    let col = grid[k].cell_xy[0] as i64;
+                    if min_col < 0 || col < min_col {
+                        min_col = col;
+                    }
+                    if col > max_col {
+                        max_col = col;
+                    }
+                }
+            }
+            if min_col >= 0 {
+                push_row_damage(
+                    &mut self.damage_rects,
+                    row as i32,
+                    min_col as i32,
+                    max_col as i32,
+                    cw,
+                    ch,
+                    sh,
+                );
+            }
+        }
+
+        // Cursor: drawn via uniforms, not instances, so its movement
+        // doesn't show up in the diff. Damage the previous cursor cell
+        // (which we're un-painting) and the new one (which we're
+        // painting). Either can be (-1,-1) for "no cursor", in which
+        // case there's nothing to add.
+        if cursor_moved {
+            for &(col, row) in &[self.prev_cursor_cell, self.cursor_cell] {
+                if col >= 0 && row >= 0 && (col as usize) < cols && (row as usize) < rows {
+                    push_row_damage(
+                        &mut self.damage_rects,
+                        row, col, col, cw, ch, sh,
+                    );
+                }
+            }
+        }
+
+        // EGL_KHR_swap_buffers_with_damage with n_rects=0 is
+        // implementation-defined: some drivers treat it as full damage,
+        // some as no damage at all. We're called from the renderer for
+        // a reason (App marked dirty), so leaving damage empty would
+        // risk a stale window on the "no damage" interpretation. Push
+        // a degenerate 1×1 rect at the origin so the swap is always
+        // unambiguous — the compositor will recompose ~zero pixels.
+        if self.damage_rects.is_empty() {
+            self.damage_rects.push(Rect::new(0, 0, 1, 1));
+        }
+
+        self.snapshot_for_next_frame(rows, cols);
+    }
+
+    fn snapshot_for_next_frame(&mut self, rows: usize, cols: usize) {
+        self.last_grid_instances.clear();
+        self.last_grid_instances
+            .extend_from_slice(&self.instances_scratch[..self.grid_instance_end]);
+        self.last_grid_dims = (rows, cols);
+        self.prev_cursor_cell = self.cursor_cell;
     }
 
     pub fn draw(&self, gl: &glow::Context) {

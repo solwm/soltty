@@ -11,6 +11,10 @@ use glutin::context::{
 };
 use glutin::display::{GetGlDisplay, GlDisplay};
 use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
+// `Surface` and `PossiblyCurrentContext` above are the dispatch enums;
+// for the EGL-only `swap_buffers_with_damage` call we have to pattern-
+// match into the concrete variants. The variant names come straight from
+// glutin's source — see `api::egl::surface::Surface` for the method.
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
 use winit::event_loop::ActiveEventLoop;
@@ -290,7 +294,25 @@ impl Gpu {
         }
 
         let t_swap_start = self.timings.as_ref().map(|_| Instant::now());
-        if let Err(e) = self.surface.swap_buffers(&self.context) {
+        // `swap_buffers_with_damage` lets the Wayland compositor recompose
+        // only the damaged rectangles instead of the whole surface. On
+        // NVIDIA 595 EGL the EGL_KHR_swap_buffers_with_damage extension is
+        // present; glutin silently falls back to plain SwapBuffers if it
+        // isn't, so this stays correctness-safe on any driver. Damage
+        // rects come from `Renderer::prepare`'s per-row CellInstance diff
+        // against last frame.
+        //
+        // The method only exists on the EGL surface (not GLX/WGL/CGL), so
+        // we have to drop down to the concrete variant — exactly the same
+        // dance alacritty does. The catch-all arm preserves behavior on
+        // any non-EGL backend.
+        let swap_result = match (&self.surface, &self.context) {
+            (Surface::Egl(s), PossiblyCurrentContext::Egl(c)) => {
+                s.swap_buffers_with_damage(c, &self.renderer.damage_rects)
+            }
+            _ => self.surface.swap_buffers(&self.context),
+        };
+        if let Err(e) = swap_result {
             log::warn!("swap_buffers: {e}");
         }
 
