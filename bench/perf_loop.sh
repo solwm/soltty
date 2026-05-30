@@ -258,7 +258,10 @@ scenario_cmd() {
         gol_c)
             local gol="${GOL_BIN:-/home/magniff/workspace/gol-c/gol}"
             local iters="${GOL_ITERS:-2000}"
-            echo "GOL_BENCH_ITERS=$iters GOL_BENCH_OUT=${gol_bench_out:-/tmp/gol_b.unset} $gol; sleep 0.5"
+            local force=""
+            [ -n "${GOL_FORCE_COLS:-}" ] && force="$force GOL_FORCE_COLS=$GOL_FORCE_COLS"
+            [ -n "${GOL_FORCE_ROWS:-}" ] && force="$force GOL_FORCE_ROWS=$GOL_FORCE_ROWS"
+            echo "GOL_BENCH_ITERS=$iters$force GOL_BENCH_OUT=${gol_bench_out:-/tmp/gol_b.unset} $gol; sleep 0.5"
             ;;
         *) return 1 ;;
     esac

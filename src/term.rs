@@ -493,18 +493,6 @@ impl Term {
         }
     }
 
-    /// Clear the `dirty` bit on every live-grid row. The renderer calls
-    /// this after `compute_damage_rects` finishes consuming the bits,
-    /// so the next prepare sees a fresh slate. Scrollback rows are
-    /// excluded — they only matter when the viewport is scrolled into
-    /// history, and that path force-marks dirty via `scroll_view`.
-    pub fn mark_clean(&mut self) {
-        let g = self.grid_mut();
-        for row in g.lines.iter_mut() {
-            row.dirty = false;
-        }
-    }
-
     /// Cursor's visual row/col within the current viewport, or `None` if
     /// it's scrolled out of view or DECTCEM-hidden via `?25l`. We honor
     /// `?25l` on both screens — programs like gol-c use it on the primary

@@ -30,7 +30,7 @@ use crate::theme::Theme;
 
 /// Default font size, ~30% larger than the original 16px baseline.
 pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0 * 1.3;
-const MIN_FONT_SIZE_PX: f32 = 4.0;
+const MIN_FONT_SIZE_PX: f32 = 2.0;
 const MAX_FONT_SIZE_PX: f32 = 96.0;
 
 /// Resolve startup font size. Precedence: `SOLTTY_FONT_PX` env var >
@@ -280,7 +280,7 @@ impl Gpu {
 
     pub fn render(
         &mut self,
-        term: &mut Term,
+        term: &Term,
         picker: Option<&mut Picker>,
         selection: Option<&Selection>,
         cursor_visible_now: bool,
@@ -303,12 +303,6 @@ impl Gpu {
             vi_cursor,
             search,
         );
-
-        // Reset Row::dirty bits now that prepare has consumed them.
-        // Anything the parser mutates between now and the next prepare
-        // will flip them back on; the snapshot inside compute_damage_rects
-        // already captured this frame's state for the diff.
-        term.mark_clean();
 
         let t1 = self.timings.as_ref().map(|_| Instant::now());
 
