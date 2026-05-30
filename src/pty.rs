@@ -73,10 +73,10 @@ impl Pty {
         std::thread::Builder::new()
             .name("soltty-pty-reader".into())
             .spawn(move || {
-                // 64 KB read buffer — matches Linux's default PTY pipe
-                // buffer size, so a chatty producer that fills the kernel
-                // pipe gets drained in a single syscall instead of 8.
-                let mut buf = [0u8; 65536];
+                // 256 KB read buffer — bigger than the kernel's PTY pipe
+                // so a single read() returns whatever the kernel had
+                // queued in one shot.
+                let mut buf = [0u8; 262144];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,

@@ -287,6 +287,7 @@ impl Gpu {
         vi_cursor: Option<(usize, usize)>,
         vi_active: bool,
         search: Option<&SearchOverlay<'_>>,
+        burst_active: bool,
     ) {
         // Fast path: when timing is off, skip every Instant::now() and
         // every query_counter call — `timings` is None and the matches
@@ -302,6 +303,7 @@ impl Gpu {
             cursor_visible_now,
             vi_cursor,
             search,
+            burst_active,
         );
 
         let t1 = self.timings.as_ref().map(|_| Instant::now());
@@ -342,12 +344,9 @@ impl Gpu {
         // we have to drop down to the concrete variant — exactly the same
         // dance alacritty does. The catch-all arm preserves behavior on
         // any non-EGL backend.
-        let swap_result = match (&self.surface, &self.context) {
-            (Surface::Egl(s), PossiblyCurrentContext::Egl(c)) => {
-                s.swap_buffers_with_damage(c, &self.renderer.damage_rects)
-            }
-            _ => self.surface.swap_buffers(&self.context),
-        };
+        // EXPERIMENT v6: skip with-damage entirely, always plain swap.
+        let _ = burst_active; // unused in this experiment
+        let swap_result = self.surface.swap_buffers(&self.context);
         if let Err(e) = swap_result {
             log::warn!("swap_buffers: {e}");
         }

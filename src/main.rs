@@ -304,7 +304,7 @@ const BURST_BYTES_THRESHOLD: usize = 1024;
 ///
 /// Typing/echo bypasses this entirely — see `App::window_event`
 /// keyboard branch which clears `burst_holdoff` on every keystroke.
-const BURST_FRAME_MULTIPLIER: u32 = 3;
+const BURST_FRAME_MULTIPLIER: u32 = 6;
 /// How many renders we stay in burst mode for, after the last big
 /// drain. Keeps us coasting through the burst without thrashing back
 /// and forth on a single momentarily-empty drain.
@@ -637,6 +637,7 @@ impl ApplicationHandler<UserEvent> for App {
                     vi_cursor,
                     self.vi.active,
                     search_overlay.as_ref(),
+                    self.burst_holdoff > 0,
                 );
                 self.redraw_pending = false;
                 self.dirty = false;

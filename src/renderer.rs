@@ -348,6 +348,7 @@ impl Renderer {
         cursor_visible_now: bool,
         vi_cursor: Option<(usize, usize)>,
         search: Option<&SearchOverlay<'_>>,
+        burst_active: bool,
     ) {
         let rows = term.grid().rows;
         let cols = term.grid().cols;
@@ -509,7 +510,30 @@ impl Renderer {
         // Always do this BEFORE the overlay appends — the diff only
         // considers grid cells, and we want to preserve the diff state
         // (last_grid_instances) across overlay activity.
-        self.compute_damage_rects(rows, cols, search.is_some(), picker.is_some());
+        //
+        // During a sustained PTY burst (gol-c, cat-of-large-file) the
+        // resulting damage is almost always near-full-screen anyway and
+        // the per-cell byte-compare + last-frame snapshot memcpy is
+        // pure CPU on the main thread — time we could be spending
+        // draining PTY. Skip the diff and emit full-window damage
+        // outright; the compositor was going to recomposite the bulk
+        // of the surface regardless, and we don't pay for the cycles.
+        // The next non-burst frame will see last_grid_instances empty
+        // and emit a full-damage frame to reseed the diff state, same
+        // as the first-frame case.
+        if burst_active {
+            self.damage_rects.clear();
+            self.damage_rects.push(Rect::new(
+                0, 0,
+                self.screen_size.0 as i32,
+                self.screen_size.1 as i32,
+            ));
+            self.last_grid_instances.clear();
+            self.last_grid_dims = (0, 0);
+            self.prev_cursor_cell = (-1, -1);
+        } else {
+            self.compute_damage_rects(rows, cols, search.is_some(), picker.is_some());
+        }
 
         // Search bar at the bottom row. After the cell loop so it
         // overwrites whatever's there. Before picker so an open picker
