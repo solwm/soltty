@@ -859,45 +859,41 @@ fn arg(params: &Params, idx: usize, default: u16) -> u16 {
 /// Parse three `;`-separated decimal integers followed by `m`, each
 /// clamped to u8. Returns `(r, g, b, index-past-the-m)` on success,
 /// `None` if the form doesn't match. Used by the truecolor SGR
-/// specialization in `Term::feed`.
+/// specialization in `Term::feed`; marked `#[inline]` so the per-cell
+/// call cost folds into the hot loop.
+#[inline]
 fn parse_three_u8(bytes: &[u8], start: usize) -> Option<(u8, u8, u8, usize)> {
     let n = bytes.len();
-    let mut j = start;
-    let parse_one = |bytes: &[u8], mut j: usize| -> Option<(u8, usize)> {
+    #[inline(always)]
+    fn parse_one(bytes: &[u8], j: &mut usize) -> Option<u8> {
         let mut v: u32 = 0;
         let mut any = false;
-        while j < bytes.len() {
-            let b = bytes[j];
-            if (b'0'..=b'9').contains(&b) {
-                v = v * 10 + (b - b'0') as u32;
-                if v > 255 {
-                    return None;
-                }
-                any = true;
-                j += 1;
-            } else {
+        while *j < bytes.len() {
+            let b = bytes[*j];
+            if !(b'0'..=b'9').contains(&b) {
                 break;
             }
+            v = v * 10 + (b - b'0') as u32;
+            if v > 255 {
+                return None;
+            }
+            any = true;
+            *j += 1;
         }
-        if !any {
-            return None;
-        }
-        Some((v as u8, j))
-    };
-    let (r, j_after) = parse_one(bytes, j)?;
-    j = j_after;
+        if any { Some(v as u8) } else { None }
+    }
+    let mut j = start;
+    let r = parse_one(bytes, &mut j)?;
     if j >= n || bytes[j] != b';' {
         return None;
     }
     j += 1;
-    let (g, j_after) = parse_one(bytes, j)?;
-    j = j_after;
+    let g = parse_one(bytes, &mut j)?;
     if j >= n || bytes[j] != b';' {
         return None;
     }
     j += 1;
-    let (b_, j_after) = parse_one(bytes, j)?;
-    j = j_after;
+    let b_ = parse_one(bytes, &mut j)?;
     if j >= n || bytes[j] != b'm' {
         return None;
     }
