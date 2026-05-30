@@ -265,7 +265,7 @@ impl Term {
                     }
                     let g = performer.term.grid_mut();
                     for &c in &bytes[start..i] {
-                        g.put_char(c as char);
+                        g.put_ascii_fast(c);
                     }
                     continue;
                 }
@@ -335,7 +335,7 @@ impl Term {
                     // iteration + the general fast-path dispatch.
                     if i < n && (0x20..=0x7E).contains(&bytes[i]) {
                         let g = performer.term.grid_mut();
-                        g.put_char(bytes[i] as char);
+                        g.put_ascii_fast(bytes[i]);
                         i += 1;
                     }
                     continue;

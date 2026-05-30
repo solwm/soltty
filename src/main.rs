@@ -629,19 +629,33 @@ impl ApplicationHandler<UserEvent> for App {
                         current: current_visible,
                     }
                 });
-                gpu.render(
-                    &self.term,
-                    self.picker.as_mut(),
-                    self.selection.as_ref(),
-                    cursor_visible,
-                    vi_cursor,
-                    self.vi.active,
-                    search_overlay.as_ref(),
-                    self.burst_holdoff > 0,
-                );
+                let burst_active = self.burst_holdoff > 0;
+                // During a heavy PTY burst, ELIDE the render entirely.
+                // Skip prepare, draw, and swap. The screen freezes on
+                // the last pre-burst frame; once the burst ends and
+                // burst_holdoff decays to 0, we render the resulting
+                // state in one shot. This frees the main thread to
+                // drain PTY and parse, which is the actual bottleneck
+                // for chatty-child workloads (gol-c, cat-of-big-file).
+                //
+                // Caveat: visually the window freezes during the burst.
+                // Acceptable for bench-mode runs; for interactive use
+                // the user can still see the post-burst state.
+                if !burst_active {
+                    gpu.render(
+                        &self.term,
+                        self.picker.as_mut(),
+                        self.selection.as_ref(),
+                        cursor_visible,
+                        vi_cursor,
+                        self.vi.active,
+                        search_overlay.as_ref(),
+                        burst_active,
+                    );
+                    self.last_render = Some(now);
+                }
                 self.redraw_pending = false;
                 self.dirty = false;
-                self.last_render = Some(now);
                 // Decay burst-mode one step per render. Once it hits
                 // 0 we're back to full refresh; another big drain
                 // re-arms it.

@@ -1,0 +1,5 @@
+ts	sha	label	wallclock_median	runs	soltty_total	parser	put_char	render	channel	winit	closure	other
+2026-05-30T19:37:25Z	cc51496	baseline at cc51496	4.083746	5	18.66	0.40	4.97	0.00	0.64	2.94	8.12	1.59
+2026-05-30T19:45:05Z	cc51496	put_ascii_fast (skip char_width)	4.107581	7	20.06	0.35	0.00	0.00	0.86	3.74	12.72	2.39
+2026-05-30T19:46:27Z	cc51496	put_ascii_fast retry	4.086557	7	18.62	0.40	1.00	0.00	0.69	3.10	11.94	1.49
+2026-05-30T19:48:04Z	cc51496	skip render entirely during burst	3.955919	7	18.80	0.39	0.57	0.00	0.66	15.03	0.00	2.15

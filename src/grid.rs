@@ -257,6 +257,38 @@ impl Grid {
         self.cursor.wrap_next = false;
     }
 
+    /// ASCII fast path: caller knows the byte is in 0x20..=0x7E. Saves
+    /// the `char_width` call, the wide-character wrap check, and the
+    /// wide spacer write. Hot under any text-heavy workload — the
+    /// printable-ASCII run in `Term::feed` calls this directly so the
+    /// per-cell cost in gol-c / scroll-of-text is as tight as possible.
+    #[inline]
+    pub fn put_ascii_fast(&mut self, byte: u8) {
+        if self.cursor.wrap_next {
+            self.cursor.col = 0;
+            self.line_feed();
+            self.cursor.wrap_next = false;
+        }
+        let r = self.cursor.row;
+        let c = self.cursor.col;
+        if r < self.rows && c < self.cols {
+            let pen_fg = self.pen.fg;
+            let pen_bg = self.pen.bg;
+            let pen_attrs = self.pen.attrs;
+            let cell = &mut self.lines[r].cells[c];
+            cell.ch = byte as char;
+            cell.fg = pen_fg;
+            cell.bg = pen_bg;
+            cell.attrs = pen_attrs;
+            cell.width = 1;
+        }
+        if c + 1 >= self.cols {
+            self.cursor.wrap_next = true;
+        } else {
+            self.cursor.col = c + 1;
+        }
+    }
+
     pub fn put_char(&mut self, ch: char) {
         let width = char_width(ch);
 
