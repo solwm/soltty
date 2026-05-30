@@ -298,6 +298,50 @@ impl Term {
                     _ => {}
                 }
             }
+            // Ultra-hot specialization: `ESC [ 4 8 ; 2 ; R ; G ; B m`
+            // and `ESC [ 3 8 ; 2 ; R ; G ; B m` — the truecolor bg/fg
+            // SGRs that gol-c / log colorizers / `cargo build` emit
+            // *per cell*. The generic SGR fast path below handles them
+            // correctly, but at ~30 branches per cell × millions of
+            // cells per second they're the dominant per-byte cost.
+            // Match the exact 7-byte prefix and inline-parse three
+            // u8 components straight into `grid.pen`, skipping the
+            // 16-slot param buffer + `apply_sgr_simple` dispatch.
+            // Anything that doesn't match (mode 5 indexed, other code
+            // before/after, subparams) falls through to the generic
+            // path for correctness.
+            if performer.in_ground
+                && b == 0x1B
+                && i + 6 < n
+                && bytes[i + 1] == b'['
+                && (bytes[i + 2] == b'4' || bytes[i + 2] == b'3')
+                && bytes[i + 3] == b'8'
+                && bytes[i + 4] == b';'
+                && bytes[i + 5] == b'2'
+                && bytes[i + 6] == b';'
+            {
+                let is_bg = bytes[i + 2] == b'4';
+                if let Some((r, g, b_, end)) = parse_three_u8(bytes, i + 7) {
+                    let grid = performer.term.grid_mut();
+                    let color = crate::grid::Color::Rgb(r, g, b_);
+                    if is_bg {
+                        grid.pen.bg = color;
+                    } else {
+                        grid.pen.fg = color;
+                    }
+                    i = end;
+                    // After truecolor SGR, gol-c writes a space (one
+                    // printable). Inline that too to skip another loop
+                    // iteration + the general fast-path dispatch.
+                    if i < n && (0x20..=0x7E).contains(&bytes[i]) {
+                        let g = performer.term.grid_mut();
+                        g.put_char(bytes[i] as char);
+                        i += 1;
+                    }
+                    continue;
+                }
+                // Otherwise fall through to generic SGR.
+            }
             // SGR / CUP fast path. ESC `[` <digits/`;`> ... <`m`|`H`|`f`>
             // is the hot CSI in colorful workloads (gol-c writes
             // `\x1B[48;2;R;G;Bm ` per cell) and in cursor_jumps
@@ -812,6 +856,54 @@ fn arg(params: &Params, idx: usize, default: u16) -> u16 {
 /// as `apply_sgr` for the `;`-separated form (the only form our
 /// inline-CSI fast path produces); subparam-style SGRs (`38:5:n`)
 /// still go through vte and `apply_sgr` proper.
+/// Parse three `;`-separated decimal integers followed by `m`, each
+/// clamped to u8. Returns `(r, g, b, index-past-the-m)` on success,
+/// `None` if the form doesn't match. Used by the truecolor SGR
+/// specialization in `Term::feed`.
+fn parse_three_u8(bytes: &[u8], start: usize) -> Option<(u8, u8, u8, usize)> {
+    let n = bytes.len();
+    let mut j = start;
+    let parse_one = |bytes: &[u8], mut j: usize| -> Option<(u8, usize)> {
+        let mut v: u32 = 0;
+        let mut any = false;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if (b'0'..=b'9').contains(&b) {
+                v = v * 10 + (b - b'0') as u32;
+                if v > 255 {
+                    return None;
+                }
+                any = true;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if !any {
+            return None;
+        }
+        Some((v as u8, j))
+    };
+    let (r, j_after) = parse_one(bytes, j)?;
+    j = j_after;
+    if j >= n || bytes[j] != b';' {
+        return None;
+    }
+    j += 1;
+    let (g, j_after) = parse_one(bytes, j)?;
+    j = j_after;
+    if j >= n || bytes[j] != b';' {
+        return None;
+    }
+    j += 1;
+    let (b_, j_after) = parse_one(bytes, j)?;
+    j = j_after;
+    if j >= n || bytes[j] != b'm' {
+        return None;
+    }
+    Some((r, g, b_, j + 1))
+}
+
 fn apply_sgr_simple(grid: &mut Grid, params: &[u16]) {
     if params.is_empty() {
         // Lone `CSI m` is the same as `CSI 0 m`.
