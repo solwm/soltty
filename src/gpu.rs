@@ -30,7 +30,7 @@ use crate::theme::Theme;
 
 /// Default font size, ~30% larger than the original 16px baseline.
 pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0 * 1.3;
-const MIN_FONT_SIZE_PX: f32 = 6.0;
+const MIN_FONT_SIZE_PX: f32 = 4.0;
 const MAX_FONT_SIZE_PX: f32 = 96.0;
 
 /// Resolve startup font size. Precedence: `SOLTTY_FONT_PX` env var >

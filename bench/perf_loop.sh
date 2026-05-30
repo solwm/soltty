@@ -82,15 +82,28 @@ spawn_term() {
     fi
     local wl_env=""
     [ "$capture_commits" = "1" ] && wl_env="WAYLAND_DEBUG=client"
-    # Force matched font + size across terminals so the cell-pixel
-    # workload is identical. JetBrains Mono is the default for both on
-    # this host; FONT_PX defaults to 15 px (matching the user's
-    # interactive alacritty.toml).
-    local font_px="${FONT_PX:-15}"
+    # Pick matched font sizes per terminal.
+    #
+    # SOLTTY_FONT_PX takes pixels; alacritty's font.size takes *points*
+    # (so at Wayland scale 1 they're off by a factor of ~1.33). To get
+    # the same cell-pixel size — and therefore the same grid count when
+    # maximized — pass them separately:
+    #
+    #   SOLTTY_PX=10  ALACRITTY_PT=6   → both 640×150 cells
+    #   SOLTTY_PX=20  ALACRITTY_PT=12  → both 320×77  cells
+    #
+    # Verified empirically via a probe (cf. commit message). Without
+    # overrides, defaults give roughly equivalent cell sizes.
+    #
+    # FONT_PX (legacy) sets BOTH to the same numeric value — only useful
+    # if you intentionally want the unit-mismatch comparison or are
+    # testing one terminal in isolation.
+    local soltty_px="${SOLTTY_PX:-${FONT_PX:-10}}"
+    local alac_pt="${ALACRITTY_PT:-${FONT_PX:-6}}"
     case "$term" in
         soltty)
             timeout --foreground --kill-after=2 "${hard_kill_s}s" \
-                env $wl_env SOLTTY_START_MAXIMIZED=1 SOLTTY_FONT_PX="$font_px" \
+                env $wl_env SOLTTY_START_MAXIMIZED=1 SOLTTY_FONT_PX="$soltty_px" \
                 "$bin_dir/soltty" -e bash -c "$cmd_str" >/dev/null 2>"$stderr_dst" &
             ;;
         alacritty)
@@ -98,7 +111,7 @@ spawn_term() {
             timeout --foreground --kill-after=2 "${hard_kill_s}s" \
                 env $wl_env alacritty \
                     -o 'window.startup_mode="Maximized"' \
-                    -o "font.size=$font_px" \
+                    -o "font.size=$alac_pt" \
                     -o 'font.normal.family="JetBrains Mono"' \
                     -e bash -c "$cmd_str" >/dev/null 2>"$stderr_dst" &
             ;;
@@ -233,9 +246,19 @@ scenario_cmd() {
         # because bash -c (non-login shell) may not have the repo dir on
         # its CWD. ${gol_bench_out} is allocated by run_trial before this
         # function is called.
+        #
+        # We deliberately do NOT pass GOL_FORCE_COLS/ROWS — that would
+        # force a fixed sub-grid that becomes a tiny strip on the screen
+        # at small fonts. Letting gol use TIOCGWINSZ means it fills
+        # whatever cells the terminal exposes, so the bench scales
+        # with the actual viewport at the chosen font size.
+        # GOL_ITERS overrides the iteration count (default 2000); at
+        # small fonts each iteration is much larger, so callers should
+        # lower it (e.g. GOL_ITERS=200 at FONT_PX=4).
         gol_c)
             local gol="${GOL_BIN:-/home/magniff/workspace/gol-c/gol}"
-            echo "GOL_BENCH_ITERS=2000 GOL_FORCE_COLS=295 GOL_FORCE_ROWS=75 GOL_BENCH_OUT=${gol_bench_out:-/tmp/gol_b.unset} $gol; sleep 0.5"
+            local iters="${GOL_ITERS:-2000}"
+            echo "GOL_BENCH_ITERS=$iters GOL_BENCH_OUT=${gol_bench_out:-/tmp/gol_b.unset} $gol; sleep 0.5"
             ;;
         *) return 1 ;;
     esac
