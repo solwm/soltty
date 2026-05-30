@@ -390,6 +390,11 @@ impl Renderer {
                 self.cursor_shape_id = 0;
             }
         }
+        // Cell coords of the active cursor (if any). Used by the
+        // skip-blank-cell guard below: a blank cell at the cursor
+        // position still needs an instance, otherwise the shader has
+        // no fragment to overlay the cursor on.
+        let (cursor_row_i, cursor_col_i) = (self.cursor_cell.1, self.cursor_cell.0);
 
         // Single pass: ensure each cell's glyph in the atlas, then pack the
         // instance immediately. Same shape as the wgpu version was.
@@ -420,7 +425,18 @@ impl Renderer {
                     && is_blank_glyph(cell.ch)
                     && cell.attrs == CellAttrs::default()
                 {
-                    continue;
+                    // Cursor / selection are drawn as a shader overlay
+                    // keyed on cell_xy; suppressing the instance for a
+                    // blank cell at the cursor or under the selection
+                    // would silently hide the overlay (the very bug
+                    // this guard prevents).
+                    let is_cursor =
+                        (vrow as i32) == cursor_row_i && (col_idx as i32) == cursor_col_i;
+                    let is_selected =
+                        selection.map_or(false, |s| s.contains(vrow, col_idx));
+                    if !is_cursor && !is_selected {
+                        continue;
+                    }
                 }
                 let style = FontStyle::from_attrs(
                     cell.attrs.has(CellAttrs::BOLD),
