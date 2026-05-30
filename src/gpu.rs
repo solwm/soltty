@@ -344,9 +344,20 @@ impl Gpu {
         // we have to drop down to the concrete variant — exactly the same
         // dance alacritty does. The catch-all arm preserves behavior on
         // any non-EGL backend.
-        // EXPERIMENT v6: skip with-damage entirely, always plain swap.
-        let _ = burst_active; // unused in this experiment
-        let swap_result = self.surface.swap_buffers(&self.context);
+        //
+        // During a burst the damage list is already a full-window rect
+        // (see compute_damage_rects), so the with-damage marshaling
+        // would do nothing useful — use plain swap_buffers to skip it.
+        let swap_result = if burst_active {
+            self.surface.swap_buffers(&self.context)
+        } else {
+            match (&self.surface, &self.context) {
+                (Surface::Egl(s), PossiblyCurrentContext::Egl(c)) => {
+                    s.swap_buffers_with_damage(c, &self.renderer.damage_rects)
+                }
+                _ => self.surface.swap_buffers(&self.context),
+            }
+        };
         if let Err(e) = swap_result {
             log::warn!("swap_buffers: {e}");
         }

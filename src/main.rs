@@ -304,7 +304,7 @@ const BURST_BYTES_THRESHOLD: usize = 1024;
 ///
 /// Typing/echo bypasses this entirely — see `App::window_event`
 /// keyboard branch which clears `burst_holdoff` on every keystroke.
-const BURST_FRAME_MULTIPLIER: u32 = 6;
+const BURST_FRAME_MULTIPLIER: u32 = 3;
 /// How many renders we stay in burst mode for, after the last big
 /// drain. Keeps us coasting through the burst without thrashing back
 /// and forth on a single momentarily-empty drain.
@@ -497,20 +497,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(pty) = self.pty.as_mut() {
                     let bytes = pty.drain();
                     if !bytes.is_empty() {
-                        // A drain larger than the threshold means the
-                        // child is in burst mode — stretch the next
-                        // few render deadlines so we don't paint every
-                        // intermediate state. Typing produces tiny
-                        // drains (single-key echo) and never trips
-                        // this; gol-c/`cat`-of-large-file always do.
                         if bytes.len() >= BURST_BYTES_THRESHOLD {
                             self.burst_holdoff = BURST_HOLDOFF_FRAMES;
                         }
-                        self.term.feed(&bytes);
-                        // Parser may have produced reply bytes (DSR
-                        // cursor-position reports etc.) — write them
-                        // back to the PTY now so the application sees
-                        // the round-trip before its next read.
+                        self.term.feed(bytes);
                         let reply = self.term.take_reply();
                         if !reply.is_empty() {
                             pty.write(&reply);
@@ -630,32 +620,19 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 });
                 let burst_active = self.burst_holdoff > 0;
-                // During a heavy PTY burst, ELIDE the render entirely.
-                // Skip prepare, draw, and swap. The screen freezes on
-                // the last pre-burst frame; once the burst ends and
-                // burst_holdoff decays to 0, we render the resulting
-                // state in one shot. This frees the main thread to
-                // drain PTY and parse, which is the actual bottleneck
-                // for chatty-child workloads (gol-c, cat-of-big-file).
-                //
-                // Caveat: visually the window freezes during the burst.
-                // Acceptable for bench-mode runs; for interactive use
-                // the user can still see the post-burst state.
-                if !burst_active {
-                    gpu.render(
-                        &self.term,
-                        self.picker.as_mut(),
-                        self.selection.as_ref(),
-                        cursor_visible,
-                        vi_cursor,
-                        self.vi.active,
-                        search_overlay.as_ref(),
-                        burst_active,
-                    );
-                    self.last_render = Some(now);
-                }
+                gpu.render(
+                    &self.term,
+                    self.picker.as_mut(),
+                    self.selection.as_ref(),
+                    cursor_visible,
+                    vi_cursor,
+                    self.vi.active,
+                    search_overlay.as_ref(),
+                    burst_active,
+                );
                 self.redraw_pending = false;
                 self.dirty = false;
+                self.last_render = Some(now);
                 // Decay burst-mode one step per render. Once it hits
                 // 0 we're back to full refresh; another big drain
                 // re-arms it.
