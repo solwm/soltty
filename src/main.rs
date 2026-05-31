@@ -13,6 +13,8 @@ mod term;
 mod theme;
 mod vi;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -123,7 +125,8 @@ fn main() {
         vi_keybind: vi::ViKeyBind::resolve(cfg.vi_keybind.as_deref()),
         held_buttons: 0,
         last_reported_cell: None,
-        burst_holdoff: 0,
+        burst_holdoff: Arc::new(AtomicU32::new(0)),
+        pty_replies: None,
         // Assume focused at startup; the compositor sends a Focused
         // event shortly after window creation that will correct this
         // if we came up unfocused.
@@ -247,7 +250,15 @@ struct App {
     /// so the moment the burst stops we're back to full refresh rate
     /// for typing/echo. Typing produces tiny drains (one keypress
     /// echo) and never triggers this path.
-    burst_holdoff: u32,
+    /// Shared with the PTY worker. Worker stores BURST_HOLDOFF_FRAMES
+    /// when it sees a large feed batch; main loads to widen the render
+    /// interval and decays by 1 per render. Atomic so we don't take
+    /// the term lock to update or read it.
+    burst_holdoff: Arc<AtomicU32>,
+    /// Reply bytes the parser produced (DSR, OSC color queries) —
+    /// worker sends them here, main drains and writes them through
+    /// `pty.write`. `None` until `resumed` wires up the channel.
+    pty_replies: Option<Receiver<Vec<u8>>>,
     /// Loaded user config. Consulted in `resumed` for font / frame
     /// settings that we don't know how to apply until the window
     /// exists. Other settings (theme, vi keybind) are already resolved
@@ -382,6 +393,10 @@ impl ApplicationHandler<UserEvent> for App {
             initial_theme.cursor_bg,
         );
 
+        // Wrap the configured Term so the worker can take a clone.
+        let term_arc = Arc::new(Mutex::new(term));
+        let (reply_tx, reply_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel();
+
         let proxy_data = self.proxy.clone();
         let proxy_exit = self.proxy.clone();
         log::info!("spawn: {} {:?}", self.program, self.args);
@@ -390,6 +405,11 @@ impl ApplicationHandler<UserEvent> for App {
             cols,
             &self.program,
             &self.args,
+            term_arc.clone(),
+            reply_tx,
+            self.burst_holdoff.clone(),
+            BURST_HOLDOFF_FRAMES,
+            BURST_BYTES_THRESHOLD,
             move || {
                 let _ = proxy_data.send_event(UserEvent::PtyData);
             },
@@ -404,10 +424,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.pty = Some(pty);
-        // Replace the placeholder 24×80 Term-Arc with the properly-sized
-        // one. Nobody else has cloned the placeholder yet so the drop is
-        // safe.
-        self.term = Arc::new(Mutex::new(term));
+        // Replace the placeholder 24×80 Term-Arc with the worker-shared
+        // one. The placeholder has no other clones at this point so
+        // the drop is safe.
+        self.term = term_arc;
+        self.pty_replies = Some(reply_rx);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -467,7 +488,7 @@ impl ApplicationHandler<UserEvent> for App {
         // two paths must agree; otherwise about_to_wait could trip a
         // redraw `maybe_request_redraw` had postponed (or vice
         // versa), and the burst throttle would leak frames.
-        let interval = if self.burst_holdoff > 0 {
+        let interval = if self.burst_holdoff.load(Ordering::Acquire) > 0 {
             self.frame_interval * BURST_FRAME_MULTIPLIER
         } else {
             self.frame_interval
@@ -501,24 +522,22 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyData => {
+                // Worker has parsed at least one batch since our last
+                // wake. Ack the coalescing flag so the next worker
+                // batch re-signals us, drain any reply bytes the
+                // parser produced and forward them through the PTY
+                // writer. No term lock involved — the parser already
+                // mutated Term under its own lock on the worker.
                 if let Some(pty) = self.pty.as_mut() {
-                    let bytes = pty.drain();
-                    if !bytes.is_empty() {
-                        if bytes.len() >= BURST_BYTES_THRESHOLD {
-                            self.burst_holdoff = BURST_HOLDOFF_FRAMES;
-                        }
-                        let reply = {
-                            let mut term = self.term.lock().unwrap();
-                            term.feed(bytes);
-                            term.take_reply()
-                        };
-                        if !reply.is_empty() {
+                    pty.ack_wakeup();
+                    if let Some(rx) = self.pty_replies.as_ref() {
+                        while let Ok(reply) = rx.try_recv() {
                             pty.write(&reply);
                         }
-                        self.dirty = true;
-                        self.maybe_request_redraw();
                     }
                 }
+                self.dirty = true;
+                self.maybe_request_redraw();
             }
             UserEvent::PtyExited => {
                 // Shell (or whatever was the foreground command) closed its
@@ -632,7 +651,7 @@ impl ApplicationHandler<UserEvent> for App {
                             current: current_visible,
                         }
                     });
-                    burst_active = self.burst_holdoff > 0;
+                    burst_active = self.burst_holdoff.load(Ordering::Acquire) > 0;
                     gpu.snapshot_term(&*term_guard);
                     // Guard drops here as the block ends — everything
                     // after this point operates on the renderer's
@@ -651,9 +670,15 @@ impl ApplicationHandler<UserEvent> for App {
                 self.dirty = false;
                 self.last_render = Some(now);
                 // Decay burst-mode one step per render. Once it hits
-                // 0 we're back to full refresh; another big drain
-                // re-arms it.
-                self.burst_holdoff = self.burst_holdoff.saturating_sub(1);
+                // 0 we're back to full refresh; another big worker
+                // batch re-arms it. Racing with the worker is
+                // benign: if it stores a fresh value between our
+                // load and store, we lose at most one re-arm and
+                // the next batch sets it again.
+                let cur = self.burst_holdoff.load(Ordering::Acquire);
+                if cur > 0 {
+                    self.burst_holdoff.store(cur - 1, Ordering::Release);
+                }
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -936,12 +961,25 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                 ..
             } => {
+                // Flush any parser replies (DSR / OSC color queries)
+                // BEFORE writing keystrokes, so a reply to a still-in-
+                // flight query lands ahead of the new input on the
+                // PTY writer. Without this, an app's query could
+                // race with the user typing and the reply would
+                // arrive mid-keystroke stream.
+                if let (Some(pty), Some(rx)) =
+                    (self.pty.as_mut(), self.pty_replies.as_ref())
+                {
+                    while let Ok(reply) = rx.try_recv() {
+                        pty.write(&reply);
+                    }
+                }
                 // Cancel any burst-mode render hold-off the moment the
                 // user touches the keyboard. The shell's echo of this
                 // keystroke needs to paint at full refresh rate, even
                 // if a `cat large.log` had us in slow-render mode an
                 // instant earlier.
-                self.burst_holdoff = 0;
+                self.burst_holdoff.store(0, Ordering::Release);
                 log::debug!(
                     "key: logical={logical_key:?} physical={physical_key:?} text={text:?} ctrl={} shift={} alt={}",
                     self.modifiers.control_key(),
@@ -1459,7 +1497,7 @@ impl App {
         // don't all hit the GPU. IDLE_THRESHOLD still wins as a
         // ceiling so the user never waits more than 100 ms to see
         // the latest state.
-        let interval = if self.burst_holdoff > 0 {
+        let interval = if self.burst_holdoff.load(Ordering::Acquire) > 0 {
             self.frame_interval * BURST_FRAME_MULTIPLIER
         } else {
             self.frame_interval

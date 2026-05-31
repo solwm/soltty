@@ -1,32 +1,28 @@
-use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
-/// Bound on how many 8 KB chunks the reader thread can buffer before blocking.
-/// 64 chunks = 512 KB in flight. When full, the reader's `tx.send` blocks,
-/// the kernel PTY buffer fills, and a chatty child (e.g. a busy-loop printf)
-/// is forced to slow down to match our drain rate. Without this, the channel
-/// grows unboundedly, the main thread can't keep up, and keyboard events
-/// (including Ctrl+C) queue behind a wall of PTY data.
-const PTY_CHANNEL_CAP: usize = 64;
+use crate::term::Term;
+
+/// Threshold (bytes accumulated in the current batch) above which the
+/// worker switches from poll(timeout=0) to a short-blocking poll, so
+/// one feed carries a render-frame's worth of producer output. Picked
+/// above any plausible single-keystroke echo so interactive typing
+/// never enters the slower-poll path.
+const BURST_BATCH_BYTES: usize = 4 * 1024;
 
 pub struct Pty {
-    #[allow(dead_code)] // used by `resize`, which is wired up in milestone 5
+    #[allow(dead_code)] // used by `resize`
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    output_rx: Receiver<Vec<u8>>,
-    /// Reusable scratch buffer for `drain` so we don't allocate a fresh
-    /// `Vec<u8>` per call. Under gol-c bench we drain ~1000+ times/sec;
-    /// the per-call malloc/free shows up in profiles.
-    drain_buf: Vec<u8>,
-    /// Coalesced-wakeup flag. Reader sets to true after a read; main
-    /// clears it at the start of every drain. `on_data` fires winit's
-    /// user event only when the flag was previously false — i.e., when
-    /// the main thread might be idle. Saves redundant winit dispatches
-    /// during chatty bursts where multiple reads queue between drains.
+    /// Coalesced-wakeup flag. Worker sets to true after each batched
+    /// read + feed; main clears it inside `user_event(PtyData)`. The
+    /// worker only fires `on_data` when this transitions false→true,
+    /// so back-to-back read/feed cycles between two main-thread
+    /// frames collapse into a single winit wake.
     wakeup_pending: Arc<AtomicBool>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
@@ -37,6 +33,24 @@ impl Pty {
         cols: u16,
         program: &str,
         args: &[String],
+        // Parser state shared with main. Worker holds the lock during
+        // feed; main holds it for `snapshot_term` and the brief
+        // input-handler reads. The two are rarely contended thanks
+        // to the snapshot pattern, which copies cells out of Term
+        // and drops the guard before any GPU work runs.
+        term: Arc<Mutex<Term>>,
+        // Reply bytes the parser produced (DSR, OSC color queries) —
+        // worker hands them to main here, main writes them through
+        // `Pty::write` so all keystroke and reply traffic shares one
+        // ordering on the writer.
+        reply_tx: Sender<Vec<u8>>,
+        // Burst-throttle counter the main thread reads to widen the
+        // render interval. Worker stores `burst_holdoff_frames` when
+        // a batch exceeds `burst_bytes_threshold`; main decays it by
+        // 1 per render.
+        burst_holdoff: Arc<AtomicU32>,
+        burst_holdoff_frames: u32,
+        burst_bytes_threshold: usize,
         on_data: impl Fn() + Send + 'static,
         on_exit: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<Self> {
@@ -64,40 +78,107 @@ impl Pty {
         // Drop slave on the parent side so the child sees EOF when it exits.
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().map_err(io_other)?;
+        // We read through the raw fd so we can use poll(timeout=0) to
+        // batch contiguous reads into a single feed. The dyn-Read
+        // clone is kept on the worker thread purely to own the dup'd
+        // fd (drop closes it).
+        let reader = pair.master.try_clone_reader().map_err(io_other)?;
+        let raw_fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| io_other("master pty has no raw fd"))?;
         let writer = pair.master.take_writer().map_err(io_other)?;
 
-        let (tx, rx) = sync_channel::<Vec<u8>>(PTY_CHANNEL_CAP);
         let wakeup_pending = Arc::new(AtomicBool::new(false));
         let wakeup_clone = wakeup_pending.clone();
         std::thread::Builder::new()
             .name("soltty-pty-reader".into())
             .spawn(move || {
+                // Move-capture the cloned reader so its Drop runs at
+                // thread exit; the raw_fd we read through stays valid
+                // for the lifetime of this thread.
+                let _reader_keepalive = reader;
                 // 256 KB read buffer — bigger than the kernel's PTY pipe
-                // so a single read() returns whatever the kernel had
-                // queued in one shot.
+                // so a single read() typically returns whatever was queued.
                 let mut buf = [0u8; 262144];
                 loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break;
+                    // First read of the batch: blocks until data is available.
+                    let mut total = match unsafe {
+                        libc::read(raw_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                    } {
+                        0 => break,
+                        n if n < 0 => {
+                            let err = std::io::Error::last_os_error();
+                            if err.kind() == std::io::ErrorKind::Interrupted {
+                                continue;
                             }
-                            // Coalesced wakeup: only fire `on_data` if a
-                            // previous wakeup hasn't already been signaled
-                            // but not yet consumed by the main thread.
-                            // Under heavy bursts (gol-c writes ~7 chunks
-                            // per frame) this collapses 7 winit dispatches
-                            // into 1.
-                            if !wakeup_clone.swap(true, Ordering::AcqRel) {
-                                on_data();
-                            }
+                            break;
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                        n => n as usize,
+                    };
+                    // Opportunistically extend the batch in two phases.
+                    // Phase 1 (always): drain whatever's already queued
+                    // with poll(timeout=0). Phase 2 (only past the
+                    // burst threshold): wait up to a few ms for more —
+                    // interactive single-byte echo never crosses the
+                    // threshold so latency is unaffected.
+                    const BURST_BATCH_MS: i32 = 2;
+                    while total < buf.len() {
+                        let timeout = if total >= BURST_BATCH_BYTES {
+                            BURST_BATCH_MS
+                        } else {
+                            0
+                        };
+                        let mut pollfd = libc::pollfd {
+                            fd: raw_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let r = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+                        if r <= 0 || (pollfd.revents & libc::POLLIN) == 0 {
+                            break;
+                        }
+                        let n = unsafe {
+                            libc::read(
+                                raw_fd,
+                                buf[total..].as_mut_ptr() as *mut _,
+                                buf.len() - total,
+                            )
+                        };
+                        if n <= 0 {
+                            break;
+                        }
+                        total += n as usize;
+                    }
+                    if total >= burst_bytes_threshold {
+                        burst_holdoff.store(burst_holdoff_frames, Ordering::Release);
+                    }
+                    // Feed under the shared lock. The lock is held only
+                    // for the parse pass — main's snapshot takes the
+                    // lock briefly (~150 µs for a 640×150 grid memcpy)
+                    // then drops the guard before any GPU work, so
+                    // worker contention is bounded by snapshot time,
+                    // not by `swap_buffers`.
+                    let reply = {
+                        let mut term_guard = term.lock().unwrap();
+                        term_guard.feed(&buf[..total]);
+                        term_guard.take_reply()
+                    };
+                    if !reply.is_empty() {
+                        // Drop on full / disconnected — main has gone
+                        // away, the exit path is about to fire.
+                        let _ = reply_tx.send(reply);
+                    }
+                    // Coalesced wakeup: only fire `on_data` if a
+                    // previous wakeup hasn't been consumed yet. Under
+                    // a sustained burst the atomic stays true across
+                    // many feed cycles, collapsing N→1 winit
+                    // dispatches per frame.
+                    if !wakeup_clone.swap(true, Ordering::AcqRel) {
+                        on_data();
                     }
                 }
+                drop(_reader_keepalive);
                 // Reader saw EOF (or unrecoverable error) — child has closed
                 // its end of the PTY. Tell the main thread to wind down.
                 on_exit();
@@ -106,8 +187,6 @@ impl Pty {
         Ok(Self {
             master: pair.master,
             writer,
-            output_rx: rx,
-            drain_buf: Vec::with_capacity(256 * 1024),
             wakeup_pending,
             _child: child,
         })
@@ -119,27 +198,12 @@ impl Pty {
         }
     }
 
-    /// Drain everything currently pending on the channel. Returns a
-    /// reusable slice borrowed from `self.drain_buf` — caller must
-    /// copy/parse before the next call to `drain` (which truncates the
-    /// buffer back to empty).
-    pub fn drain(&mut self) -> &[u8] {
-        // Reset the coalesce flag *first*. Any read that lands between
-        // here and the next drain will set it again and re-wake us.
-        // Resetting last would race: a read that landed mid-drain could
-        // set the flag, then we'd clear it, and a subsequent read
-        // wouldn't re-wake because the flag was already true. Reset
-        // first → at most one missed wake per drain, and the channel
-        // try_recv loop below catches anything that arrived since.
+    /// Clear the worker→main wakeup flag at the start of
+    /// `user_event(PtyData)`. Any worker batch that lands between
+    /// here and the end of the handler re-signals naturally on the
+    /// next swap of the atomic.
+    pub fn ack_wakeup(&self) {
         self.wakeup_pending.store(false, Ordering::Release);
-        self.drain_buf.clear();
-        loop {
-            match self.output_rx.try_recv() {
-                Ok(chunk) => self.drain_buf.extend_from_slice(&chunk),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        &self.drain_buf
     }
 
     #[allow(dead_code)] // wired up in milestone 5
