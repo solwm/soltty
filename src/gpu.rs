@@ -278,9 +278,18 @@ impl Gpu {
         self.renderer.resize(&self.gl, (width, height));
     }
 
+    /// Capture the slice of `Term` that the renderer needs into the
+    /// reusable snapshot buffers on `Renderer`. After this returns
+    /// the renderer is decoupled from the live `Term` for the rest of
+    /// the frame, so a caller holding a Term lock can drop the guard
+    /// here. Separate from `render` so the lock-drop point is
+    /// explicit at the call site.
+    pub fn snapshot_term(&mut self, term: &Term) {
+        self.renderer.snapshot_term(term);
+    }
+
     pub fn render(
         &mut self,
-        term: &Term,
         picker: Option<&mut Picker>,
         selection: Option<&Selection>,
         cursor_visible_now: bool,
@@ -296,7 +305,6 @@ impl Gpu {
 
         self.renderer.prepare(
             &self.gl,
-            term,
             &mut self.atlas,
             picker,
             selection,

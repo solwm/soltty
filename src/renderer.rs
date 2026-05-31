@@ -2,7 +2,7 @@ use glow::HasContext;
 use glutin::surface::Rect;
 
 use crate::font::{FontAtlas, FontStyle};
-use crate::grid::{CellAttrs, Color, CursorShape};
+use crate::grid::{Cell, CellAttrs, Color, CursorShape};
 use crate::picker::Picker;
 use crate::selection::Selection;
 use crate::term::Term;
@@ -201,6 +201,19 @@ pub struct Renderer {
     /// per the EGL spec). Cleared and refilled each `prepare`. `Gpu::render`
     /// reads this and forwards it to `swap_buffers_with_damage`.
     pub damage_rects: Vec<Rect>,
+
+    /// Per-frame snapshot of everything in `Term` that the pack loop
+    /// reads. Refilled at the top of `prepare`; the rest of `prepare`
+    /// (and `draw`/`swap`) reads from here, never from the live Term.
+    /// Lets a future caller take the Term lock just for the snapshot
+    /// fill and release it before any GPU work runs. Today there's no
+    /// lock, but the boundary is the same: after `snapshot_term`
+    /// returns, the renderer is independent of Term for the frame.
+    snap_rows: usize,
+    snap_cols: usize,
+    snap_viewport: Vec<Vec<Cell>>,
+    snap_viewport_cursor: Option<(usize, usize)>,
+    snap_cursor_shape: CursorShape,
 }
 
 impl Renderer {
@@ -282,6 +295,11 @@ impl Renderer {
             grid_instance_end: 0,
             last_grid_dims: (0, 0),
             damage_rects: Vec::new(),
+            snap_rows: 0,
+            snap_cols: 0,
+            snap_viewport: Vec::new(),
+            snap_viewport_cursor: None,
+            snap_cursor_shape: CursorShape::Block,
         };
         unsafe { renderer.upload_uniforms(gl) };
         renderer
@@ -338,10 +356,45 @@ impl Renderer {
         unsafe { self.upload_uniforms(gl) };
     }
 
+    /// Copy everything the pack loop reads from `Term` into reusable
+    /// internal buffers. Caller invokes this before `prepare`; after it
+    /// returns the renderer no longer touches `term` for the frame, so
+    /// a caller that holds an `Arc<Mutex<Term>>` lock can drop the
+    /// guard right here and let other threads (a parser worker, for
+    /// instance) take it for the remainder of the frame.
+    ///
+    /// The viewport is materialized into `Vec<Vec<Cell>>` with
+    /// per-row `Vec::clear()` + `extend_from_slice` so the heap
+    /// allocations are amortized across frames.
+    pub fn snapshot_term(&mut self, term: &Term) {
+        let grid = term.grid();
+        self.snap_rows = grid.rows;
+        self.snap_cols = grid.cols;
+        // Match the outer Vec length to the row count; existing inner
+        // Vecs keep their capacity.
+        if self.snap_viewport.len() < self.snap_rows {
+            self.snap_viewport
+                .resize_with(self.snap_rows, Vec::new);
+        } else {
+            self.snap_viewport.truncate(self.snap_rows);
+        }
+        for vrow in 0..self.snap_rows {
+            let row = term.viewport_row(vrow);
+            let dst = &mut self.snap_viewport[vrow];
+            dst.clear();
+            // Slice down to `cols` so a shrunk grid doesn't carry stale
+            // tail cells. `Cell: Copy` so extend_from_slice is one
+            // memcpy per row, no Drop bookkeeping.
+            let n = row.cells.len().min(self.snap_cols);
+            dst.extend_from_slice(&row.cells[..n]);
+        }
+        self.snap_viewport_cursor = term.viewport_cursor();
+        self.snap_cursor_shape = term.cursor_shape();
+    }
+
     pub fn prepare(
         &mut self,
         gl: &glow::Context,
-        term: &Term,
         atlas: &mut FontAtlas,
         picker: Option<&mut Picker>,
         selection: Option<&Selection>,
@@ -350,8 +403,8 @@ impl Renderer {
         search: Option<&SearchOverlay<'_>>,
         burst_active: bool,
     ) {
-        let rows = term.grid().rows;
-        let cols = term.grid().cols;
+        let rows = self.snap_rows;
+        let cols = self.snap_cols;
 
         // Cursor info goes to the shader via uniforms; the fragment stage
         // overlays the chosen shape on top of the cursor cell. Keeping it
@@ -369,11 +422,11 @@ impl Renderer {
         //     that frame.
         let cursor: Option<(usize, usize, CursorShape)> = match vi_cursor {
             Some((row, col)) => Some((row, col, CursorShape::HollowBlock)),
-            None => term
-                .viewport_cursor()
+            None => self
+                .snap_viewport_cursor
                 .filter(|_| picker.is_none())
                 .filter(|_| cursor_visible_now)
-                .map(|(r, c)| (r, c, term.cursor_shape())),
+                .map(|(r, c)| (r, c, self.snap_cursor_shape)),
         };
         match cursor {
             Some((row, col, shape)) => {
@@ -397,11 +450,12 @@ impl Renderer {
         let (cursor_row_i, cursor_col_i) = (self.cursor_cell.1, self.cursor_cell.0);
 
         // Single pass: ensure each cell's glyph in the atlas, then pack the
-        // instance immediately. Same shape as the wgpu version was.
+        // instance immediately. Reads from the per-frame snapshot, never
+        // back to the live `Term` — see `snapshot_term`.
         self.instances_scratch.clear();
         for vrow in 0..rows {
-            let row = term.viewport_row(vrow);
-            for (col_idx, cell) in row.cells.iter().take(cols).enumerate() {
+            let row = &self.snap_viewport[vrow];
+            for (col_idx, cell) in row.iter().take(cols).enumerate() {
                 // Spacer cells (the right half of a wide character)
                 // don't get their own instance — the leading cell's
                 // wide glyph already covers them via a second instance

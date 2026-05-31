@@ -620,8 +620,13 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 });
                 let burst_active = self.burst_holdoff > 0;
+                // Snapshot Term into the renderer first. After this
+                // call, the renderer no longer touches Term for the
+                // rest of the frame — `render` runs from the
+                // snapshot. When Term moves behind a lock later, this
+                // is where the guard drops.
+                gpu.snapshot_term(&self.term);
                 gpu.render(
-                    &self.term,
                     self.picker.as_mut(),
                     self.selection.as_ref(),
                     cursor_visible,
