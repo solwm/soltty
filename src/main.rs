@@ -13,7 +13,7 @@ mod term;
 mod theme;
 mod vi;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -102,7 +102,7 @@ fn main() {
         window: None,
         gpu: None,
         pty: None,
-        term: Term::new(24, 80),
+        term: Arc::new(Mutex::new(Term::new(24, 80))),
         modifiers: ModifiersState::empty(),
         program,
         args,
@@ -174,7 +174,11 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     pty: Option<Pty>,
-    term: Term,
+    /// Shared so the PTY worker (added in a follow-up commit) can take
+    /// the lock for feed while the main thread is past `snapshot_term`
+    /// and into the lock-free render path. For now main is the only
+    /// locker — every acquisition is uncontested.
+    term: Arc<Mutex<Term>>,
     modifiers: ModifiersState,
     program: String,
     args: Vec<String>,
@@ -400,7 +404,10 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.pty = Some(pty);
-        self.term = term;
+        // Replace the placeholder 24×80 Term-Arc with the properly-sized
+        // one. Nobody else has cloned the placeholder yet so the drop is
+        // safe.
+        self.term = Arc::new(Mutex::new(term));
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -500,8 +507,11 @@ impl ApplicationHandler<UserEvent> for App {
                         if bytes.len() >= BURST_BYTES_THRESHOLD {
                             self.burst_holdoff = BURST_HOLDOFF_FRAMES;
                         }
-                        self.term.feed(bytes);
-                        let reply = self.term.take_reply();
+                        let reply = {
+                            let mut term = self.term.lock().unwrap();
+                            term.feed(bytes);
+                            term.take_reply()
+                        };
                         if !reply.is_empty() {
                             pty.write(&reply);
                         }
@@ -548,7 +558,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(size) => {
                 gpu.resize(size.width, size.height);
                 let (rows, cols) = grid_dims_for_window(gpu.cell_size(), size.width, size.height);
-                self.term.resize(rows as usize, cols as usize);
+                self.term.lock().unwrap().resize(rows as usize, cols as usize);
                 if let Some(pty) = self.pty.as_ref() {
                     pty.resize(rows, cols);
                 }
@@ -558,74 +568,76 @@ impl ApplicationHandler<UserEvent> for App {
                 let size = window.inner_size();
                 gpu.resize(size.width, size.height);
                 let (rows, cols) = grid_dims_for_window(gpu.cell_size(), size.width, size.height);
-                self.term.resize(rows as usize, cols as usize);
+                self.term.lock().unwrap().resize(rows as usize, cols as usize);
                 if let Some(pty) = self.pty.as_ref() {
                     pty.resize(rows, cols);
                 }
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                // Inline `cursor_visible_now` here — calling a `&self`
-                // method while the destructuring at the top of this fn
-                // holds `&mut self.gpu` trips the borrow checker, even
-                // though the fields we touch are disjoint from gpu. Going
-                // through field access directly lets disjoint-borrow do
-                // its job.
-                let cursor_visible = match self.term.cursor_shape() {
-                    CursorShape::Block | CursorShape::HollowBlock => true,
-                    CursorShape::Bar | CursorShape::Underline => {
-                        let elapsed = now.duration_since(self.blink_epoch);
-                        let half_ms = BLINK_HALF_PERIOD.as_millis();
-                        (elapsed.as_millis() / half_ms) % 2 == 0
-                    }
-                };
-                let vi_cursor = if self.vi.active {
-                    Some(self.vi.cursor)
-                } else {
-                    None
-                };
-                // Build the renderer's search-overlay view from vi state.
-                // Only matches inside the current viewport are listed —
-                // off-screen ones get skipped, since the renderer matches
-                // by viewport row.
-                let search_overlay = self.vi.search.as_ref().map(|s| {
-                    let g = self.term.grid();
-                    let sb_len = g.scrollback.len();
-                    let top_abs = sb_len.saturating_sub(self.term.viewport_offset);
-                    let view_rows = g.rows;
-                    let mut visible = Vec::new();
-                    let mut current_visible = None;
-                    for (i, m) in s.matches.iter().enumerate() {
-                        if m.row >= top_abs && m.row < top_abs + view_rows {
-                            if Some(i) == s.current {
-                                current_visible = Some(visible.len());
-                            }
-                            visible.push(renderer::MatchView {
-                                vrow: m.row - top_abs,
-                                col_start: m.col_start,
-                                col_end: m.col_end,
-                            });
+                // Lock the Term once for everything the renderer needs
+                // to see, then drop the guard before any GPU work
+                // runs. After `snapshot_term` returns the renderer
+                // owns its own copy of the viewport rows + cursor info;
+                // a future parser thread would be free to feed bytes
+                // while we're inside prepare/draw/swap.
+                let (cursor_visible, vi_cursor, search_overlay, burst_active);
+                {
+                    let term_guard = self.term.lock().unwrap();
+                    cursor_visible = match term_guard.cursor_shape() {
+                        CursorShape::Block | CursorShape::HollowBlock => true,
+                        CursorShape::Bar | CursorShape::Underline => {
+                            let elapsed = now.duration_since(self.blink_epoch);
+                            let half_ms = BLINK_HALF_PERIOD.as_millis();
+                            (elapsed.as_millis() / half_ms) % 2 == 0
                         }
-                    }
-                    let prompt = match s.direction {
-                        vi::SearchDirection::Forward => '/',
-                        vi::SearchDirection::Backward => '?',
                     };
-                    renderer::SearchOverlay {
-                        prompt,
-                        query: &s.query,
-                        typing: s.typing,
-                        matches: visible,
-                        current: current_visible,
-                    }
-                });
-                let burst_active = self.burst_holdoff > 0;
-                // Snapshot Term into the renderer first. After this
-                // call, the renderer no longer touches Term for the
-                // rest of the frame — `render` runs from the
-                // snapshot. When Term moves behind a lock later, this
-                // is where the guard drops.
-                gpu.snapshot_term(&self.term);
+                    vi_cursor = if self.vi.active {
+                        Some(self.vi.cursor)
+                    } else {
+                        None
+                    };
+                    // Build the renderer's search-overlay view from vi state.
+                    // Only matches inside the current viewport are listed —
+                    // off-screen ones get skipped, since the renderer matches
+                    // by viewport row.
+                    search_overlay = self.vi.search.as_ref().map(|s| {
+                        let g = term_guard.grid();
+                        let sb_len = g.scrollback.len();
+                        let top_abs = sb_len.saturating_sub(term_guard.viewport_offset);
+                        let view_rows = g.rows;
+                        let mut visible = Vec::new();
+                        let mut current_visible = None;
+                        for (i, m) in s.matches.iter().enumerate() {
+                            if m.row >= top_abs && m.row < top_abs + view_rows {
+                                if Some(i) == s.current {
+                                    current_visible = Some(visible.len());
+                                }
+                                visible.push(renderer::MatchView {
+                                    vrow: m.row - top_abs,
+                                    col_start: m.col_start,
+                                    col_end: m.col_end,
+                                });
+                            }
+                        }
+                        let prompt = match s.direction {
+                            vi::SearchDirection::Forward => '/',
+                            vi::SearchDirection::Backward => '?',
+                        };
+                        renderer::SearchOverlay {
+                            prompt,
+                            query: &s.query,
+                            typing: s.typing,
+                            matches: visible,
+                            current: current_visible,
+                        }
+                    });
+                    burst_active = self.burst_holdoff > 0;
+                    gpu.snapshot_term(&*term_guard);
+                    // Guard drops here as the block ends — everything
+                    // after this point operates on the renderer's
+                    // copy.
+                }
                 gpu.render(
                     self.picker.as_mut(),
                     self.selection.as_ref(),
@@ -648,7 +660,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
-                let mode = self.term.mouse_mode;
+                let mode = self.term.lock().unwrap().mouse_mode;
                 let shift = self.modifiers.shift_key();
                 // Mouse-reporting forward path. Shift held = bypass
                 // (matches alacritty/xterm: hold Shift to escape an
@@ -661,7 +673,7 @@ impl ApplicationHandler<UserEvent> for App {
                         term::MouseMode::AllMotion => true,
                     };
                     if want_motion {
-                        let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term);
+                        let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &*self.term.lock().unwrap());
                         // Drop pixel-granular motion that didn't change
                         // the cell — keeps a fast drag from drowning
                         // the PTY in identical events.
@@ -686,7 +698,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 ctrl: self.modifiers.control_key(),
                             };
                             if let Some(pty) = self.pty.as_mut() {
-                                pty.write(&term::encode_mouse(event, self.term.mouse_encoding));
+                                pty.write(&term::encode_mouse(event, self.term.lock().unwrap().mouse_encoding));
                             }
                         }
                     }
@@ -702,11 +714,11 @@ impl ApplicationHandler<UserEvent> for App {
                         // selection past the visible region.
                         let inner = window.inner_size();
                         if position.y < 0.0 {
-                            self.term.scroll_view(1);
+                            self.term.lock().unwrap().scroll_view(1);
                         } else if position.y > inner.height as f64 {
-                            self.term.scroll_view(-1);
+                            self.term.lock().unwrap().scroll_view(-1);
                         }
-                        let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &self.term);
+                        let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &*self.term.lock().unwrap());
                         if cell != sel.end {
                             sel.end = cell;
                             window.request_redraw();
@@ -719,7 +731,7 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                let mode = self.term.mouse_mode;
+                let mode = self.term.lock().unwrap().mouse_mode;
                 let shift = self.modifiers.shift_key();
                 if mode != term::MouseMode::None && !shift {
                     // Update held mask first so motion handlers know
@@ -728,7 +740,7 @@ impl ApplicationHandler<UserEvent> for App {
                         ElementState::Pressed => self.held_buttons |= 0b001,
                         ElementState::Released => self.held_buttons &= !0b001,
                     }
-                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term);
+                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &*self.term.lock().unwrap());
                     let event = term::MouseEvent {
                         button: term::MouseButton::Left,
                         action: match state {
@@ -742,12 +754,12 @@ impl ApplicationHandler<UserEvent> for App {
                         ctrl: self.modifiers.control_key(),
                     };
                     if let Some(pty) = self.pty.as_mut() {
-                        pty.write(&term::encode_mouse(event, self.term.mouse_encoding));
+                        pty.write(&term::encode_mouse(event, self.term.lock().unwrap().mouse_encoding));
                     }
                     return;
                 }
                 let (cw, ch) = gpu.cell_size();
-                let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &self.term);
+                let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &*self.term.lock().unwrap());
                 match state {
                     ElementState::Pressed => {
                         // Shift+click extends the existing selection.
@@ -777,13 +789,13 @@ impl ApplicationHandler<UserEvent> for App {
 
                         let mut sel = match count {
                             2 => {
-                                let (s, e) = selection::word_bounds(&self.term, cell.0, cell.1);
+                                let (s, e) = selection::word_bounds(&*self.term.lock().unwrap(), cell.0, cell.1);
                                 let mut sel = selection::Selection::new(s);
                                 sel.end = e;
                                 sel
                             }
                             3 => {
-                                let (s, e) = selection::line_bounds(&self.term, cell.0);
+                                let (s, e) = selection::line_bounds(&*self.term.lock().unwrap(), cell.0);
                                 let mut sel = selection::Selection::new(s);
                                 sel.end = e;
                                 sel
@@ -796,7 +808,7 @@ impl ApplicationHandler<UserEvent> for App {
                             sel.dragging = false;
                             // Auto-fill clipboard so triple-click → middle
                             // click pastes the whole line.
-                            let text = selection::extract_text(&self.term, &sel);
+                            let text = selection::extract_text(&*self.term.lock().unwrap(), &sel);
                             if !text.is_empty() {
                                 self.clipboard.set_primary(text.clone());
                                 self.clipboard.set_text(text);
@@ -812,7 +824,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // (skip stray clicks). Fill both clipboards so
                             // Ctrl+Shift+V and middle-click both paste it.
                             if !sel.is_empty() {
-                                let text = selection::extract_text(&self.term, sel);
+                                let text = selection::extract_text(&*self.term.lock().unwrap(), sel);
                                 if !text.is_empty() {
                                     self.clipboard.set_primary(text.clone());
                                     self.clipboard.set_text(text);
@@ -827,14 +839,14 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Middle,
                 ..
             } => {
-                let mode = self.term.mouse_mode;
+                let mode = self.term.lock().unwrap().mouse_mode;
                 let shift = self.modifiers.shift_key();
                 if mode != term::MouseMode::None && !shift {
                     match state {
                         ElementState::Pressed => self.held_buttons |= 0b010,
                         ElementState::Released => self.held_buttons &= !0b010,
                     }
-                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term);
+                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &*self.term.lock().unwrap());
                     let event = term::MouseEvent {
                         button: term::MouseButton::Middle,
                         action: match state {
@@ -848,7 +860,7 @@ impl ApplicationHandler<UserEvent> for App {
                         ctrl: self.modifiers.control_key(),
                     };
                     if let Some(pty) = self.pty.as_mut() {
-                        pty.write(&term::encode_mouse(event, self.term.mouse_encoding));
+                        pty.write(&term::encode_mouse(event, self.term.lock().unwrap().mouse_encoding));
                     }
                     return;
                 }
@@ -866,22 +878,22 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if !text.is_empty() {
                     if let Some(pty) = self.pty.as_mut() {
-                        write_paste(pty, &text, self.term.bracketed_paste);
-                        self.term.reset_view();
+                        write_paste(pty, &text, self.term.lock().unwrap().bracketed_paste);
+                        self.term.lock().unwrap().reset_view();
                         self.selection = None;
                         window.request_redraw();
                     }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let mode = self.term.mouse_mode;
+                let mode = self.term.lock().unwrap().mouse_mode;
                 let shift = self.modifiers.shift_key();
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_x, y) => (y * 3.0) as isize,
                     MouseScrollDelta::PixelDelta(p) => (p.y / 16.0) as isize,
                 };
                 if mode != term::MouseMode::None && !shift && lines != 0 {
-                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term);
+                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &*self.term.lock().unwrap());
                     let button = if lines > 0 {
                         term::MouseButton::WheelUp
                     } else {
@@ -902,13 +914,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 alt: self.modifiers.alt_key(),
                                 ctrl: self.modifiers.control_key(),
                             };
-                            pty.write(&term::encode_mouse(event, self.term.mouse_encoding));
+                            pty.write(&term::encode_mouse(event, self.term.lock().unwrap().mouse_encoding));
                         }
                     }
                     return;
                 }
                 if lines != 0 {
-                    self.term.scroll_view(lines);
+                    self.term.lock().unwrap().scroll_view(lines);
                     window.request_redraw();
                 }
             }
@@ -963,27 +975,27 @@ impl ApplicationHandler<UserEvent> for App {
                     match &logical_key {
                         Key::Named(ArrowUp) => {
                             picker.move_up();
-                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
                         }
                         Key::Named(ArrowDown) => {
                             picker.move_down();
-                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
                         }
                         Key::Named(PageUp) => {
                             picker.page_up(8);
-                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
                         }
                         Key::Named(PageDown) => {
                             picker.page_down(8);
-                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
                         }
                         Key::Named(Home) => {
                             picker.home();
-                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
                         }
                         Key::Named(End) => {
                             picker.end();
-                            apply_picker_preview(gpu, &mut self.term, picker, &self.theme_lib);
+                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
                         }
                         Key::Named(Enter) => {
                             // Commit current selection.
@@ -995,7 +1007,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // Restore the original theme.
                             let original = picker.cancel(&self.theme_lib).clone();
                             gpu.set_theme(&original);
-                            self.term.set_theme_colors(
+                            self.term.lock().unwrap().set_theme_colors(
                                 original.fg,
                                 original.bg,
                                 original.cursor_bg,
@@ -1012,7 +1024,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Vi mode: activation. Once active, the keypress that
                 // triggered entry is consumed locally — never sent to PTY.
                 if !self.vi.active && self.vi_keybind.matches(&logical_key, self.modifiers) {
-                    let start = self.term.viewport_cursor().unwrap_or((0, 0));
+                    let start = self.term.lock().unwrap().viewport_cursor().unwrap_or((0, 0));
                     self.vi.enter(start);
                     self.selection = None;
                     window.request_redraw();
@@ -1033,10 +1045,10 @@ impl ApplicationHandler<UserEvent> for App {
                         .map(|s| s.typing)
                         .unwrap_or(false);
                     if typing {
-                        let cols = self.term.grid().cols;
+                        let cols = self.term.lock().unwrap().grid().cols;
                         match &logical_key {
                             Key::Named(NamedKey::Escape) => {
-                                cancel_search(&mut self.vi, &mut self.term);
+                                cancel_search(&mut self.vi, &mut *self.term.lock().unwrap());
                             }
                             Key::Named(NamedKey::Enter) => {
                                 if let Some(s) = self.vi.search.as_mut() {
@@ -1047,7 +1059,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 if let Some(s) = self.vi.search.as_mut() {
                                     s.query.pop();
                                 }
-                                refresh_search(&mut self.vi, &mut self.term);
+                                refresh_search(&mut self.vi, &mut *self.term.lock().unwrap());
                             }
                             Key::Character(text) if !self.modifiers.control_key() => {
                                 if let Some(c) = text.chars().next() {
@@ -1055,7 +1067,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         if let Some(s) = self.vi.search.as_mut() {
                                             s.query.push(c);
                                         }
-                                        refresh_search(&mut self.vi, &mut self.term);
+                                        refresh_search(&mut self.vi, &mut *self.term.lock().unwrap());
                                     }
                                 }
                             }
@@ -1068,7 +1080,7 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
 
-                    let cols = self.term.grid().cols;
+                    let cols = self.term.lock().unwrap().grid().cols;
                     let shift = self.modifiers.shift_key();
                     let ctrl = self.modifiers.control_key();
                     let mut motion: Option<vi::Motion> = None;
@@ -1162,7 +1174,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     );
                                     yank_range_to_clipboard(
                                         &mut self.clipboard,
-                                        &self.term,
+                                        &*self.term.lock().unwrap(),
                                         line_start,
                                         line_end,
                                     );
@@ -1176,17 +1188,17 @@ impl ApplicationHandler<UserEvent> for App {
                                     let n = self.vi.take_count();
                                     vi::apply_motion(
                                         &mut self.vi,
-                                        &mut self.term,
+                                        &mut *self.term.lock().unwrap(),
                                         m,
                                         n,
                                     );
                                     let end_abs = vi::cursor_to_absolute(
-                                        &self.term,
+                                        &*self.term.lock().unwrap(),
                                         self.vi.cursor,
                                     );
                                     yank_range_to_clipboard(
                                         &mut self.clipboard,
-                                        &self.term,
+                                        &*self.term.lock().unwrap(),
                                         start_abs,
                                         end_abs,
                                     );
@@ -1201,22 +1213,22 @@ impl ApplicationHandler<UserEvent> for App {
                                     let big = shift;
                                     let bounds = if inner_pending {
                                         vi::inner_word_bounds(
-                                            &self.term,
+                                            &*self.term.lock().unwrap(),
                                             self.vi.cursor,
                                             big,
                                         )
                                     } else {
                                         vi::around_word_bounds(
-                                            &self.term,
+                                            &*self.term.lock().unwrap(),
                                             self.vi.cursor,
                                             big,
                                         )
                                     };
-                                    let s_abs = vi::cursor_to_absolute(&self.term, bounds.0);
-                                    let e_abs = vi::cursor_to_absolute(&self.term, bounds.1);
+                                    let s_abs = vi::cursor_to_absolute(&*self.term.lock().unwrap(), bounds.0);
+                                    let e_abs = vi::cursor_to_absolute(&*self.term.lock().unwrap(), bounds.1);
                                     yank_range_to_clipboard(
                                         &mut self.clipboard,
-                                        &self.term,
+                                        &*self.term.lock().unwrap(),
                                         s_abs,
                                         e_abs,
                                     );
@@ -1298,7 +1310,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         if self.vi.visual != vi::VisualMode::None {
                                             if let Some(sel) = self.selection.as_ref() {
                                                 let text = selection::extract_text(
-                                                    &self.term,
+                                                    &*self.term.lock().unwrap(),
                                                     sel,
                                                 );
                                                 if !text.is_empty() {
@@ -1311,7 +1323,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             self.selection = None;
                                         } else {
                                             let start_abs = vi::cursor_to_absolute(
-                                                &self.term,
+                                                &*self.term.lock().unwrap(),
                                                 self.vi.cursor,
                                             );
                                             self.vi.pending_op =
@@ -1321,19 +1333,19 @@ impl ApplicationHandler<UserEvent> for App {
                                     // Search.
                                     ('/', _) => start_search(
                                         &mut self.vi,
-                                        &self.term,
+                                        &*self.term.lock().unwrap(),
                                         vi::SearchDirection::Forward,
                                     ),
                                     ('?', _) => start_search(
                                         &mut self.vi,
-                                        &self.term,
+                                        &*self.term.lock().unwrap(),
                                         vi::SearchDirection::Backward,
                                     ),
                                     ('n', false) => {
-                                        search_navigate(&mut self.vi, &mut self.term, false)
+                                        search_navigate(&mut self.vi, &mut *self.term.lock().unwrap(), false)
                                     }
                                     ('n', true) => {
-                                        search_navigate(&mut self.vi, &mut self.term, true)
+                                        search_navigate(&mut self.vi, &mut *self.term.lock().unwrap(), true)
                                     }
                                     _ => {}
                                 }
@@ -1345,7 +1357,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // Apply the chosen motion (if any), consuming the count.
                     if let Some(m) = motion {
                         let n = self.vi.take_count();
-                        vi::apply_motion(&mut self.vi, &mut self.term, m, n);
+                        vi::apply_motion(&mut self.vi, &mut *self.term.lock().unwrap(), m, n);
                     }
                     // Refresh selection from the latest vi state if we're
                     // still in a visual mode (covers `v`/`V` plus any
@@ -1366,8 +1378,8 @@ impl ApplicationHandler<UserEvent> for App {
                         let pasted = self.clipboard.get_text();
                         if !pasted.is_empty() {
                             if let Some(pty) = self.pty.as_mut() {
-                                write_paste(pty, &pasted, self.term.bracketed_paste);
-                                self.term.reset_view();
+                                write_paste(pty, &pasted, self.term.lock().unwrap().bracketed_paste);
+                                self.term.lock().unwrap().reset_view();
                                 self.selection = None;
                                 window.request_redraw();
                             }
@@ -1383,7 +1395,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let inner = window.inner_size();
                     let cell = gpu.set_font_size(target);
                     let (rows, cols) = grid_dims_for_window(cell, inner.width, inner.height);
-                    self.term.resize(rows as usize, cols as usize);
+                    self.term.lock().unwrap().resize(rows as usize, cols as usize);
                     if let Some(pty) = self.pty.as_ref() {
                         pty.resize(rows, cols);
                     }
@@ -1392,16 +1404,25 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if let Some(pty) = self.pty.as_mut() {
+                    // Bind the cached flag to a local FIRST so the
+                    // MutexGuard temp drops at the end of THIS
+                    // statement. If we inline it as an `encode_key`
+                    // argument the temp lives until the end of the
+                    // surrounding `if let`, and the `reset_view()`
+                    // lock below would re-enter and deadlock —
+                    // std::sync::Mutex is not reentrant.
+                    let app_cursor_keys =
+                        self.term.lock().unwrap().application_cursor_keys;
                     if let Some(bytes) = encode_key(
                         &logical_key,
                         text.as_deref(),
                         self.modifiers,
-                        self.term.application_cursor_keys,
+                        app_cursor_keys,
                     ) {
                         // Any keypress that produces output snaps the viewport
                         // back to the live grid — matches what every other
                         // terminal does and is what users expect.
-                        self.term.reset_view();
+                        self.term.lock().unwrap().reset_view();
                         // Typing also clears the selection.
                         self.selection = None;
                         // Reset the blink phase so the cursor is solidly on
@@ -1473,7 +1494,7 @@ impl App {
         if !self.focused {
             return false;
         }
-        match self.term.cursor_shape() {
+        match self.term.lock().unwrap().cursor_shape() {
             // HollowBlock is internal (vi-mode); apps can't request it,
             // and we don't blink it for the same reason as Block — vi
             // mode is "reading" mode, flicker would be distracting.
