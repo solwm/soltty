@@ -27,7 +27,8 @@ bench-runs runs label="":
 
 # Show the last 10 bench rows column-aligned.
 bench-tail:
-    @column -t -s '\t' bench/profile_track.tsv | tail -11
+    #!/usr/bin/env bash
+    column -t -s $'\t' bench/profile_track.tsv | tail -11
 
 # perf-record one gol-c run and print the top soltty symbols (>0.5%).
 perf:
