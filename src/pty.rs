@@ -82,6 +82,21 @@ impl Pty {
             .ok_or_else(|| io_other("master pty has no raw fd"))?;
         let writer = pair.master.take_writer().map_err(io_other)?;
 
+        // Drop the line discipline's per-byte processing so the kernel
+        // flushes bigger chunks to userspace. Without this, gol-c's
+        // chunked stdout reaches us as ~2 KB reads (avg in strace),
+        // costing ~100k syscalls per bench run and gating throughput.
+        // We're a terminal emulator — we do our own VTE processing;
+        // we don't need the kernel's line discipline for input
+        // handling. Raw mode is what every modern terminal sets.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(raw_fd, &mut t) == 0 {
+                libc::cfmakeraw(&mut t);
+                let _ = libc::tcsetattr(raw_fd, libc::TCSANOW, &t);
+            }
+        }
+
         let wakeup_pending = Arc::new(AtomicBool::new(false));
         let wakeup_clone = wakeup_pending.clone();
         std::thread::Builder::new()
