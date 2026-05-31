@@ -96,6 +96,20 @@ impl Pty {
                 let _ = libc::tcsetattr(raw_fd, libc::TCSANOW, &t);
             }
         }
+        // Non-blocking master fd so the inner-batch loop can `read`
+        // directly and use EAGAIN as the "kernel pipe is empty, send
+        // what we have" signal — one syscall per inner iteration
+        // instead of poll+read.
+        unsafe {
+            let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+            if flags >= 0 {
+                let _ = libc::fcntl(
+                    raw_fd,
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                );
+            }
+        }
 
         let wakeup_pending = Arc::new(AtomicBool::new(false));
         let wakeup_clone = wakeup_pending.clone();
@@ -109,34 +123,13 @@ impl Pty {
                 // 256 KB read buffer — bigger than the kernel's PTY pipe
                 // so a single read() typically returns whatever was queued.
                 let mut buf = [0u8; 262144];
-                loop {
-                    // First read of the batch: blocks until data is available.
-                    let mut total = match unsafe {
-                        libc::read(raw_fd, buf.as_mut_ptr() as *mut _, buf.len())
-                    } {
-                        0 => break,
-                        n if n < 0 => {
-                            let err = std::io::Error::last_os_error();
-                            if err.kind() == std::io::ErrorKind::Interrupted {
-                                continue;
-                            }
-                            break;
-                        }
-                        n => n as usize,
-                    };
-                    // Opportunistically extend the batch with
-                    // poll(timeout=0): if the kernel pipe has more
-                    // already queued, fold it into the same feed.
-                    // Stops as soon as the pipe drains, so latency
-                    // for one-off writes is unaffected.
-                    while total < buf.len() {
-                        let mut pollfd = libc::pollfd {
-                            fd: raw_fd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        let r = unsafe { libc::poll(&mut pollfd, 1, 0) };
-                        if r <= 0 || (pollfd.revents & libc::POLLIN) == 0 {
+                'outer: loop {
+                    let mut total = 0usize;
+                    // Non-blocking read loop: drain whatever the
+                    // kernel has buffered into one batch. EAGAIN
+                    // means the pipe is empty for now.
+                    loop {
+                        if total >= buf.len() {
                             break;
                         }
                         let n = unsafe {
@@ -146,10 +139,37 @@ impl Pty {
                                 buf.len() - total,
                             )
                         };
-                        if n <= 0 {
-                            break;
+                        if n > 0 {
+                            total += n as usize;
+                            continue;
                         }
-                        total += n as usize;
+                        if n == 0 {
+                            // EOF — child has closed its end.
+                            if total > 0 {
+                                break;
+                            }
+                            break 'outer;
+                        }
+                        let err = std::io::Error::last_os_error();
+                        let kind = err.kind();
+                        if kind == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if kind == std::io::ErrorKind::WouldBlock {
+                            if total > 0 {
+                                break;
+                            }
+                            // Nothing buffered — wait for data.
+                            let mut pollfd = libc::pollfd {
+                                fd: raw_fd,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            let _ = unsafe { libc::poll(&mut pollfd, 1, -1) };
+                            continue;
+                        }
+                        // Other errors — bail.
+                        break 'outer;
                     }
                     if total >= burst_bytes_threshold {
                         burst_holdoff.store(burst_holdoff_frames, Ordering::Release);
