@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(just bench-tail)",
+      "Bash(just test)",
+      "Bash(just check)",
+      "Bash(bench/profile_track.sh *)",
+      "Bash(./target/release/soltty --version)"
+    ]
+  }
+}
