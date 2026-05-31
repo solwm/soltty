@@ -7,13 +7,6 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use crate::term::Term;
 
-/// Threshold (bytes accumulated in the current batch) above which the
-/// worker switches from poll(timeout=0) to a short-blocking poll, so
-/// one feed carries a render-frame's worth of producer output. Picked
-/// above any plausible single-keystroke echo so interactive typing
-/// never enters the slower-poll path.
-const BURST_BATCH_BYTES: usize = 4 * 1024;
-
 pub struct Pty {
     #[allow(dead_code)] // used by `resize`
     master: Box<dyn MasterPty + Send>,
@@ -116,25 +109,18 @@ impl Pty {
                         }
                         n => n as usize,
                     };
-                    // Opportunistically extend the batch in two phases.
-                    // Phase 1 (always): drain whatever's already queued
-                    // with poll(timeout=0). Phase 2 (only past the
-                    // burst threshold): wait up to a few ms for more —
-                    // interactive single-byte echo never crosses the
-                    // threshold so latency is unaffected.
-                    const BURST_BATCH_MS: i32 = 2;
+                    // Opportunistically extend the batch with
+                    // poll(timeout=0): if the kernel pipe has more
+                    // already queued, fold it into the same feed.
+                    // Stops as soon as the pipe drains, so latency
+                    // for one-off writes is unaffected.
                     while total < buf.len() {
-                        let timeout = if total >= BURST_BATCH_BYTES {
-                            BURST_BATCH_MS
-                        } else {
-                            0
-                        };
                         let mut pollfd = libc::pollfd {
                             fd: raw_fd,
                             events: libc::POLLIN,
                             revents: 0,
                         };
-                        let r = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+                        let r = unsafe { libc::poll(&mut pollfd, 1, 0) };
                         if r <= 0 || (pollfd.revents & libc::POLLIN) == 0 {
                             break;
                         }
