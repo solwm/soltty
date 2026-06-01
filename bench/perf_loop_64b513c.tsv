@@ -1,0 +1,5 @@
+# perf_loop run timestamp=2026-06-01T02:00:33Z sha=64b513c
+# runs=10 sample_seconds=8 capture_commits=0
+scenario	terminal	sol_sm	term_sm	term_sm_max	util_mean	util_p95	util_max	util_min	commits_per_s	wallclock_s
+gol_c	soltty	9.46	1.74	16	27.1	53.2	53	5	0.0	-
+gol_c	alacritty	16.31	3.53	10	25.1	39.5	42	15	0.0	-
