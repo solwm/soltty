@@ -13,3 +13,8 @@ ts	sha	label	wallclock_median	runs	soltty_total	parser	put_char	render	channel	w
 2026-05-31T23:45:16Z	fbae4b9	non-blocking read + EAGAIN	3.255953	10	5.08	0.00	0.00	0.00	0.32	3.38	0.30	1.08
 2026-05-31T23:48:12Z	505acf0	worker pinned to CPU 2	3.296020	10	6.20	0.00	0.00	0.00	0.40	4.23	0.33	1.24
 2026-05-31T23:50:47Z	505acf0	HEAD 20-run final baseline	3.262216	20	5.66	0.00	0.00	0.00	0.34	3.83	0.29	1.20
+2026-06-01T00:00:36Z	61f0d83	io_uring double-buffered	3.245639	10	6.30	0.00	0.00	0.00	0.60	4.18	0.20	1.32
+2026-06-01T00:01:55Z	61f0d83	io_uring 2-buf 15-run	3.249904	15	6.03	0.00	0.00	0.00	0.43	3.91	0.35	1.34
+2026-06-01T00:03:18Z	61f0d83	io_uring 4-buf	3.245331	12	6.95	0.00	0.00	0.00	0.76	3.97	0.45	1.77
+2026-06-01T00:30:42Z	61f0d83	map-buffer-range + STREAM_DRAW	3.240555	12	5.99	0.00	0.00	0.00	0.39	4.06	0.32	1.22
+2026-06-01T00:32:25Z	61f0d83	map-buffer-range 20-run	3.243798	20	6.70	0.00	0.00	0.00	0.86	4.19	0.22	1.43

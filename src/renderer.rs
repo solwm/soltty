@@ -655,14 +655,41 @@ impl Renderer {
                 gl.buffer_data_size(
                     glow::ARRAY_BUFFER,
                     (self.instance_capacity * std::mem::size_of::<CellInstance>()) as i32,
-                    glow::DYNAMIC_DRAW,
+                    glow::STREAM_DRAW,
                 );
             }
-            let bytes = std::slice::from_raw_parts(
-                self.instances_scratch.as_ptr() as *const u8,
-                needed * std::mem::size_of::<CellInstance>(),
-            );
-            gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
+            // Orphan the buffer with INVALIDATE_BUFFER instead of
+            // buffer_sub_data — the driver hands us a fresh chunk
+            // without stalling on the previous frame's draw. Combined
+            // with STREAM_DRAW above, this matches the alacritty
+            // upload pattern. UNSYNCHRONIZED also skips the implicit
+            // wait; we never read this buffer back, so it's safe.
+            let bytes = needed * std::mem::size_of::<CellInstance>();
+            if bytes > 0 {
+                let ptr = gl.map_buffer_range(
+                    glow::ARRAY_BUFFER,
+                    0,
+                    bytes as i32,
+                    glow::MAP_WRITE_BIT
+                        | glow::MAP_INVALIDATE_BUFFER_BIT
+                        | glow::MAP_UNSYNCHRONIZED_BIT,
+                );
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(
+                        self.instances_scratch.as_ptr() as *const u8,
+                        ptr,
+                        bytes,
+                    );
+                    gl.unmap_buffer(glow::ARRAY_BUFFER);
+                } else {
+                    // Map failed — fall back to sub_data so we still draw.
+                    let src = std::slice::from_raw_parts(
+                        self.instances_scratch.as_ptr() as *const u8,
+                        bytes,
+                    );
+                    gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, src);
+                }
+            }
         }
         self.instance_count = needed as i32;
     }
@@ -1096,7 +1123,7 @@ unsafe fn build_vao_vbo(gl: &glow::Context, capacity: usize) -> (glow::VertexArr
     gl.buffer_data_size(
         glow::ARRAY_BUFFER,
         (capacity * std::mem::size_of::<CellInstance>()) as i32,
-        glow::DYNAMIC_DRAW,
+        glow::STREAM_DRAW,
     );
 
     // Integer attribute pointers for uvec2/ivec2 use glVertexAttribIPointer.
