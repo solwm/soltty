@@ -30,3 +30,5 @@ ts	sha	label	wallclock_median	runs	soltty_total	parser	put_char	render	channel	w
 2026-06-01T01:40:14Z	ed0bd35	SSE2 parse_three_u8	3.247228	15	6.34	0.00	0.00	0.00	0.40	4.55	0.29	1.10
 2026-06-01T01:42:19Z	ed0bd35	SSE2 — 25-run confirm	3.251822	25	6.40	0.00	0.00	0.00	0.75	4.08	0.34	1.23
 2026-06-01T01:46:04Z	ed0bd35	SSE2 inline-folded	3.257619	15	6.36	0.00	0.00	0.00	0.61	4.27	0.29	1.19
+2026-06-01T02:19:28Z	64b513c	soltty matched-grid 10-run	3.236481	10	-	-	-	-	-	-	-	-
+2026-06-01T02:19:28Z	64b513c	alacritty matched-grid 10-run	4.848451	10	-	-	-	-	-	-	-	-
