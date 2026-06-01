@@ -286,7 +286,15 @@ impl Term {
                         continue;
                     }
                     0x0A | 0x0B | 0x0C => {
-                        performer.term.grid_mut().line_feed();
+                        // We turn off the ldisc's OPOST ONLCR
+                        // processing on the master fd (~18 % win on
+                        // chatty output benches), so the kernel no
+                        // longer adds CR before LF on the way out of
+                        // the child. Programs writing to a tty rely
+                        // on \n acting like \r\n — do that here.
+                        let g = performer.term.grid_mut();
+                        g.carriage_return();
+                        g.line_feed();
                         i += 1;
                         continue;
                     }
@@ -565,7 +573,11 @@ impl<'a> Perform for Performer<'a> {
             0x07 => {} // BEL
             0x08 => g.backspace(),
             0x09 => g.tab(),
-            0x0A | 0x0B | 0x0C => g.line_feed(),
+            0x0A | 0x0B | 0x0C => {
+                // ONLCR emulation — see the fast-path comment.
+                g.carriage_return();
+                g.line_feed();
+            }
             0x0D => g.carriage_return(),
             _ => {}
         }
