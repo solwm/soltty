@@ -18,3 +18,7 @@ ts	sha	label	wallclock_median	runs	soltty_total	parser	put_char	render	channel	w
 2026-06-01T00:03:18Z	61f0d83	io_uring 4-buf	3.245331	12	6.95	0.00	0.00	0.00	0.76	3.97	0.45	1.77
 2026-06-01T00:30:42Z	61f0d83	map-buffer-range + STREAM_DRAW	3.240555	12	5.99	0.00	0.00	0.00	0.39	4.06	0.32	1.22
 2026-06-01T00:32:25Z	61f0d83	map-buffer-range 20-run	3.243798	20	6.70	0.00	0.00	0.00	0.86	4.19	0.22	1.43
+2026-06-01T00:34:16Z	e39d057	1MB buffer (post-cfmakeraw)	3.296859	10	5.75	0.00	0.00	0.00	0.40	3.95	0.27	1.13
+2026-06-01T00:38:46Z	e39d057	FINAL — 25-run @ e39d057	3.252418	25	6.81	0.00	0.00	0.00	0.58	4.66	0.24	1.33
+2026-06-01T01:01:29Z	e39d057	unrolled parse_one + wrapping_sub	3.259731	15	7.83	0.00	0.00	0.00	0.76	5.17	0.34	1.56
+2026-06-01T01:03:43Z	e39d057	post-parse-revert 25-run	3.246636	25	6.32	0.00	0.00	0.00	0.47	4.41	0.29	1.15
