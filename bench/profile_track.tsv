@@ -22,3 +22,4 @@ ts	sha	label	wallclock_median	runs	soltty_total	parser	put_char	render	channel	w
 2026-06-01T00:38:46Z	e39d057	FINAL — 25-run @ e39d057	3.252418	25	6.81	0.00	0.00	0.00	0.58	4.66	0.24	1.33
 2026-06-01T01:01:29Z	e39d057	unrolled parse_one + wrapping_sub	3.259731	15	7.83	0.00	0.00	0.00	0.76	5.17	0.34	1.56
 2026-06-01T01:03:43Z	e39d057	post-parse-revert 25-run	3.246636	25	6.32	0.00	0.00	0.00	0.47	4.41	0.29	1.15
+2026-06-01T01:08:26Z	393bfcc	OPOST-only (preserve ISIG/ICANON)	3.265922	15	6.70	0.00	0.00	0.00	0.62	4.45	0.26	1.37

@@ -82,17 +82,24 @@ impl Pty {
             .ok_or_else(|| io_other("master pty has no raw fd"))?;
         let writer = pair.master.take_writer().map_err(io_other)?;
 
-        // Drop the line discipline's per-byte processing so the kernel
-        // flushes bigger chunks to userspace. Without this, gol-c's
-        // chunked stdout reaches us as ~2 KB reads (avg in strace),
-        // costing ~100k syscalls per bench run and gating throughput.
-        // We're a terminal emulator — we do our own VTE processing;
-        // we don't need the kernel's line discipline for input
-        // handling. Raw mode is what every modern terminal sets.
+        // Drop the slave-side OPOST processing on the output direction
+        // (the bytes the child writes to its stdout, which we read on
+        // the master). OPOST runs the ldisc's per-byte output post-
+        // processing for things like ONLCR (\n → \r\n), which we
+        // don't want — we have our own VTE parser, and the per-byte
+        // walk is real overhead under chatty output (gol-c, log
+        // dumps).
+        //
+        // We deliberately do NOT call cfmakeraw, which would also
+        // clear ICANON/ISIG/ECHO on the slave's input side and break
+        // job control (Ctrl+C / Ctrl+Z), line editing, and shell
+        // completion (zsh's readline / fzf-style tab completion both
+        // expect ISIG and ICANON managed by the shell). Leaving the
+        // input-side flags alone lets the shell set its own termios.
         unsafe {
             let mut t: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(raw_fd, &mut t) == 0 {
-                libc::cfmakeraw(&mut t);
+                t.c_oflag &= !libc::OPOST;
                 let _ = libc::tcsetattr(raw_fd, libc::TCSANOW, &t);
             }
         }
