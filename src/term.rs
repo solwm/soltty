@@ -73,21 +73,23 @@ pub enum MouseAction {
 /// shift, bit 3 = alt, bit 4 = ctrl, bit 5 = motion, bit 6 = wheel.
 pub fn encode_mouse(event: MouseEvent, encoding: MouseEncoding) -> Vec<u8> {
     // Base button bits.
-    let (mut b, is_release) = match (event.button, event.action) {
-        (MouseButton::Left, MouseAction::Press)
-        | (MouseButton::Left, MouseAction::Motion) => (0u8, false),
-        (MouseButton::Middle, MouseAction::Press)
-        | (MouseButton::Middle, MouseAction::Motion) => (1, false),
-        (MouseButton::Right, MouseAction::Press)
-        | (MouseButton::Right, MouseAction::Motion) => (2, false),
-        (MouseButton::None, MouseAction::Motion) => (3, false), // no-button motion
-        (MouseButton::Left, MouseAction::Release) => (0, true),
-        (MouseButton::Middle, MouseAction::Release) => (1, true),
-        (MouseButton::Right, MouseAction::Release) => (2, true),
-        (MouseButton::WheelUp, _) => (64, false),
-        (MouseButton::WheelDown, _) => (65, false),
-        (MouseButton::None, _) => (3, false),
-    };
+    let (mut b, is_release) =
+        match (event.button, event.action) {
+            (MouseButton::Left, MouseAction::Press) | (MouseButton::Left, MouseAction::Motion) => {
+                (0u8, false)
+            }
+            (MouseButton::Middle, MouseAction::Press)
+            | (MouseButton::Middle, MouseAction::Motion) => (1, false),
+            (MouseButton::Right, MouseAction::Press)
+            | (MouseButton::Right, MouseAction::Motion) => (2, false),
+            (MouseButton::None, MouseAction::Motion) => (3, false), // no-button motion
+            (MouseButton::Left, MouseAction::Release) => (0, true),
+            (MouseButton::Middle, MouseAction::Release) => (1, true),
+            (MouseButton::Right, MouseAction::Release) => (2, true),
+            (MouseButton::WheelUp, _) => (64, false),
+            (MouseButton::WheelDown, _) => (65, false),
+            (MouseButton::None, _) => (3, false),
+        };
     if matches!(event.action, MouseAction::Motion) {
         b |= 0x20; // motion bit
     }
@@ -226,7 +228,9 @@ impl Term {
 
     pub fn grid_mut(&mut self) -> &mut Grid {
         if self.on_alt {
-            self.alt.as_mut().expect("alt grid must exist when on_alt=true")
+            self.alt
+                .as_mut()
+                .expect("alt grid must exist when on_alt=true")
         } else {
             &mut self.primary
         }
@@ -274,7 +278,10 @@ impl Term {
                 // and tab/backspace in shell echo all go through
                 // here.
                 match b {
-                    0x07 => { i += 1; continue; }     // BEL: no-op
+                    0x07 => {
+                        i += 1;
+                        continue;
+                    } // BEL: no-op
                     0x08 => {
                         performer.term.grid_mut().backspace();
                         i += 1;
@@ -285,7 +292,7 @@ impl Term {
                         i += 1;
                         continue;
                     }
-                    0x0A | 0x0B | 0x0C => {
+                    0x0A..=0x0C => {
                         // We turn off the ldisc's OPOST ONLCR
                         // processing on the master fd (~18 % win on
                         // chatty output benches), so the kernel no
@@ -359,11 +366,7 @@ impl Term {
             // dispatch straight to `apply_sgr_simple` / `grid.goto`.
             // Anything weird (subparams via `:`, intermediates,
             // unknown final) falls through to vte for correctness.
-            if performer.in_ground
-                && b == 0x1B
-                && i + 1 < n
-                && bytes[i + 1] == b'['
-            {
+            if performer.in_ground && b == 0x1B && i + 1 < n && bytes[i + 1] == b'[' {
                 // Fixed-size param array — both SGR and CUP params
                 // are always small ints; 16 slots covers any realistic
                 // `38;2;R;G;B` chained with attrs.
@@ -397,8 +400,13 @@ impl Term {
                         j += 1;
                         continue;
                     }
-                    if (b'0'..=b'9').contains(&bj) {
-                        cur = cur * 10 + (bj - b'0') as u32;
+                    if bj.is_ascii_digit() {
+                        // Saturating so a long digit run (e.g. a malicious
+                        // `\x1b[99999999999m`) can't overflow `u32` and panic
+                        // in a debug build. Once we pass u16::MAX the param is
+                        // out of range anyway, so we flag `overflow` and let
+                        // the whole sequence fall back to vte.
+                        cur = cur.saturating_mul(10).saturating_add((bj - b'0') as u32);
                         if cur > u16::MAX as u32 {
                             overflow = true;
                         }
@@ -422,8 +430,16 @@ impl Term {
                             // np tells us which params were actually
                             // present. `arg`-style fallback: treat
                             // missing-or-zero as 1.
-                            let r = if np >= 1 && row > 0 { row as usize - 1 } else { 0 };
-                            let c = if np >= 2 && col > 0 { col as usize - 1 } else { 0 };
+                            let r = if np >= 1 && row > 0 {
+                                row as usize - 1
+                            } else {
+                                0
+                            };
+                            let c = if np >= 2 && col > 0 {
+                                col as usize - 1
+                            } else {
+                                0
+                            };
                             grid.goto(r, c);
                         }
                         _ => unreachable!(),
@@ -573,7 +589,7 @@ impl<'a> Perform for Performer<'a> {
             0x07 => {} // BEL
             0x08 => g.backspace(),
             0x09 => g.tab(),
-            0x0A | 0x0B | 0x0C => {
+            0x0A..=0x0C => {
                 // ONLCR emulation — see the fast-path comment.
                 g.carriage_return();
                 g.line_feed();
@@ -583,13 +599,7 @@ impl<'a> Perform for Performer<'a> {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         self.in_ground = true;
         // DECSCUSR (`CSI Ps SP q`): cursor shape. The space intermediate
         // distinguishes it from any plain `CSI Ps q` (which we don't
@@ -724,10 +734,7 @@ impl<'a> Perform for Performer<'a> {
                     // truncated value just look at the high half.
                     let resp = format!(
                         "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x07",
-                        n,
-                        color[0], color[0],
-                        color[1], color[1],
-                        color[2], color[2],
+                        n, color[0], color[0], color[1], color[1], color[2], color[2],
                     );
                     self.term.reply.extend_from_slice(resp.as_bytes());
                 }
@@ -776,7 +783,7 @@ impl<'a> Performer<'a> {
     /// matches what real terminals do.
     fn set_cursor_shape(&mut self, ps: u16) {
         let shape = match ps {
-            0 | 1 | 2 => CursorShape::Block,
+            0..=2 => CursorShape::Block,
             3 | 4 => CursorShape::Underline,
             5 | 6 => CursorShape::Bar,
             _ => return,
@@ -870,7 +877,7 @@ fn parse_three_u8(bytes: &[u8], start: usize) -> Option<(u8, u8, u8, usize)> {
         let mut any = false;
         while *j < bytes.len() {
             let b = bytes[*j];
-            if !(b'0'..=b'9').contains(&b) {
+            if !b.is_ascii_digit() {
                 break;
             }
             v = v * 10 + (b - b'0') as u32;
@@ -880,7 +887,11 @@ fn parse_three_u8(bytes: &[u8], start: usize) -> Option<(u8, u8, u8, usize)> {
             any = true;
             *j += 1;
         }
-        if any { Some(v as u8) } else { None }
+        if any {
+            Some(v as u8)
+        } else {
+            None
+        }
     }
     let mut j = start;
     let r = parse_one(bytes, &mut j)?;
@@ -1031,9 +1042,7 @@ fn apply_sgr(grid: &mut Grid, params: &Params) {
     }
 }
 
-fn read_extended_color<'a>(
-    iter: &mut std::iter::Peekable<vte::ParamsIter<'a>>,
-) -> Option<Color> {
+fn read_extended_color<'a>(iter: &mut std::iter::Peekable<vte::ParamsIter<'a>>) -> Option<Color> {
     let mode = iter.next()?.first().copied()?;
     match mode {
         5 => {
@@ -1044,6 +1053,26 @@ fn read_extended_color<'a>(
             let r = iter.next()?.first().copied()? as u8;
             let g = iter.next()?.first().copied()? as u8;
             let b = iter.next()?.first().copied()? as u8;
+            Some(Color::Rgb(r, g, b))
+        }
+        _ => None,
+    }
+}
+
+fn parse_extended_color_subparams(sub: &[u16]) -> Option<Color> {
+    match sub.get(1).copied()? {
+        5 => Some(Color::Indexed(sub.get(2).copied()? as u8)),
+        2 => {
+            // Some emitters use [38, 2, _, r, g, b] (with a colorspace slot).
+            let (r, g, b) = if sub.len() >= 6 {
+                (sub[3] as u8, sub[4] as u8, sub[5] as u8)
+            } else {
+                (
+                    sub.get(2).copied()? as u8,
+                    sub.get(3).copied()? as u8,
+                    sub.get(4).copied()? as u8,
+                )
+            };
             Some(Color::Rgb(r, g, b))
         }
         _ => None,
@@ -1109,6 +1138,20 @@ mod tests {
         assert_eq!(l0[2].fg, Color::Rgb(200, 30, 30));
         assert_eq!(l0[3].ch, 'X');
         assert_eq!(l0[3].fg, Color::Default);
+    }
+
+    #[test]
+    fn huge_csi_param_does_not_overflow() {
+        // A numeric CSI param longer than u32 can represent must not
+        // panic the parser (debug builds run with overflow checks on,
+        // and the PTY byte stream is fully attacker-controlled). The
+        // out-of-range param bails the inline fast path to vte; we only
+        // assert the parser survives and keeps processing input.
+        let mut t = Term::new(4, 20);
+        t.feed(b"\x1b[99999999999999999999m");
+        t.feed(b"hi");
+        assert_eq!(t.grid().lines[0].cells[0].ch, 'h');
+        assert_eq!(t.grid().lines[0].cells[1].ch, 'i');
     }
 
     #[test]
@@ -1207,12 +1250,12 @@ mod tests {
         // Mix BS / HT / LF / CR with surrounding text so the cursor
         // positioning has something to interact with.
         let cases: &[&[u8]] = &[
-            b"abc\ndef",          // LF
-            b"abc\r\ndef",        // CRLF
-            b"a\tb\tc",           // HT
-            b"abc\x08X",          // BS — overwrite last cell
-            b"\n\n\n",            // run of LFs
-            b"hello\rworld",      // CR mid-line
+            b"abc\ndef",     // LF
+            b"abc\r\ndef",   // CRLF
+            b"a\tb\tc",      // HT
+            b"abc\x08X",     // BS — overwrite last cell
+            b"\n\n\n",       // run of LFs
+            b"hello\rworld", // CR mid-line
         ];
         for bytes in cases {
             let mut a = Term::new(4, 16);
@@ -1255,8 +1298,8 @@ mod tests {
             b"\x1b[H",
             b"\x1b[3;5H",
             b"\x1b[3;5f",
-            b"\x1b[;5H",  // row default = 1 → row 0
-            b"\x1b[7H",   // col default = 1 → col 0
+            b"\x1b[;5H", // row default = 1 → row 0
+            b"\x1b[7H",  // col default = 1 → col 0
         ];
         for bytes in cases {
             let mut a = Term::new(10, 20);
@@ -1279,8 +1322,8 @@ mod tests {
         // A CSI may straddle two feed calls (PTY chunk boundary).
         // We must remember `in_ground = false` between calls.
         let mut t = Term::new(2, 16);
-        t.feed(b"\x1b[38;2;10;");           // mid-CSI
-        t.feed(b"20;30mX");                 // finish + print
+        t.feed(b"\x1b[38;2;10;"); // mid-CSI
+        t.feed(b"20;30mX"); // finish + print
         let cell = &t.grid().lines[0].cells[0];
         assert_eq!(cell.ch, 'X');
         assert_eq!(cell.fg, Color::Rgb(10, 20, 30));
@@ -1330,10 +1373,10 @@ mod tests {
     fn viewport_anchors_when_output_arrives_during_scrollback() {
         let mut t = Term::new(2, 4);
         t.feed(b"a\r\nb\r\nc\r\nd"); // scrollback=[a,b], live=[c,d]
-        t.scroll_view(2);            // viewing [a,b]
+        t.scroll_view(2); // viewing [a,b]
         let top_before = t.viewport_row(0).cells[0].ch;
-        t.feed(b"\r\ne");            // pushes "c" into scrollback
-        // Anchored: top of viewport should still show 'a'
+        t.feed(b"\r\ne"); // pushes "c" into scrollback
+                          // Anchored: top of viewport should still show 'a'
         assert_eq!(top_before, 'a');
         assert_eq!(t.viewport_row(0).cells[0].ch, 'a');
     }
@@ -1360,12 +1403,12 @@ mod tests {
         t.feed(b"\x1b[5 q"); // Bar on primary
         assert_eq!(t.cursor_shape(), CursorShape::Bar);
         t.feed(b"\x1b[?1049h"); // enter alt
-        // Alt starts fresh, default Block.
+                                // Alt starts fresh, default Block.
         assert_eq!(t.cursor_shape(), CursorShape::Block);
         t.feed(b"\x1b[3 q"); // Underline on alt
         assert_eq!(t.cursor_shape(), CursorShape::Underline);
         t.feed(b"\x1b[?1049l"); // back to primary
-        // Primary's shape preserved.
+                                // Primary's shape preserved.
         assert_eq!(t.cursor_shape(), CursorShape::Bar);
     }
 
@@ -1610,25 +1653,5 @@ mod tests {
         t.feed(b"\x1b[?1049l");
         assert!(!t.on_alt);
         assert!(line(t.grid(), 0).starts_with("abc"));
-    }
-}
-
-fn parse_extended_color_subparams(sub: &[u16]) -> Option<Color> {
-    match sub.get(1).copied()? {
-        5 => Some(Color::Indexed(sub.get(2).copied()? as u8)),
-        2 => {
-            // Some emitters use [38, 2, _, r, g, b] (with a colorspace slot).
-            let (r, g, b) = if sub.len() >= 6 {
-                (sub[3] as u8, sub[4] as u8, sub[5] as u8)
-            } else {
-                (
-                    sub.get(2).copied()? as u8,
-                    sub.get(3).copied()? as u8,
-                    sub.get(4).copied()? as u8,
-                )
-            };
-            Some(Color::Rgb(r, g, b))
-        }
-        _ => None,
     }
 }

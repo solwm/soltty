@@ -24,7 +24,9 @@ fn main() {
     let mut col = 0usize;
     let chars_per_row = cols.max(1);
     for cp in 0x0021u32..0x4000 {
-        let Some(ch) = char::from_u32(cp) else { continue };
+        let Some(ch) = char::from_u32(cp) else {
+            continue;
+        };
         if ch.is_control() || (0xd800..=0xdfff).contains(&cp) {
             continue;
         }

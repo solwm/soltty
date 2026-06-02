@@ -17,10 +17,34 @@ pub struct Pty {
     /// so back-to-back read/feed cycles between two main-thread
     /// frames collapse into a single winit wake.
     wakeup_pending: Arc<AtomicBool>,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+/// Feed `bytes` into the shared terminal and hand back any reply bytes,
+/// without ever poisoning the mutex.
+///
+/// `Term::feed` runs the (attacker-controlled) escape-sequence parser. If
+/// it ever panics, a plain `lock().unwrap()` would poison the mutex, and
+/// the main thread would then panic on its very next `lock().unwrap()` —
+/// turning one parser bug into a whole-app crash with a confusing
+/// secondary panic. We contain the panic here (caught before the guard
+/// drops, so the lock is never marked poisoned) and recover from an
+/// already-poisoned guard for good measure.
+fn feed_locked(term: &Mutex<Term>, bytes: &[u8]) -> Vec<u8> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let mut guard = term.lock().unwrap_or_else(|p| p.into_inner());
+    catch_unwind(AssertUnwindSafe(|| {
+        guard.feed(bytes);
+        guard.take_reply()
+    }))
+    .unwrap_or_else(|_| {
+        log::error!("terminal parser panicked on input; dropping batch");
+        Vec::new()
+    })
 }
 
 impl Pty {
+    #[allow(clippy::too_many_arguments)] // spawn config; grouping into a struct buys nothing
     pub fn spawn(
         rows: u16,
         cols: u16,
@@ -110,11 +134,7 @@ impl Pty {
         unsafe {
             let flags = libc::fcntl(raw_fd, libc::F_GETFL);
             if flags >= 0 {
-                let _ = libc::fcntl(
-                    raw_fd,
-                    libc::F_SETFL,
-                    flags | libc::O_NONBLOCK,
-                );
+                let _ = libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
         }
 
@@ -187,11 +207,7 @@ impl Pty {
                     // then drops the guard before any GPU work, so
                     // worker contention is bounded by snapshot time,
                     // not by `swap_buffers`.
-                    let reply = {
-                        let mut term_guard = term.lock().unwrap();
-                        term_guard.feed(&buf[..total]);
-                        term_guard.take_reply()
-                    };
+                    let reply = feed_locked(&term, &buf[..total]);
                     if !reply.is_empty() {
                         // Drop on full / disconnected — main has gone
                         // away, the exit path is about to fire.
@@ -216,7 +232,7 @@ impl Pty {
             master: pair.master,
             writer,
             wakeup_pending,
-            _child: child,
+            child,
         })
     }
 
@@ -245,6 +261,34 @@ impl Pty {
             log::warn!("pty resize: {e}");
         }
     }
+
+    /// The child's process id, while it's still tracked. Test-only.
+    #[cfg(test)]
+    fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // Closing the window must take the shell — and any job-control
+        // children in its process group — down with it. Otherwise they
+        // orphan: the reader thread holds a dup'd master fd, so dropping
+        // our `master` doesn't close the last PTY handle and the kernel
+        // never delivers the usual SIGHUP. portable_pty starts the child
+        // in its own session, so its pid is also its process-group id;
+        // signal the whole group (SIGHUP for a clean exit, then SIGKILL
+        // to be sure), then reap the leader so we don't leave a zombie.
+        if let Some(pid) = self.child.process_id() {
+            let pgid = pid as i32;
+            unsafe {
+                libc::kill(-pgid, libc::SIGHUP);
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 pub fn default_shell() -> String {
@@ -256,5 +300,77 @@ pub fn default_shell() -> String {
 }
 
 fn io_other<E: std::fmt::Display>(e: E) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn feed_locked_recovers_from_poisoned_mutex() {
+        // A previous panic-while-holding poisons the mutex. `feed_locked`
+        // must still feed (recovering the inner Term) rather than
+        // propagating the poison — otherwise one parser panic cascades
+        // into a crash on the next lock.
+        let term = Arc::new(Mutex::new(Term::new(4, 10)));
+        let poisoner = term.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = poisoner.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(term.is_poisoned());
+
+        let reply = feed_locked(&term, b"hi");
+        assert!(reply.is_empty()); // plain text produces no reply bytes
+        let g = term.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(g.grid().lines[0].cells[0].ch, 'h');
+        assert_eq!(g.grid().lines[0].cells[1].ch, 'i');
+    }
+
+    #[test]
+    fn child_is_killed_on_drop() {
+        // Regression: closing the window (dropping the Pty) must not leave
+        // an orphaned shell/child running. Spawn a long sleep, confirm
+        // it's alive, drop the Pty, and confirm the leader is gone.
+        let term = Arc::new(Mutex::new(Term::new(24, 80)));
+        let (tx, _rx) = channel();
+        let burst = Arc::new(AtomicU32::new(0));
+        let pty = Pty::spawn(
+            24,
+            80,
+            "/bin/sh",
+            &["-c".into(), "sleep 30".into()],
+            term,
+            tx,
+            burst,
+            0,
+            usize::MAX,
+            || {},
+            || {},
+        )
+        .expect("spawn pty");
+
+        let pid = pty.child_pid().expect("child pid") as i32;
+        // Alive: signal 0 just checks existence/permission.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "child should be alive");
+
+        drop(pty);
+
+        // Drop kills + reaps synchronously, but the group SIGKILL may take
+        // a beat to settle. Poll briefly for the leader to disappear.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child survived Pty drop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }

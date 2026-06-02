@@ -121,10 +121,7 @@ impl Gpu {
         );
         let window = Arc::new(window.expect("DisplayBuilder yielded no window"));
 
-        let raw_window_handle = window
-            .window_handle()
-            .expect("window_handle")
-            .as_raw();
+        let raw_window_handle = window.window_handle().expect("window_handle").as_raw();
         let gl_display = gl_config.display();
 
         // Try OpenGL 3.3 core. Fall back to OpenGL ES 3.0 if the driver
@@ -288,6 +285,7 @@ impl Gpu {
         self.renderer.snapshot_term(term);
     }
 
+    #[allow(clippy::too_many_arguments)] // per-frame render inputs; a struct adds indirection in the hot path
     pub fn render(
         &mut self,
         picker: Option<&mut Picker>,
@@ -375,8 +373,8 @@ impl Gpu {
             let now = Instant::now();
             t.record_cpu(
                 (t1.unwrap() - t0.unwrap()).as_secs_f64() * 1e6, // prepare µs
-                (t2 - t1.unwrap()).as_secs_f64() * 1e6,           // draw-submit µs
-                (now - t2).as_secs_f64() * 1e3,                   // swap ms
+                (t2 - t1.unwrap()).as_secs_f64() * 1e6,          // draw-submit µs
+                (now - t2).as_secs_f64() * 1e3,                  // swap ms
             );
             t.poll_and_advance(&self.gl);
             t.maybe_report(now);

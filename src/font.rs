@@ -112,14 +112,14 @@ pub struct FontAtlas {
 
 impl FontAtlas {
     pub fn new(px_size: f32, config: &Config) -> std::io::Result<Self> {
-        let primary_path = discover_font(config).ok_or_else(|| io_err(
-            "no monospace font found; set SOLTTY_FONT or `font` in soltty.conf",
-        ))?;
+        let primary_path = discover_font(config).ok_or_else(|| {
+            io_err("no monospace font found; set SOLTTY_FONT or `font` in soltty.conf")
+        })?;
         log::info!("font: {}", primary_path.display());
         let primary_data = std::fs::read(&primary_path)?;
 
-        let primary_font = FontRef::from_index(&primary_data, 0)
-            .ok_or_else(|| io_err("could not parse font"))?;
+        let primary_font =
+            FontRef::from_index(&primary_data, 0).ok_or_else(|| io_err("could not parse font"))?;
         let primary_offset = primary_font.offset;
 
         // Cell metrics come from the primary only. Fallback glyphs are
@@ -129,7 +129,9 @@ impl FontAtlas {
         let metrics = compute_cell_metrics(&primary_font, px_size);
         log::info!(
             "cell: {}x{} (baseline={})",
-            metrics.cell_w, metrics.cell_h, metrics.baseline
+            metrics.cell_w,
+            metrics.cell_h,
+            metrics.baseline
         );
 
         let mut fonts: Vec<LoadedFont> = vec![LoadedFont {
@@ -328,8 +330,11 @@ impl FontAtlas {
             .build();
 
         let mut image = SwashImage::new();
-        let ok = Render::new(&[Source::Outline, Source::Bitmap(StrikeWith::BestFit)])
-            .render_into(&mut scaler, glyph_id, &mut image);
+        let ok = Render::new(&[Source::Outline, Source::Bitmap(StrikeWith::BestFit)]).render_into(
+            &mut scaler,
+            glyph_id,
+            &mut image,
+        );
         if !ok {
             self.store_glyph(ch, style, GlyphEntry::default());
             return;
@@ -338,6 +343,17 @@ impl FontAtlas {
         let placement = image.placement;
         let (w, h) = (placement.width, placement.height);
         if w == 0 || h == 0 {
+            self.store_glyph(ch, style, GlyphEntry::default());
+            return;
+        }
+
+        // The copy loops below index `image.data` by `placement` dimensions
+        // (×bytes-per-pixel for the content kind). swash *should* return a
+        // buffer that matches, but a corrupt/odd embedded-bitmap or color
+        // strike could return fewer bytes — indexing it would panic. Bail
+        // to a blank glyph rather than crash the whole terminal.
+        if image.data.len() < expected_bitmap_len(image.content, w, h) {
+            log::warn!("glyph {ch:?} bitmap shorter than placement; dropping");
             self.store_glyph(ch, style, GlyphEntry::default());
             return;
         }
@@ -395,12 +411,7 @@ impl FontAtlas {
             }
         }
 
-        self.dirty_rects.push(DirtyRect {
-            x: ax,
-            y: ay,
-            w,
-            h,
-        });
+        self.dirty_rects.push(DirtyRect { x: ax, y: ay, w, h });
         self.store_glyph(
             ch,
             style,
@@ -412,10 +423,24 @@ impl FontAtlas {
                 offset_x: placement.left as i16,
                 // swash placement.top is "rows above baseline"; convert to
                 // px-from-cell-top.
-                offset_y: (self.metrics.baseline as i32 - placement.top as i32) as i16,
+                offset_y: (self.metrics.baseline as i32 - placement.top) as i16,
             },
         );
     }
+}
+
+/// Minimum `image.data` length the rasterizer's copy loops will index for
+/// a `w`×`h` bitmap of the given content kind: 1 byte/px for `Mask`, 3 for
+/// `SubpixelMask`, 4 for `Color`. Used to reject short buffers before they
+/// can panic an out-of-bounds slice.
+fn expected_bitmap_len(content: swash::scale::image::Content, w: u32, h: u32) -> usize {
+    use swash::scale::image::Content;
+    let bpp = match content {
+        Content::Mask => 1,
+        Content::SubpixelMask => 3,
+        Content::Color => 4,
+    };
+    (w as usize) * (h as usize) * bpp
 }
 
 fn compute_cell_metrics(font: &FontRef<'_>, px: f32) -> CellMetrics {
@@ -621,15 +646,28 @@ mod tests {
     }
 
     #[test]
+    fn expected_bitmap_len_matches_bytes_per_pixel() {
+        use swash::scale::image::Content;
+        // The guard in `rasterize` rejects any `image.data` shorter than
+        // this; the values must match the per-pixel strides the copy
+        // loops use (1 / 3 / 4 bytes).
+        assert_eq!(expected_bitmap_len(Content::Mask, 4, 5), 20);
+        assert_eq!(expected_bitmap_len(Content::SubpixelMask, 4, 5), 60);
+        assert_eq!(expected_bitmap_len(Content::Color, 4, 5), 80);
+        // A short buffer (e.g. a 10×10 color glyph reporting only 100 of
+        // the 400 bytes it implies) is detected as insufficient.
+        let (w, h) = (10u32, 10u32);
+        assert!(100 < expected_bitmap_len(Content::Color, w, h));
+    }
+
+    #[test]
     fn variant_replaces_regular_suffix() {
         // Most distros lay out fonts as `Foo-Regular.ttf` / `Foo-Bold.ttf`;
         // the candidate set should include the name swap.
         let primary = Path::new("/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf");
         let cands = variant_candidates(primary, FontStyle::Bold);
         assert!(
-            cands
-                .iter()
-                .any(|p| p.ends_with("JetBrainsMono-Bold.ttf")),
+            cands.iter().any(|p| p.ends_with("JetBrainsMono-Bold.ttf")),
             "expected JetBrainsMono-Bold.ttf among {cands:?}"
         );
     }
@@ -639,9 +677,7 @@ mod tests {
         // DejaVuSansMono.ttf has no `-Regular` so we just append.
         let primary = Path::new("/usr/share/fonts/TTF/DejaVuSansMono.ttf");
         let cands = variant_candidates(primary, FontStyle::Bold);
-        assert!(cands
-            .iter()
-            .any(|p| p.ends_with("DejaVuSansMono-Bold.ttf")));
+        assert!(cands.iter().any(|p| p.ends_with("DejaVuSansMono-Bold.ttf")));
     }
 
     #[test]
@@ -650,8 +686,12 @@ mod tests {
         // the candidate set so the discovery succeeds.
         let primary = Path::new("/usr/share/fonts/TTF/DejaVuSansMono.ttf");
         let cands = variant_candidates(primary, FontStyle::Italic);
-        let has_italic = cands.iter().any(|p| p.ends_with("DejaVuSansMono-Italic.ttf"));
-        let has_oblique = cands.iter().any(|p| p.ends_with("DejaVuSansMono-Oblique.ttf"));
+        let has_italic = cands
+            .iter()
+            .any(|p| p.ends_with("DejaVuSansMono-Italic.ttf"));
+        let has_oblique = cands
+            .iter()
+            .any(|p| p.ends_with("DejaVuSansMono-Oblique.ttf"));
         assert!(has_italic && has_oblique, "candidates: {cands:?}");
     }
 

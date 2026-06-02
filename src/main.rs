@@ -1,7 +1,7 @@
 mod clipboard;
-mod config;
 #[cfg(unix)]
 mod clipboard_wayland;
+mod config;
 mod font;
 mod gpu;
 mod grid;
@@ -70,9 +70,7 @@ fn main() {
         Some(n) => match theme_lib.find(n) {
             Some(t) => t.name.clone(),
             None => {
-                eprintln!(
-                    "soltty: theme {n:?} not found. Use --list-themes to see options."
-                );
+                eprintln!("soltty: theme {n:?} not found. Use --list-themes to see options.");
                 std::process::exit(2);
             }
         },
@@ -387,11 +385,7 @@ impl ApplicationHandler<UserEvent> for App {
         // Seed the OSC-color cache so OSC 10/11/12 queries from a
         // freshly-spawned shell get accurate values on the very first
         // exchange.
-        term.set_theme_colors(
-            initial_theme.fg,
-            initial_theme.bg,
-            initial_theme.cursor_bg,
-        );
+        term.set_theme_colors(initial_theme.fg, initial_theme.bg, initial_theme.cursor_bg);
 
         // Wrap the configured Term so the worker can take a clone.
         let term_arc = Arc::new(Mutex::new(term));
@@ -479,8 +473,7 @@ impl ApplicationHandler<UserEvent> for App {
             // we still need to wake at the next phase boundary so the
             // toggle isn't delayed indefinitely waiting for input.
             if !self.redraw_pending && blinking {
-                event_loop
-                    .set_control_flow(ControlFlow::WaitUntil(self.next_blink_toggle(now)));
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_blink_toggle(now)));
             }
             return;
         }
@@ -547,12 +540,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let (Some(window), Some(gpu)) = (self.window.as_ref(), self.gpu.as_mut()) else {
             return;
         };
@@ -577,7 +565,16 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(size) => {
                 gpu.resize(size.width, size.height);
                 let (rows, cols) = grid_dims_for_window(gpu.cell_size(), size.width, size.height);
-                self.term.lock().unwrap().resize(rows as usize, cols as usize);
+                self.term
+                    .lock()
+                    .unwrap()
+                    .resize(rows as usize, cols as usize);
+                Self::clamp_view_state(
+                    &mut self.vi,
+                    &mut self.selection,
+                    rows as usize,
+                    cols as usize,
+                );
                 if let Some(pty) = self.pty.as_ref() {
                     pty.resize(rows, cols);
                 }
@@ -587,7 +584,16 @@ impl ApplicationHandler<UserEvent> for App {
                 let size = window.inner_size();
                 gpu.resize(size.width, size.height);
                 let (rows, cols) = grid_dims_for_window(gpu.cell_size(), size.width, size.height);
-                self.term.lock().unwrap().resize(rows as usize, cols as usize);
+                self.term
+                    .lock()
+                    .unwrap()
+                    .resize(rows as usize, cols as usize);
+                Self::clamp_view_state(
+                    &mut self.vi,
+                    &mut self.selection,
+                    rows as usize,
+                    cols as usize,
+                );
                 if let Some(pty) = self.pty.as_ref() {
                     pty.resize(rows, cols);
                 }
@@ -652,7 +658,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     });
                     burst_active = self.burst_holdoff.load(Ordering::Acquire) > 0;
-                    gpu.snapshot_term(&*term_guard);
+                    gpu.snapshot_term(&term_guard);
                     // Guard drops here as the block ends — everything
                     // after this point operates on the renderer's
                     // copy.
@@ -698,7 +704,11 @@ impl ApplicationHandler<UserEvent> for App {
                         term::MouseMode::AllMotion => true,
                     };
                     if want_motion {
-                        let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &*self.term.lock().unwrap());
+                        let cell = pixel_to_cell(
+                            self.mouse_pos,
+                            gpu.cell_size(),
+                            &self.term.lock().unwrap(),
+                        );
                         // Drop pixel-granular motion that didn't change
                         // the cell — keeps a fast drag from drowning
                         // the PTY in identical events.
@@ -723,7 +733,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 ctrl: self.modifiers.control_key(),
                             };
                             if let Some(pty) = self.pty.as_mut() {
-                                pty.write(&term::encode_mouse(event, self.term.lock().unwrap().mouse_encoding));
+                                pty.write(&term::encode_mouse(
+                                    event,
+                                    self.term.lock().unwrap().mouse_encoding,
+                                ));
                             }
                         }
                     }
@@ -743,7 +756,8 @@ impl ApplicationHandler<UserEvent> for App {
                         } else if position.y > inner.height as f64 {
                             self.term.lock().unwrap().scroll_view(-1);
                         }
-                        let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &*self.term.lock().unwrap());
+                        let cell =
+                            pixel_to_cell(self.mouse_pos, (cw, ch), &self.term.lock().unwrap());
                         if cell != sel.end {
                             sel.end = cell;
                             window.request_redraw();
@@ -765,7 +779,8 @@ impl ApplicationHandler<UserEvent> for App {
                         ElementState::Pressed => self.held_buttons |= 0b001,
                         ElementState::Released => self.held_buttons &= !0b001,
                     }
-                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &*self.term.lock().unwrap());
+                    let cell =
+                        pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term.lock().unwrap());
                     let event = term::MouseEvent {
                         button: term::MouseButton::Left,
                         action: match state {
@@ -779,12 +794,15 @@ impl ApplicationHandler<UserEvent> for App {
                         ctrl: self.modifiers.control_key(),
                     };
                     if let Some(pty) = self.pty.as_mut() {
-                        pty.write(&term::encode_mouse(event, self.term.lock().unwrap().mouse_encoding));
+                        pty.write(&term::encode_mouse(
+                            event,
+                            self.term.lock().unwrap().mouse_encoding,
+                        ));
                     }
                     return;
                 }
                 let (cw, ch) = gpu.cell_size();
-                let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &*self.term.lock().unwrap());
+                let cell = pixel_to_cell(self.mouse_pos, (cw, ch), &self.term.lock().unwrap());
                 match state {
                     ElementState::Pressed => {
                         // Shift+click extends the existing selection.
@@ -814,13 +832,18 @@ impl ApplicationHandler<UserEvent> for App {
 
                         let mut sel = match count {
                             2 => {
-                                let (s, e) = selection::word_bounds(&*self.term.lock().unwrap(), cell.0, cell.1);
+                                let (s, e) = selection::word_bounds(
+                                    &self.term.lock().unwrap(),
+                                    cell.0,
+                                    cell.1,
+                                );
                                 let mut sel = selection::Selection::new(s);
                                 sel.end = e;
                                 sel
                             }
                             3 => {
-                                let (s, e) = selection::line_bounds(&*self.term.lock().unwrap(), cell.0);
+                                let (s, e) =
+                                    selection::line_bounds(&self.term.lock().unwrap(), cell.0);
                                 let mut sel = selection::Selection::new(s);
                                 sel.end = e;
                                 sel
@@ -833,7 +856,7 @@ impl ApplicationHandler<UserEvent> for App {
                             sel.dragging = false;
                             // Auto-fill clipboard so triple-click → middle
                             // click pastes the whole line.
-                            let text = selection::extract_text(&*self.term.lock().unwrap(), &sel);
+                            let text = selection::extract_text(&self.term.lock().unwrap(), &sel);
                             if !text.is_empty() {
                                 self.clipboard.set_primary(text.clone());
                                 self.clipboard.set_text(text);
@@ -849,7 +872,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // (skip stray clicks). Fill both clipboards so
                             // Ctrl+Shift+V and middle-click both paste it.
                             if !sel.is_empty() {
-                                let text = selection::extract_text(&*self.term.lock().unwrap(), sel);
+                                let text = selection::extract_text(&self.term.lock().unwrap(), sel);
                                 if !text.is_empty() {
                                     self.clipboard.set_primary(text.clone());
                                     self.clipboard.set_text(text);
@@ -871,7 +894,8 @@ impl ApplicationHandler<UserEvent> for App {
                         ElementState::Pressed => self.held_buttons |= 0b010,
                         ElementState::Released => self.held_buttons &= !0b010,
                     }
-                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &*self.term.lock().unwrap());
+                    let cell =
+                        pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term.lock().unwrap());
                     let event = term::MouseEvent {
                         button: term::MouseButton::Middle,
                         action: match state {
@@ -885,7 +909,10 @@ impl ApplicationHandler<UserEvent> for App {
                         ctrl: self.modifiers.control_key(),
                     };
                     if let Some(pty) = self.pty.as_mut() {
-                        pty.write(&term::encode_mouse(event, self.term.lock().unwrap().mouse_encoding));
+                        pty.write(&term::encode_mouse(
+                            event,
+                            self.term.lock().unwrap().mouse_encoding,
+                        ));
                     }
                     return;
                 }
@@ -918,7 +945,8 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::PixelDelta(p) => (p.y / 16.0) as isize,
                 };
                 if mode != term::MouseMode::None && !shift && lines != 0 {
-                    let cell = pixel_to_cell(self.mouse_pos, gpu.cell_size(), &*self.term.lock().unwrap());
+                    let cell =
+                        pixel_to_cell(self.mouse_pos, gpu.cell_size(), &self.term.lock().unwrap());
                     let button = if lines > 0 {
                         term::MouseButton::WheelUp
                     } else {
@@ -939,7 +967,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 alt: self.modifiers.alt_key(),
                                 ctrl: self.modifiers.control_key(),
                             };
-                            pty.write(&term::encode_mouse(event, self.term.lock().unwrap().mouse_encoding));
+                            pty.write(&term::encode_mouse(
+                                event,
+                                self.term.lock().unwrap().mouse_encoding,
+                            ));
                         }
                     }
                     return;
@@ -967,9 +998,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // PTY writer. Without this, an app's query could
                 // race with the user typing and the reply would
                 // arrive mid-keystroke stream.
-                if let (Some(pty), Some(rx)) =
-                    (self.pty.as_mut(), self.pty_replies.as_ref())
-                {
+                if let (Some(pty), Some(rx)) = (self.pty.as_mut(), self.pty_replies.as_ref()) {
                     while let Ok(reply) = rx.try_recv() {
                         pty.write(&reply);
                     }
@@ -1013,32 +1042,61 @@ impl ApplicationHandler<UserEvent> for App {
                     match &logical_key {
                         Key::Named(ArrowUp) => {
                             picker.move_up();
-                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
+                            apply_picker_preview(
+                                gpu,
+                                &mut self.term.lock().unwrap(),
+                                picker,
+                                &self.theme_lib,
+                            );
                         }
                         Key::Named(ArrowDown) => {
                             picker.move_down();
-                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
+                            apply_picker_preview(
+                                gpu,
+                                &mut self.term.lock().unwrap(),
+                                picker,
+                                &self.theme_lib,
+                            );
                         }
                         Key::Named(PageUp) => {
                             picker.page_up(8);
-                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
+                            apply_picker_preview(
+                                gpu,
+                                &mut self.term.lock().unwrap(),
+                                picker,
+                                &self.theme_lib,
+                            );
                         }
                         Key::Named(PageDown) => {
                             picker.page_down(8);
-                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
+                            apply_picker_preview(
+                                gpu,
+                                &mut self.term.lock().unwrap(),
+                                picker,
+                                &self.theme_lib,
+                            );
                         }
                         Key::Named(Home) => {
                             picker.home();
-                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
+                            apply_picker_preview(
+                                gpu,
+                                &mut self.term.lock().unwrap(),
+                                picker,
+                                &self.theme_lib,
+                            );
                         }
                         Key::Named(End) => {
                             picker.end();
-                            apply_picker_preview(gpu, &mut *self.term.lock().unwrap(), picker, &self.theme_lib);
+                            apply_picker_preview(
+                                gpu,
+                                &mut self.term.lock().unwrap(),
+                                picker,
+                                &self.theme_lib,
+                            );
                         }
                         Key::Named(Enter) => {
                             // Commit current selection.
-                            self.active_theme_name =
-                                picker.current(&self.theme_lib).name.clone();
+                            self.active_theme_name = picker.current(&self.theme_lib).name.clone();
                             self.picker = None;
                         }
                         Key::Named(Escape) => {
@@ -1062,7 +1120,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // Vi mode: activation. Once active, the keypress that
                 // triggered entry is consumed locally — never sent to PTY.
                 if !self.vi.active && self.vi_keybind.matches(&logical_key, self.modifiers) {
-                    let start = self.term.lock().unwrap().viewport_cursor().unwrap_or((0, 0));
+                    let start = self
+                        .term
+                        .lock()
+                        .unwrap()
+                        .viewport_cursor()
+                        .unwrap_or((0, 0));
                     self.vi.enter(start);
                     self.selection = None;
                     window.request_redraw();
@@ -1076,17 +1139,12 @@ impl ApplicationHandler<UserEvent> for App {
                     // Search-typing has its own input rules: every key
                     // edits the query, navigates it, or commits/cancels.
                     // Vi motions are inert until commit.
-                    let typing = self
-                        .vi
-                        .search
-                        .as_ref()
-                        .map(|s| s.typing)
-                        .unwrap_or(false);
+                    let typing = self.vi.search.as_ref().map(|s| s.typing).unwrap_or(false);
                     if typing {
                         let cols = self.term.lock().unwrap().grid().cols;
                         match &logical_key {
                             Key::Named(NamedKey::Escape) => {
-                                cancel_search(&mut self.vi, &mut *self.term.lock().unwrap());
+                                cancel_search(&mut self.vi, &mut self.term.lock().unwrap());
                             }
                             Key::Named(NamedKey::Enter) => {
                                 if let Some(s) = self.vi.search.as_mut() {
@@ -1097,7 +1155,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 if let Some(s) = self.vi.search.as_mut() {
                                     s.query.pop();
                                 }
-                                refresh_search(&mut self.vi, &mut *self.term.lock().unwrap());
+                                refresh_search(&mut self.vi, &mut self.term.lock().unwrap());
                             }
                             Key::Character(text) if !self.modifiers.control_key() => {
                                 if let Some(c) = text.chars().next() {
@@ -1105,7 +1163,10 @@ impl ApplicationHandler<UserEvent> for App {
                                         if let Some(s) = self.vi.search.as_mut() {
                                             s.query.push(c);
                                         }
-                                        refresh_search(&mut self.vi, &mut *self.term.lock().unwrap());
+                                        refresh_search(
+                                            &mut self.vi,
+                                            &mut self.term.lock().unwrap(),
+                                        );
                                     }
                                 }
                             }
@@ -1171,10 +1232,8 @@ impl ApplicationHandler<UserEvent> for App {
                             // `yi<obj>`, `ya<obj>`, count digit, or
                             // cancel). Same shape for the text-object
                             // sub-states.
-                            let yank_pending = matches!(
-                                self.vi.pending_op,
-                                Some(vi::PendingOp::Yank { .. })
-                            );
+                            let yank_pending =
+                                matches!(self.vi.pending_op, Some(vi::PendingOp::Yank { .. }));
                             let inner_pending =
                                 self.vi.pending_op == Some(vi::PendingOp::YankInner);
                             let around_pending =
@@ -1198,21 +1257,20 @@ impl ApplicationHandler<UserEvent> for App {
                                     && (ch != '0' || self.vi.pending_count.is_some())
                                 {
                                     self.vi.push_digit(ch.to_digit(10).unwrap());
-                                    self.vi.pending_op =
-                                        Some(vi::PendingOp::Yank { start_abs });
-                                } else if (ch == 'y' && !shift) || (ch == 'y' && shift) {
+                                    self.vi.pending_op = Some(vi::PendingOp::Yank { start_abs });
+                                } else if ch == 'y' {
                                     // yy or Y: yank N current/next lines.
                                     let count = self.vi.take_count();
                                     let line_start = (start_abs.0, 0);
                                     let line_end = (
-                                        start_abs.0.saturating_add(
-                                            count.saturating_sub(1) as usize,
-                                        ),
+                                        start_abs
+                                            .0
+                                            .saturating_add(count.saturating_sub(1) as usize),
                                         cols.saturating_sub(1),
                                     );
                                     yank_range_to_clipboard(
                                         &mut self.clipboard,
-                                        &*self.term.lock().unwrap(),
+                                        &self.term.lock().unwrap(),
                                         line_start,
                                         line_end,
                                     );
@@ -1226,17 +1284,17 @@ impl ApplicationHandler<UserEvent> for App {
                                     let n = self.vi.take_count();
                                     vi::apply_motion(
                                         &mut self.vi,
-                                        &mut *self.term.lock().unwrap(),
+                                        &mut self.term.lock().unwrap(),
                                         m,
                                         n,
                                     );
                                     let end_abs = vi::cursor_to_absolute(
-                                        &*self.term.lock().unwrap(),
+                                        &self.term.lock().unwrap(),
                                         self.vi.cursor,
                                     );
                                     yank_range_to_clipboard(
                                         &mut self.clipboard,
-                                        &*self.term.lock().unwrap(),
+                                        &self.term.lock().unwrap(),
                                         start_abs,
                                         end_abs,
                                     );
@@ -1251,22 +1309,28 @@ impl ApplicationHandler<UserEvent> for App {
                                     let big = shift;
                                     let bounds = if inner_pending {
                                         vi::inner_word_bounds(
-                                            &*self.term.lock().unwrap(),
+                                            &self.term.lock().unwrap(),
                                             self.vi.cursor,
                                             big,
                                         )
                                     } else {
                                         vi::around_word_bounds(
-                                            &*self.term.lock().unwrap(),
+                                            &self.term.lock().unwrap(),
                                             self.vi.cursor,
                                             big,
                                         )
                                     };
-                                    let s_abs = vi::cursor_to_absolute(&*self.term.lock().unwrap(), bounds.0);
-                                    let e_abs = vi::cursor_to_absolute(&*self.term.lock().unwrap(), bounds.1);
+                                    let s_abs = vi::cursor_to_absolute(
+                                        &self.term.lock().unwrap(),
+                                        bounds.0,
+                                    );
+                                    let e_abs = vi::cursor_to_absolute(
+                                        &self.term.lock().unwrap(),
+                                        bounds.1,
+                                    );
                                     yank_range_to_clipboard(
                                         &mut self.clipboard,
-                                        &*self.term.lock().unwrap(),
+                                        &self.term.lock().unwrap(),
                                         s_abs,
                                         e_abs,
                                     );
@@ -1305,9 +1369,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     ('m', true) => motion = Some(vi::Motion::ScreenMiddle),
                                     ('l', true) => motion = Some(vi::Motion::ScreenBottom),
                                     // gg / G — document ends.
-                                    ('g', false) => {
-                                        self.vi.pending_op = Some(vi::PendingOp::Goto)
-                                    }
+                                    ('g', false) => self.vi.pending_op = Some(vi::PendingOp::Goto),
                                     ('g', true) => motion = Some(vi::Motion::DocEnd),
                                     // Word motions: lowercase = word,
                                     // uppercase (shift) = WORD.
@@ -1320,9 +1382,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     ('e', false) => {
                                         motion = Some(vi::Motion::WordEnd { big: false })
                                     }
-                                    ('e', true) => {
-                                        motion = Some(vi::Motion::WordEnd { big: true })
-                                    }
+                                    ('e', true) => motion = Some(vi::Motion::WordEnd { big: true }),
                                     ('b', false) => {
                                         motion = Some(vi::Motion::WordPrev { big: false })
                                     }
@@ -1348,12 +1408,11 @@ impl ApplicationHandler<UserEvent> for App {
                                         if self.vi.visual != vi::VisualMode::None {
                                             if let Some(sel) = self.selection.as_ref() {
                                                 let text = selection::extract_text(
-                                                    &*self.term.lock().unwrap(),
+                                                    &self.term.lock().unwrap(),
                                                     sel,
                                                 );
                                                 if !text.is_empty() {
-                                                    self.clipboard
-                                                        .set_primary(text.clone());
+                                                    self.clipboard.set_primary(text.clone());
                                                     self.clipboard.set_text(text);
                                                 }
                                             }
@@ -1361,7 +1420,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             self.selection = None;
                                         } else {
                                             let start_abs = vi::cursor_to_absolute(
-                                                &*self.term.lock().unwrap(),
+                                                &self.term.lock().unwrap(),
                                                 self.vi.cursor,
                                             );
                                             self.vi.pending_op =
@@ -1371,20 +1430,24 @@ impl ApplicationHandler<UserEvent> for App {
                                     // Search.
                                     ('/', _) => start_search(
                                         &mut self.vi,
-                                        &*self.term.lock().unwrap(),
+                                        &self.term.lock().unwrap(),
                                         vi::SearchDirection::Forward,
                                     ),
                                     ('?', _) => start_search(
                                         &mut self.vi,
-                                        &*self.term.lock().unwrap(),
+                                        &self.term.lock().unwrap(),
                                         vi::SearchDirection::Backward,
                                     ),
-                                    ('n', false) => {
-                                        search_navigate(&mut self.vi, &mut *self.term.lock().unwrap(), false)
-                                    }
-                                    ('n', true) => {
-                                        search_navigate(&mut self.vi, &mut *self.term.lock().unwrap(), true)
-                                    }
+                                    ('n', false) => search_navigate(
+                                        &mut self.vi,
+                                        &mut self.term.lock().unwrap(),
+                                        false,
+                                    ),
+                                    ('n', true) => search_navigate(
+                                        &mut self.vi,
+                                        &mut self.term.lock().unwrap(),
+                                        true,
+                                    ),
                                     _ => {}
                                 }
                             }
@@ -1395,7 +1458,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // Apply the chosen motion (if any), consuming the count.
                     if let Some(m) = motion {
                         let n = self.vi.take_count();
-                        vi::apply_motion(&mut self.vi, &mut *self.term.lock().unwrap(), m, n);
+                        vi::apply_motion(&mut self.vi, &mut self.term.lock().unwrap(), m, n);
                     }
                     // Refresh selection from the latest vi state if we're
                     // still in a visual mode (covers `v`/`V` plus any
@@ -1416,7 +1479,11 @@ impl ApplicationHandler<UserEvent> for App {
                         let pasted = self.clipboard.get_text();
                         if !pasted.is_empty() {
                             if let Some(pty) = self.pty.as_mut() {
-                                write_paste(pty, &pasted, self.term.lock().unwrap().bracketed_paste);
+                                write_paste(
+                                    pty,
+                                    &pasted,
+                                    self.term.lock().unwrap().bracketed_paste,
+                                );
                                 self.term.lock().unwrap().reset_view();
                                 self.selection = None;
                                 window.request_redraw();
@@ -1428,12 +1495,22 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Font zoom: Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0. Handled
                 // locally; never forwarded to the PTY.
-                if let Some(target) = font_zoom_target(&logical_key, self.modifiers, gpu.font_size())
+                if let Some(target) =
+                    font_zoom_target(&logical_key, self.modifiers, gpu.font_size())
                 {
                     let inner = window.inner_size();
                     let cell = gpu.set_font_size(target);
                     let (rows, cols) = grid_dims_for_window(cell, inner.width, inner.height);
-                    self.term.lock().unwrap().resize(rows as usize, cols as usize);
+                    self.term
+                        .lock()
+                        .unwrap()
+                        .resize(rows as usize, cols as usize);
+                    Self::clamp_view_state(
+                        &mut self.vi,
+                        &mut self.selection,
+                        rows as usize,
+                        cols as usize,
+                    );
                     if let Some(pty) = self.pty.as_ref() {
                         pty.resize(rows, cols);
                     }
@@ -1449,8 +1526,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // surrounding `if let`, and the `reset_view()`
                     // lock below would re-enter and deadlock —
                     // std::sync::Mutex is not reentrant.
-                    let app_cursor_keys =
-                        self.term.lock().unwrap().application_cursor_keys;
+                    let app_cursor_keys = self.term.lock().unwrap().application_cursor_keys;
                     if let Some(bytes) = encode_key(
                         &logical_key,
                         text.as_deref(),
@@ -1479,6 +1555,27 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
+    /// After a grid resize, pull the vi cursor and any live selection back
+    /// inside the new `rows`×`cols` bounds. Both feed coordinates into
+    /// `Term::viewport_row`, which indexes the live grid unchecked, so a
+    /// stale row/col left over from the old (larger) grid would panic on
+    /// the next motion or copy. Takes the fields rather than `&mut self`
+    /// so it composes with the disjoint `window`/`gpu` borrows the resize
+    /// handlers already hold.
+    fn clamp_view_state(
+        vi: &mut vi::ViMode,
+        selection: &mut Option<selection::Selection>,
+        rows: usize,
+        cols: usize,
+    ) {
+        vi.clamp_cursor(rows, cols);
+        if let Some(sel) = selection.as_mut() {
+            let (r, c) = (rows.saturating_sub(1), cols.saturating_sub(1));
+            sel.anchor = (sel.anchor.0.min(r), sel.anchor.1.min(c));
+            sel.end = (sel.end.0.min(r), sel.end.1.min(c));
+        }
+    }
+
     /// Request a redraw if one isn't already pending and we're past the
     /// frame-interval throttle window. Inside the window, `about_to_wait`
     /// arms a `WaitUntil` so we paint exactly when the slot opens.
@@ -1663,8 +1760,7 @@ fn refresh_search(vi_state: &mut vi::ViMode, term: &mut Term) {
         let origin_abs =
             vi::viewport_to_absolute(term, s.origin_cursor.0, s.origin_viewport_offset);
         let matches = vi::find_matches(term, &s.query);
-        let current =
-            vi::pick_current_match(&matches, origin_abs, s.origin_cursor.1, s.direction);
+        let current = vi::pick_current_match(&matches, origin_abs, s.origin_cursor.1, s.direction);
         (matches, current, s.query.is_empty())
     };
     // Phase 2: write back, extract jump target.

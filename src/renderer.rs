@@ -35,12 +35,12 @@ pub struct SearchOverlay<'a> {
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 struct CellInstance {
-    cell_xy: [u32; 2],         // 0..8
-    glyph_origin: [u32; 2],    // 8..16
-    glyph_size: [u32; 2],      // 16..24
-    glyph_offset: [i32; 2],    // 24..32
-    fg: [f32; 4],              // 32..48
-    bg: [f32; 4],              // 48..64
+    cell_xy: [u32; 2],      // 0..8
+    glyph_origin: [u32; 2], // 8..16
+    glyph_size: [u32; 2],   // 16..24
+    glyph_offset: [i32; 2], // 24..32
+    fg: [f32; 4],           // 32..48
+    bg: [f32; 4],           // 48..64
 }
 
 impl PartialEq for CellInstance {
@@ -102,8 +102,15 @@ fn debug_damage_stats(rects: &[Rect], screen_w: i32, screen_h: i32) {
         static STATS: Cell<(u64, u64, u64, u64, u64)> = const { Cell::new((0, 0, 0, 0, 0)) };
     }
     let area_full = screen_w as u64 * screen_h as u64;
-    let area: u64 = rects.iter().map(|r| r.width.max(0) as u64 * r.height.max(0) as u64).sum();
-    let pct_x100 = if area_full > 0 { (area * 10000) / area_full } else { 0 };
+    let area: u64 = rects
+        .iter()
+        .map(|r| r.width.max(0) as u64 * r.height.max(0) as u64)
+        .sum();
+    let pct_x100 = if area_full > 0 {
+        (area * 10000) / area_full
+    } else {
+        0
+    };
     let is_full = pct_x100 >= 9000;
     STATS.with(|s| {
         let (n, sum_rects, sum_pct, full_n, max_rects) = s.get();
@@ -127,6 +134,69 @@ fn debug_damage_stats(rects: &[Rect], screen_w: i32, screen_h: i32) {
 }
 
 const INSTANCE_STRIDE: i32 = std::mem::size_of::<CellInstance>() as i32;
+
+/// Dirty bounding box in cell coords (inclusive), from a grid-instance diff.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct DamageBox {
+    min_col: i32,
+    max_col: i32,
+    min_row: i32,
+    max_row: i32,
+}
+
+/// Result of diffing this frame's grid instances against the previous
+/// frame's, assuming the two slices have equal length.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum GridDiff {
+    /// No grid cell changed.
+    Clean,
+    /// These cells changed; damage their bounding box.
+    Dirty(DamageBox),
+    /// The two slices describe different cell positions at the same index
+    /// (a glyph appeared/disappeared earlier in the grid, net-zero in
+    /// count). Index-keyed comparison is invalid here — it can compare two
+    /// unrelated cells and miss a real change, leaving stale pixels — so
+    /// the caller must full-damage.
+    Reorder,
+}
+
+/// Diff two equal-length, row-major instance lists by cell position.
+///
+/// The instance list is sparse (blank cells are skipped, wide cells emit
+/// two entries), so comparing `grid[k]` to `prev[k]` is only sound when
+/// slot `k` maps to the same cell in both frames. We verify that via
+/// `cell_xy`; any mismatch means the layout shifted and we report
+/// `Reorder` so the caller falls back to full damage.
+fn diff_grid_instances(grid: &[CellInstance], prev: &[CellInstance]) -> GridDiff {
+    debug_assert_eq!(grid.len(), prev.len());
+    let mut min_col = i32::MAX;
+    let mut max_col = i32::MIN;
+    let mut min_row = i32::MAX;
+    let mut max_row = i32::MIN;
+    for (inst, old) in grid.iter().zip(prev.iter()) {
+        if inst.cell_xy != old.cell_xy {
+            return GridDiff::Reorder;
+        }
+        if inst != old {
+            let col = inst.cell_xy[0] as i32;
+            let row = inst.cell_xy[1] as i32;
+            min_col = min_col.min(col);
+            max_col = max_col.max(col);
+            min_row = min_row.min(row);
+            max_row = max_row.max(row);
+        }
+    }
+    if min_col <= max_col {
+        GridDiff::Dirty(DamageBox {
+            min_col,
+            max_col,
+            min_row,
+            max_row,
+        })
+    } else {
+        GridDiff::Clean
+    }
+}
 
 pub struct Renderer {
     program: glow::Program,
@@ -373,8 +443,7 @@ impl Renderer {
         // Match the outer Vec length to the row count; existing inner
         // Vecs keep their capacity.
         if self.snap_viewport.len() < self.snap_rows {
-            self.snap_viewport
-                .resize_with(self.snap_rows, Vec::new);
+            self.snap_viewport.resize_with(self.snap_rows, Vec::new);
         } else {
             self.snap_viewport.truncate(self.snap_rows);
         }
@@ -392,6 +461,7 @@ impl Renderer {
         self.snap_cursor_shape = term.cursor_shape();
     }
 
+    #[allow(clippy::too_many_arguments)] // per-frame render inputs; a struct adds indirection in the hot path
     pub fn prepare(
         &mut self,
         gl: &glow::Context,
@@ -486,8 +556,7 @@ impl Renderer {
                     // this guard prevents).
                     let is_cursor =
                         (vrow as i32) == cursor_row_i && (col_idx as i32) == cursor_col_i;
-                    let is_selected =
-                        selection.map_or(false, |s| s.contains(vrow, col_idx));
+                    let is_selected = selection.is_some_and(|s| s.contains(vrow, col_idx));
                     if !is_cursor && !is_selected {
                         continue;
                     }
@@ -525,8 +594,7 @@ impl Renderer {
                 if let Some(ov) = search {
                     let mut hit: Option<bool> = None; // Some(is_current)
                     for (i, m) in ov.matches.iter().enumerate() {
-                        if m.vrow == vrow && col_idx >= m.col_start && col_idx <= m.col_end
-                        {
+                        if m.vrow == vrow && col_idx >= m.col_start && col_idx <= m.col_end {
                             hit = Some(Some(i) == ov.current);
                             break;
                         }
@@ -594,7 +662,8 @@ impl Renderer {
         if burst_active {
             self.damage_rects.clear();
             self.damage_rects.push(Rect::new(
-                0, 0,
+                0,
+                0,
                 self.screen_size.0 as i32,
                 self.screen_size.1 as i32,
             ));
@@ -701,7 +770,13 @@ impl Renderer {
     /// Output is in EGL surface coordinates: origin bottom-left, X right,
     /// Y up. Caller passes the row/col grid dims so we can detect a
     /// resize-induced positional mismatch.
-    fn compute_damage_rects(&mut self, rows: usize, cols: usize, search_active: bool, picker_active: bool) {
+    fn compute_damage_rects(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        search_active: bool,
+        picker_active: bool,
+    ) {
         self.damage_rects.clear();
 
         let cw = self.cell_size.0 as i32;
@@ -753,26 +828,22 @@ impl Renderer {
         // dominator on Hyprland is the swap count × per-call constant,
         // not the per-pixel blend cost. Spending the call budget once
         // per frame wins.
-        let mut min_col = i32::MAX;
-        let mut max_col = i32::MIN;
-        let mut min_row = i32::MAX;
-        let mut max_row = i32::MIN;
-        for (k, inst) in grid.iter().enumerate() {
-            if *inst != prev[k] {
-                let col = inst.cell_xy[0] as i32;
-                let row = inst.cell_xy[1] as i32;
-                if col < min_col { min_col = col; }
-                if col > max_col { max_col = col; }
-                if row < min_row { min_row = row; }
-                if row > max_row { max_row = row; }
+        match diff_grid_instances(grid, prev) {
+            GridDiff::Reorder => {
+                // Layout shifted at equal length — index-keyed diffing
+                // would under-damage. Full-damage this frame instead.
+                self.damage_rects.push(Rect::new(0, 0, sw, sh));
+                self.snapshot_for_next_frame(rows, cols);
+                return;
             }
-        }
-        if min_col <= max_col {
-            let x = min_col * cw;
-            let width = (max_col - min_col + 1) * cw;
-            let y = sh - (max_row + 1) * ch;
-            let height = (max_row - min_row + 1) * ch;
-            self.damage_rects.push(Rect::new(x, y, width, height));
+            GridDiff::Clean => {}
+            GridDiff::Dirty(b) => {
+                let x = b.min_col * cw;
+                let width = (b.max_col - b.min_col + 1) * cw;
+                let y = sh - (b.max_row + 1) * ch;
+                let height = (b.max_row - b.min_row + 1) * ch;
+                self.damage_rects.push(Rect::new(x, y, width, height));
+            }
         }
 
         // Cursor: drawn via uniforms, not instances, so its movement
@@ -783,10 +854,7 @@ impl Renderer {
         if cursor_moved {
             for &(col, row) in &[self.prev_cursor_cell, self.cursor_cell] {
                 if col >= 0 && row >= 0 && (col as usize) < cols && (row as usize) < rows {
-                    push_row_damage(
-                        &mut self.damage_rects,
-                        row, col, col, cw, ch, sh,
-                    );
+                    push_row_damage(&mut self.damage_rects, row, col, col, cw, ch, sh);
                 }
             }
         }
@@ -944,7 +1012,14 @@ impl Renderer {
         // Fill background.
         for r in 0..height {
             for c in 0..width {
-                self.push_overlay_cell(' ', origin_row + r, origin_col + c, panel_fg, panel_bg, atlas);
+                self.push_overlay_cell(
+                    ' ',
+                    origin_row + r,
+                    origin_col + c,
+                    panel_fg,
+                    panel_bg,
+                    atlas,
+                );
             }
         }
 
@@ -1067,19 +1142,11 @@ const MATCH_BG_CURRENT: [f32; 4] = [1.0, 0.679, 0.0, 1.0];
 const MATCH_FG_CURRENT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 unsafe fn build_program(gl: &glow::Context) -> glow::Program {
-    link_program(
-        gl,
-        include_str!("shader.vert"),
-        include_str!("shader.frag"),
-    )
+    link_program(gl, include_str!("shader.vert"), include_str!("shader.frag"))
 }
 
 unsafe fn build_tint_program(gl: &glow::Context) -> glow::Program {
-    link_program(
-        gl,
-        include_str!("tint.vert"),
-        include_str!("tint.frag"),
-    )
+    link_program(gl, include_str!("tint.vert"), include_str!("tint.frag"))
 }
 
 unsafe fn link_program(gl: &glow::Context, vs_src: &str, fs_src: &str) -> glow::Program {
@@ -1107,7 +1174,11 @@ unsafe fn compile_shader(gl: &glow::Context, kind: u32, src: &str) -> glow::Shad
     if !gl.get_shader_compile_status(shader) {
         panic!(
             "compile {} shader: {}",
-            if kind == glow::VERTEX_SHADER { "vertex" } else { "fragment" },
+            if kind == glow::VERTEX_SHADER {
+                "vertex"
+            } else {
+                "fragment"
+            },
             gl.get_shader_info_log(shader)
         );
     }
@@ -1140,11 +1211,11 @@ unsafe fn build_vao_vbo(gl: &glow::Context, capacity: usize) -> (glow::VertexArr
     for &(loc, count, ty, is_int, offset) in attrs {
         gl.enable_vertex_attrib_array(loc);
         if is_int {
-            gl.vertex_attrib_pointer_i32(loc as u32, count, ty, INSTANCE_STRIDE, offset);
+            gl.vertex_attrib_pointer_i32(loc, count, ty, INSTANCE_STRIDE, offset);
         } else {
-            gl.vertex_attrib_pointer_f32(loc as u32, count, ty, false, INSTANCE_STRIDE, offset);
+            gl.vertex_attrib_pointer_f32(loc, count, ty, false, INSTANCE_STRIDE, offset);
         }
-        gl.vertex_attrib_divisor(loc as u32, 1);
+        gl.vertex_attrib_divisor(loc, 1);
     }
 
     gl.bind_buffer(glow::ARRAY_BUFFER, None);
@@ -1284,6 +1355,49 @@ fn build_palette(theme: &Theme) -> [[f32; 4]; 256] {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn inst_at(col: u32, row: u32, glyph: u32) -> CellInstance {
+        CellInstance {
+            cell_xy: [col, row],
+            glyph_origin: [glyph, 0],
+            ..CellInstance::default()
+        }
+    }
+
+    #[test]
+    fn diff_clean_when_identical() {
+        let frame = vec![inst_at(0, 0, 1), inst_at(2, 0, 2)];
+        assert_eq!(diff_grid_instances(&frame, &frame), GridDiff::Clean);
+    }
+
+    #[test]
+    fn diff_bbox_covers_changed_cells() {
+        let prev = vec![inst_at(1, 1, 1), inst_at(4, 3, 2)];
+        // Same cell positions, different glyph contents.
+        let cur = vec![inst_at(1, 1, 9), inst_at(4, 3, 8)];
+        assert_eq!(
+            diff_grid_instances(&cur, &prev),
+            GridDiff::Dirty(DamageBox {
+                min_col: 1,
+                max_col: 4,
+                min_row: 1,
+                max_row: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn diff_reorder_when_positions_shift() {
+        // Net-zero length change but the cell at each index differs: a
+        // glyph appeared earlier in the row, shifting everything after it.
+        // Index-keyed comparison would misalign and could under-damage, so
+        // we must report Reorder and let the caller full-damage.
+        let prev = vec![inst_at(0, 0, 1), inst_at(5, 0, 2)];
+        let cur = vec![inst_at(0, 0, 1), inst_at(3, 0, 7)];
+        assert_eq!(diff_grid_instances(&cur, &prev), GridDiff::Reorder);
+    }
+
     #[test]
     fn srgb_lut_matches_formula() {
         // The LUT replaces a per-call powf in the per-cell render

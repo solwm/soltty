@@ -58,20 +58,19 @@ pub fn char_width(ch: char) -> u8 {
             // CJK Unified Ideographs Extensions B-G
             | 0x20000..=0x2FFFD
     );
-    if wide { 2 } else { 1 }
+    if wide {
+        2
+    } else {
+        1
+    }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Color {
+    #[default]
     Default,
     Indexed(u8),
     Rgb(u8, u8, u8),
-}
-
-impl Default for Color {
-    fn default() -> Self {
-        Color::Default
-    }
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -382,10 +381,10 @@ impl Grid {
     }
 
     pub fn move_cursor(&mut self, drow: isize, dcol: isize) {
-        let r = (self.cursor.row as isize + drow)
-            .clamp(0, self.rows.saturating_sub(1) as isize) as usize;
-        let c = (self.cursor.col as isize + dcol)
-            .clamp(0, self.cols.saturating_sub(1) as isize) as usize;
+        let r = (self.cursor.row as isize + drow).clamp(0, self.rows.saturating_sub(1) as isize)
+            as usize;
+        let c = (self.cursor.col as isize + dcol).clamp(0, self.cols.saturating_sub(1) as isize)
+            as usize;
         self.cursor.row = r;
         self.cursor.col = c;
         self.cursor.wrap_next = false;
@@ -512,9 +511,7 @@ impl Grid {
         let row = &mut self.lines[r].cells;
         row[c..].rotate_left(n);
         let blank = self.pen.blank_cell();
-        for cc in (self.cols - n)..self.cols {
-            row[cc] = blank;
-        }
+        row[(self.cols - n)..self.cols].fill(blank);
     }
 
     pub fn insert_chars(&mut self, n: usize) {
@@ -524,9 +521,7 @@ impl Grid {
         let row = &mut self.lines[r].cells;
         row[c..].rotate_right(n);
         let blank = self.pen.blank_cell();
-        for cc in c..(c + n) {
-            row[cc] = blank;
-        }
+        row[c..(c + n)].fill(blank);
     }
 
     pub fn insert_lines(&mut self, n: usize) {

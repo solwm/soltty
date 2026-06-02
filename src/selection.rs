@@ -134,6 +134,66 @@ fn word_bounds_in_cells(cells: &[crate::grid::Cell], col: usize) -> (usize, usiz
     (s, e)
 }
 
+/// Build a copy-able string from the cells covered by `sel`. Pulls rows
+/// via `Term::viewport_row` so it works in scrollback too. Char-mode
+/// trims trailing whitespace per line (copying the right-edge padding
+/// spaces is almost never what users want); Block-mode preserves
+/// trailing whitespace inside the rect because the user explicitly
+/// selected that column range and removing pad would break alignment.
+pub fn extract_text(term: &Term, sel: &Selection) -> String {
+    let cols = term.grid().cols;
+    // Selection coords can outlive the grid they were made against (a
+    // window shrink leaves the row past the live grid; a widen leaves a
+    // scrollback row narrower than `cols`, since scrollback isn't reflowed
+    // on resize). `viewport_row` indexes the live grid unchecked, so clamp
+    // the row to the viewport and every column to the row's real length.
+    let last_row = term.grid().rows.saturating_sub(1);
+    let mut out = String::new();
+    match sel.mode {
+        SelectionMode::Char => {
+            let ((sr, sc), (er, ec)) = sel.normalized();
+            let (sr, er) = (sr.min(last_row), er.min(last_row));
+            for row in sr..=er {
+                let r = term.viewport_row(row);
+                let rcols = r.cells.len();
+                let start = (if row == sr { sc } else { 0 }).min(rcols);
+                let end = (if row == er { (ec + 1).min(cols) } else { cols }).min(rcols);
+                // Skip width=0 spacers — they're the right half of a
+                // wide character; pulling them would double the glyph.
+                let line: String = r.cells[start..end.max(start)]
+                    .iter()
+                    .filter(|c| c.width != 0)
+                    .map(|c| c.ch)
+                    .collect();
+                out.push_str(line.trim_end());
+                if row < er {
+                    out.push('\n');
+                }
+            }
+        }
+        SelectionMode::Block => {
+            let ((r1, c1), (r2, c2)) = sel.block_bounds();
+            let (r1, r2) = (r1.min(last_row), r2.min(last_row));
+            for row in r1..=r2 {
+                let r = term.viewport_row(row);
+                let rcols = r.cells.len();
+                let start = c1.min(rcols);
+                let end = (c2 + 1).min(cols).min(rcols);
+                let line: String = r.cells[start..end.max(start)]
+                    .iter()
+                    .filter(|c| c.width != 0)
+                    .map(|c| c.ch)
+                    .collect();
+                out.push_str(&line);
+                if row < r2 {
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,7 +225,7 @@ mod tests {
         sel.dragging = false;
         // Inside the row-major run.
         assert!(sel.contains(1, 3));
-        assert!(sel.contains(2, 0));   // middle row, all cols
+        assert!(sel.contains(2, 0)); // middle row, all cols
         assert!(sel.contains(3, 5));
         // Char mode: cells in cols 0-2 of row 1 are NOT included
         // (selection starts at col 3 of row 1).
@@ -247,6 +307,43 @@ mod tests {
     }
 
     #[test]
+    fn extract_from_widened_scrollback_row_does_not_panic() {
+        use crate::term::Term;
+        // Push a line into scrollback while the grid is 5 cols wide.
+        let mut t = Term::new(2, 5);
+        t.feed(b"AAAAA\r\nBBBBB\r\nCCCCC");
+        assert_eq!(t.grid().scrollback.len(), 1);
+        // Widen to 10 cols: the live rows grow, but the scrollback row
+        // keeps its 5 cells (scrollback isn't reflowed on resize).
+        t.resize(2, 10);
+        // Scroll up so the 5-wide scrollback row is the top viewport row.
+        t.scroll_view(1);
+        let mut sel = Selection::new((0, 0));
+        sel.end = (0, 9); // span the full *new* width, past the row's 5 cells
+        sel.dragging = false;
+        // Old code sliced cells[0..10] on a 5-cell row → panic.
+        assert_eq!(extract_text(&t, &sel), "AAAAA");
+    }
+
+    #[test]
+    fn extract_with_rows_past_shrunk_grid_does_not_panic() {
+        use crate::term::Term;
+        let mut t = Term::new(40, 80);
+        t.feed(b"hello world");
+        let mut sel = Selection::new((30, 70));
+        sel.end = (38, 75);
+        sel.dragging = false;
+        // Grid shrinks under the still-live selection; rows 30..38 no
+        // longer exist. Must clamp instead of indexing out of bounds.
+        t.resize(10, 20);
+        let _ = extract_text(&t, &sel);
+
+        // Block mode hits the same unchecked path.
+        sel.mode = SelectionMode::Block;
+        let _ = extract_text(&t, &sel);
+    }
+
+    #[test]
     fn block_extract_preserves_internal_whitespace() {
         use crate::term::Term;
         let mut t = Term::new(2, 20);
@@ -260,58 +357,4 @@ mod tests {
         // those columns.
         assert_eq!(text, "a  bb\nc  dd");
     }
-}
-
-
-/// Build a copy-able string from the cells covered by `sel`. Pulls rows
-/// via `Term::viewport_row` so it works in scrollback too. Char-mode
-/// trims trailing whitespace per line (copying the right-edge padding
-/// spaces is almost never what users want); Block-mode preserves
-/// trailing whitespace inside the rect because the user explicitly
-/// selected that column range and removing pad would break alignment.
-pub fn extract_text(term: &Term, sel: &Selection) -> String {
-    let cols = term.grid().cols;
-    let mut out = String::new();
-    match sel.mode {
-        SelectionMode::Char => {
-            let ((sr, sc), (er, ec)) = sel.normalized();
-            for row in sr..=er {
-                let r = term.viewport_row(row);
-                let start = if row == sr { sc } else { 0 };
-                let end = if row == er {
-                    (ec + 1).min(cols)
-                } else {
-                    cols
-                };
-                // Skip width=0 spacers — they're the right half of a
-                // wide character; pulling them would double the glyph.
-                let line: String = r.cells[start..end]
-                    .iter()
-                    .filter(|c| c.width != 0)
-                    .map(|c| c.ch)
-                    .collect();
-                out.push_str(line.trim_end());
-                if row < er {
-                    out.push('\n');
-                }
-            }
-        }
-        SelectionMode::Block => {
-            let ((r1, c1), (r2, c2)) = sel.block_bounds();
-            let end = (c2 + 1).min(cols);
-            for row in r1..=r2 {
-                let r = term.viewport_row(row);
-                let line: String = r.cells[c1..end]
-                    .iter()
-                    .filter(|c| c.width != 0)
-                    .map(|c| c.ch)
-                    .collect();
-                out.push_str(&line);
-                if row < r2 {
-                    out.push('\n');
-                }
-            }
-        }
-    }
-    out
 }

@@ -114,8 +114,7 @@ impl Dispatch<WlRegistry, ()> for ClipState {
             // compositor offers we just ignore.
             match interface.as_str() {
                 "wl_seat" if state.seat.is_none() => {
-                    state.seat =
-                        Some(registry.bind::<WlSeat, _, _>(name, version.min(7), qh, ()));
+                    state.seat = Some(registry.bind::<WlSeat, _, _>(name, version.min(7), qh, ()));
                 }
                 "wl_data_device_manager" if state.manager.is_none() => {
                     state.manager = Some(registry.bind::<WlDataDeviceManager, _, _>(
@@ -261,16 +260,16 @@ impl Dispatch<WlRegistry, ()> for PrimaryState {
         {
             match interface.as_str() {
                 "wl_seat" if state.seat.is_none() => {
-                    state.seat =
-                        Some(registry.bind::<WlSeat, _, _>(name, version.min(7), qh, ()));
+                    state.seat = Some(registry.bind::<WlSeat, _, _>(name, version.min(7), qh, ()));
                 }
                 "zwp_primary_selection_device_manager_v1" if state.manager.is_none() => {
-                    state.manager = Some(registry.bind::<ZwpPrimarySelectionDeviceManagerV1, _, _>(
-                        name,
-                        version.min(1),
-                        qh,
-                        (),
-                    ));
+                    state.manager =
+                        Some(registry.bind::<ZwpPrimarySelectionDeviceManagerV1, _, _>(
+                            name,
+                            version.min(1),
+                            qh,
+                            (),
+                        ));
                 }
                 _ => {}
             }
@@ -390,10 +389,7 @@ fn read_pipe(fd: OwnedFd) -> Option<String> {
     let mut buf = [0u8; 4096];
     let deadline = Instant::now() + READ_TIMEOUT;
     loop {
-        let remaining = match deadline.checked_duration_since(Instant::now()) {
-            Some(d) => d,
-            None => return None,
-        };
+        let remaining = deadline.checked_duration_since(Instant::now())?;
         let ms = remaining.as_millis().min(60_000) as i32;
         let mut pfd = libc::pollfd {
             fd: raw,

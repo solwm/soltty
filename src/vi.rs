@@ -149,6 +149,15 @@ impl ViMode {
         self.pending_op = None;
     }
 
+    /// Pull the cursor inside a `rows`×`cols` grid. Called after a resize:
+    /// `Term::viewport_row` indexes the live grid unchecked, so a cursor
+    /// left near the old (larger) edge would panic on the next motion that
+    /// reads its row (`$`, `^`, `yiw`, …).
+    pub fn clamp_cursor(&mut self, rows: usize, cols: usize) {
+        self.cursor.0 = self.cursor.0.min(rows.saturating_sub(1));
+        self.cursor.1 = self.cursor.1.min(cols.saturating_sub(1));
+    }
+
     /// Consume the typed count and reset. Returns 1 when no count was
     /// pending, matching vim's "implicit ×1" for an unprefixed motion.
     pub fn take_count(&mut self) -> u32 {
@@ -241,12 +250,18 @@ pub enum Motion {
     FullPageDown,      // Ctrl-f
     /// `w`/`W`. `big` toggles WORD (non-whitespace runs) vs word
     /// (alphanumeric + `_` runs).
-    WordNext { big: bool },
+    WordNext {
+        big: bool,
+    },
     /// `e`/`E` — end of current word, or end of next word if already at
     /// the end.
-    WordEnd { big: bool },
+    WordEnd {
+        big: bool,
+    },
     /// `b`/`B`.
-    WordPrev { big: bool },
+    WordPrev {
+        big: bool,
+    },
 }
 
 /// Apply a motion `count` times, scrolling the viewport when motions push
@@ -260,6 +275,12 @@ pub fn apply_motion(vi: &mut ViMode, term: &mut Term, motion: Motion, count: u32
             let g = term.grid();
             (g.rows, g.cols)
         };
+        // Defensive: a resize may have left the cursor past the new edge.
+        // The row-reading arms below (`$`, `^`) hand `cursor.0` straight to
+        // `viewport_row`, which has no bounds check, so clamp before use —
+        // not only at the end of the loop as the final clamp does.
+        vi.cursor.0 = vi.cursor.0.min(rows.saturating_sub(1));
+        vi.cursor.1 = vi.cursor.1.min(cols.saturating_sub(1));
         match motion {
             Motion::Char(drow, dcol) => char_move(vi, term, drow, dcol, rows, cols),
             Motion::LineStart => vi.cursor.1 = 0,
@@ -298,17 +319,9 @@ pub fn apply_motion(vi: &mut ViMode, term: &mut Term, motion: Motion, count: u32
     }
 }
 
-fn char_move(
-    vi: &mut ViMode,
-    term: &mut Term,
-    drow: isize,
-    dcol: isize,
-    rows: usize,
-    cols: usize,
-) {
+fn char_move(vi: &mut ViMode, term: &mut Term, drow: isize, dcol: isize, rows: usize, cols: usize) {
     let r = vi.cursor.0 as isize + drow;
-    let c =
-        (vi.cursor.1 as isize + dcol).clamp(0, cols.saturating_sub(1) as isize) as usize;
+    let c = (vi.cursor.1 as isize + dcol).clamp(0, cols.saturating_sub(1) as isize) as usize;
     if r < 0 {
         // Scroll into history; pin cursor to the new top row.
         term.scroll_view(-r);
@@ -536,9 +549,7 @@ impl ViKeyBind {
                     return k;
                 }
                 None => {
-                    log::warn!(
-                        "SOLTTY_VI_KEY={s:?} did not parse; trying config-file value"
-                    );
+                    log::warn!("SOLTTY_VI_KEY={s:?} did not parse; trying config-file value");
                 }
             }
         }
@@ -671,15 +682,11 @@ pub fn pick_current_match(
     match direction {
         SearchDirection::Forward => matches
             .iter()
-            .position(|m| {
-                m.row > from_row || (m.row == from_row && m.col_start >= from_col)
-            })
+            .position(|m| m.row > from_row || (m.row == from_row && m.col_start >= from_col))
             .or(Some(0)),
         SearchDirection::Backward => matches
             .iter()
-            .rposition(|m| {
-                m.row < from_row || (m.row == from_row && m.col_start <= from_col)
-            })
+            .rposition(|m| m.row < from_row || (m.row == from_row && m.col_start <= from_col))
             .or(Some(matches.len() - 1)),
     }
 }
@@ -709,12 +716,12 @@ pub fn cursor_to_absolute(term: &Term, cursor: (usize, usize)) -> (usize, usize)
 /// absolute (scrollback ++ live) coords so this works across viewport
 /// scrolls. Trailing whitespace on each row is trimmed — same policy
 /// as `selection::extract_text` for `Char` mode.
-pub fn extract_absolute_range(
-    term: &Term,
-    start: (usize, usize),
-    end: (usize, usize),
-) -> String {
-    let (s, e) = if start <= end { (start, end) } else { (end, start) };
+pub fn extract_absolute_range(term: &Term, start: (usize, usize), end: (usize, usize)) -> String {
+    let (s, e) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
     let g = term.grid();
     let sb_len = g.scrollback.len();
     let live_len = g.lines.len();
@@ -765,6 +772,9 @@ pub fn inner_word_bounds(
     big: bool,
 ) -> ((usize, usize), (usize, usize)) {
     let (row, col) = cursor;
+    // Clamp the row: a stale cursor (e.g. after a window shrink) would
+    // otherwise index the live grid out of bounds inside `viewport_row`.
+    let row = row.min(term.grid().rows.saturating_sub(1));
     let cells = &term.viewport_row(row).cells;
     if cells.is_empty() {
         return ((row, col), (row, col));
@@ -910,6 +920,43 @@ mod tests {
     }
 
     #[test]
+    fn clamp_cursor_pulls_into_bounds() {
+        let mut v = ViMode::new();
+        v.cursor = (100, 200);
+        v.clamp_cursor(10, 20);
+        assert_eq!(v.cursor, (9, 19));
+        // Already in range — unchanged.
+        v.clamp_cursor(10, 20);
+        assert_eq!(v.cursor, (9, 19));
+        // Degenerate 0×0 grid must not underflow.
+        v.clamp_cursor(0, 0);
+        assert_eq!(v.cursor, (0, 0));
+    }
+
+    #[test]
+    fn motions_survive_shrink_with_stale_cursor() {
+        // Regression: enter vi-mode near the bottom-right of a tall
+        // window, then shrink the grid without reclamping the cursor.
+        // `$`, `^`, and the word text objects read the stale row and
+        // hand it to `viewport_row`, which would panic out of bounds.
+        let mut t = Term::new(40, 80);
+        t.feed(b"the quick brown fox");
+        let mut vi = ViMode::new();
+        vi.enter((38, 70));
+        t.resize(10, 20);
+
+        apply_motion(&mut vi, &mut t, Motion::LineEnd, 1);
+        assert!(vi.cursor.0 < 10 && vi.cursor.1 < 20);
+        apply_motion(&mut vi, &mut t, Motion::LineFirstNonBlank, 1);
+        assert!(vi.cursor.0 < 10 && vi.cursor.1 < 20);
+
+        // Text objects are dispatched directly (not via apply_motion),
+        // so they must self-clamp the row too.
+        let _ = inner_word_bounds(&t, (38, 70), false);
+        let _ = around_word_bounds(&t, (38, 70), false);
+    }
+
+    #[test]
     fn visual_char_selection_follows_cursor() {
         let mut v = ViMode::new();
         v.enter((2, 4));
@@ -1000,9 +1047,21 @@ mod tests {
     #[test]
     fn pick_current_match_forward_picks_next() {
         let ms = vec![
-            Match { row: 1, col_start: 0, col_end: 2 },
-            Match { row: 5, col_start: 3, col_end: 5 },
-            Match { row: 10, col_start: 0, col_end: 2 },
+            Match {
+                row: 1,
+                col_start: 0,
+                col_end: 2,
+            },
+            Match {
+                row: 5,
+                col_start: 3,
+                col_end: 5,
+            },
+            Match {
+                row: 10,
+                col_start: 0,
+                col_end: 2,
+            },
         ];
         assert_eq!(
             pick_current_match(&ms, 3, 0, SearchDirection::Forward),
@@ -1018,9 +1077,21 @@ mod tests {
     #[test]
     fn pick_current_match_backward_picks_prev() {
         let ms = vec![
-            Match { row: 1, col_start: 0, col_end: 2 },
-            Match { row: 5, col_start: 3, col_end: 5 },
-            Match { row: 10, col_start: 0, col_end: 2 },
+            Match {
+                row: 1,
+                col_start: 0,
+                col_end: 2,
+            },
+            Match {
+                row: 5,
+                col_start: 3,
+                col_end: 5,
+            },
+            Match {
+                row: 10,
+                col_start: 0,
+                col_end: 2,
+            },
         ];
         assert_eq!(
             pick_current_match(&ms, 7, 0, SearchDirection::Backward),

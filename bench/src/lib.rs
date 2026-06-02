@@ -37,8 +37,8 @@ impl Bench {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(default_iters);
-        let out_path = std::env::var("BENCH_OUT")
-            .unwrap_or_else(|_| "/tmp/soltty_bench.txt".into());
+        let out_path =
+            std::env::var("BENCH_OUT").unwrap_or_else(|_| "/tmp/soltty_bench.txt".into());
         let (cols, rows) = detect_size();
         Self {
             name,
@@ -143,8 +143,12 @@ fn ping_terminal<W: Write>(out: &mut W) -> std::io::Result<()> {
 /// overrides, falls back to TIOCGWINSZ via the `terminal_size` crate,
 /// then to a sane 80x24 default if neither yields a sensible value.
 fn detect_size() -> (u16, u16) {
-    let env_cols = std::env::var("BENCH_COLS").ok().and_then(|s| s.parse().ok());
-    let env_rows = std::env::var("BENCH_ROWS").ok().and_then(|s| s.parse().ok());
+    let env_cols = std::env::var("BENCH_COLS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let env_rows = std::env::var("BENCH_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok());
     if let (Some(c), Some(r)) = (env_cols, env_rows) {
         return (c, r);
     }

@@ -59,20 +59,21 @@ impl ThemeLib {
                             .file_stem()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|src| parse_user_theme(&name, &src)) {
+                        match std::fs::read_to_string(&path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|src| parse_user_theme(&name, &src))
+                        {
                             Ok(theme) => {
-                                if let Some(slot) = themes.iter_mut().find(|t| {
-                                    t.name.eq_ignore_ascii_case(&theme.name)
-                                }) {
+                                if let Some(slot) = themes
+                                    .iter_mut()
+                                    .find(|t| t.name.eq_ignore_ascii_case(&theme.name))
+                                {
                                     *slot = theme;
                                 } else {
                                     themes.push(theme);
                                 }
                             }
-                            Err(e) => log::warn!(
-                                "skipping {}: {e}",
-                                path.display()
-                            ),
+                            Err(e) => log::warn!("skipping {}: {e}", path.display()),
                         }
                     }
                 }
@@ -160,8 +161,7 @@ fn parse_user_theme(name: &str, src: &str) -> Result<Theme, String> {
             .ok_or_else(|| format!("line {}: missing `=`", lineno + 1))?;
         let k = k.trim();
         let v = v.trim().trim_matches(|c: char| c == '"' || c == '\'');
-        let rgb = parse_hex(v)
-            .ok_or_else(|| format!("line {}: bad color {v:?}", lineno + 1))?;
+        let rgb = parse_hex(v).ok_or_else(|| format!("line {}: bad color {v:?}", lineno + 1))?;
         match (section.as_deref().unwrap_or(""), k) {
             ("colors.primary", "background") => bg = Some(rgb),
             ("colors.primary", "foreground") => fg = Some(rgb),
@@ -214,7 +214,10 @@ fn strip_comment(line: &str) -> &str {
 
 fn parse_hex(s: &str) -> Option<[u8; 3]> {
     let s = s.trim_start_matches('#');
-    if s.len() != 6 {
+    // `len()` is the byte length; require ASCII as well so the 2-byte
+    // slices below can't fall on a multi-byte char boundary and panic
+    // (a user theme file is untrusted input parsed at startup).
+    if s.len() != 6 || !s.is_ascii() {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -276,6 +279,19 @@ white = "#ffffff"
         // Cursor colors default to fg/bg when unspecified.
         assert_eq!(t.cursor_bg, t.fg);
         assert_eq!(t.cursor_fg, t.bg);
+    }
+
+    #[test]
+    fn parse_hex_rejects_multibyte_without_panicking() {
+        // "café1" is 6 bytes (é is 2), so the old byte-length guard let
+        // it through and `&s[2..4]` split the 'é' → panic. Must be None.
+        assert_eq!(parse_hex("café1"), None);
+        assert_eq!(parse_hex("#café1"), None);
+        // Valid hex still parses.
+        assert_eq!(parse_hex("aabbcc"), Some([0xaa, 0xbb, 0xcc]));
+        assert_eq!(parse_hex("#001122"), Some([0x00, 0x11, 0x22]));
+        // Wrong length still rejected.
+        assert_eq!(parse_hex("#fff"), None);
     }
 
     #[test]

@@ -58,10 +58,7 @@ impl Config {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if let Err(e) = seed_default(&path) {
-                    log::warn!(
-                        "config: could not seed {}: {e}",
-                        path.display()
-                    );
+                    log::warn!("config: could not seed {}: {e}", path.display());
                 } else {
                     log::info!("config: seeded {}", path.display());
                 }
@@ -144,7 +141,12 @@ pub fn parse(src: &str) -> Result<Config, String> {
 /// Set a single `Config` field from a `qualified.key` and raw
 /// (un-stripped) value. Section-qualified and bare keys are both
 /// accepted so the user can write either flat or sectioned TOML.
-fn apply_key(cfg: &mut Config, qualified: &str, raw_value: &str, lineno: usize) -> Result<(), String> {
+fn apply_key(
+    cfg: &mut Config,
+    qualified: &str,
+    raw_value: &str,
+    lineno: usize,
+) -> Result<(), String> {
     let str_val = unquote(raw_value);
     match qualified {
         // Appearance
@@ -303,10 +305,7 @@ mod tests {
 
     #[test]
     fn seed_default_writes_template_when_missing() {
-        let dir = std::env::temp_dir().join(format!(
-            "soltty-seed-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("soltty-seed-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("soltty.conf");
         seed_default(&path).unwrap();
@@ -324,10 +323,8 @@ mod tests {
 
     #[test]
     fn seed_default_does_not_overwrite_existing_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "soltty-seed-noclobber-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("soltty-seed-noclobber-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("soltty.conf");
@@ -342,9 +339,21 @@ mod tests {
     fn font_paths_parse_per_variant() {
         let src = "[appearance]\nfont = \"/a/Regular.ttf\"\nfont_bold = \"/a/Bold.ttf\"\nfont_italic = '/a/Italic.ttf'\nfont_bold_italic = '/a/BoldItalic.ttf'\n";
         let c = parse(src).unwrap();
-        assert_eq!(c.font.as_deref().and_then(|p| p.to_str()), Some("/a/Regular.ttf"));
-        assert_eq!(c.font_bold.as_deref().and_then(|p| p.to_str()), Some("/a/Bold.ttf"));
-        assert_eq!(c.font_italic.as_deref().and_then(|p| p.to_str()), Some("/a/Italic.ttf"));
-        assert_eq!(c.font_bold_italic.as_deref().and_then(|p| p.to_str()), Some("/a/BoldItalic.ttf"));
+        assert_eq!(
+            c.font.as_deref().and_then(|p| p.to_str()),
+            Some("/a/Regular.ttf")
+        );
+        assert_eq!(
+            c.font_bold.as_deref().and_then(|p| p.to_str()),
+            Some("/a/Bold.ttf")
+        );
+        assert_eq!(
+            c.font_italic.as_deref().and_then(|p| p.to_str()),
+            Some("/a/Italic.ttf")
+        );
+        assert_eq!(
+            c.font_bold_italic.as_deref().and_then(|p| p.to_str()),
+            Some("/a/BoldItalic.ttf")
+        );
     }
 }

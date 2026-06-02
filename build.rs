@@ -21,10 +21,8 @@ fn main() {
                 .expect("file stem")
                 .to_string_lossy()
                 .to_string();
-            let src = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-            let theme = parse(&src)
-                .unwrap_or_else(|e| panic!("parse {path:?}: {e}"));
+            let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            let theme = parse(&src).unwrap_or_else(|e| panic!("parse {path:?}: {e}"));
             entries.push((name, theme));
         }
     }
@@ -89,8 +87,8 @@ fn parse(src: &str) -> Result<ParsedTheme, String> {
         // Accept either basic ("...") or literal ('...') TOML strings —
         // iTerm2-Color-Schemes uses both styles inconsistently.
         let value = value.trim().trim_matches(|c: char| c == '"' || c == '\'');
-        let rgb = parse_hex(value)
-            .ok_or_else(|| format!("line {}: bad color {value:?}", lineno + 1))?;
+        let rgb =
+            parse_hex(value).ok_or_else(|| format!("line {}: bad color {value:?}", lineno + 1))?;
         let sec = section.as_deref().unwrap_or("");
         match (sec, key) {
             ("colors.primary", "background") => {
@@ -141,7 +139,7 @@ fn strip_comment(line: &str) -> &str {
     // their hex literals in single quotes and the `#` inside `'#1d1d1d'`
     // would otherwise look like the start of a comment.
     let bytes = line.as_bytes();
-    let mut in_basic = false;  // inside "..."
+    let mut in_basic = false; // inside "..."
     let mut in_literal = false; // inside '...'
     for (i, &b) in bytes.iter().enumerate() {
         match b {
@@ -156,7 +154,9 @@ fn strip_comment(line: &str) -> &str {
 
 fn parse_hex(s: &str) -> Option<[u8; 3]> {
     let s = s.trim_start_matches('#');
-    if s.len() != 6 {
+    // Require ASCII so the 2-byte slices below can't split a multi-byte
+    // char and panic the build script on a malformed vendored theme.
+    if s.len() != 6 || !s.is_ascii() {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
